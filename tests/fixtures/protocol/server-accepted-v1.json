@@ -1,0 +1,10 @@
+{
+  "protocol": 1,
+  "binary_version": "0.1.0",
+  "leader_instance": "22222222-2222-4222-8222-222222222222",
+  "capabilities": {
+    "named_sessions": true,
+    "durable_sessions": true,
+    "shared_sessions": true
+  }
+}

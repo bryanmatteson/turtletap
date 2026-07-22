@@ -1,0 +1,6 @@
+{
+  "rejected": true,
+  "supported": { "minimum": 1, "maximum": 1 },
+  "binary_version": "0.1.0",
+  "message": "resident protocol 1..=1 is incompatible with client protocol 99..=99"
+}
