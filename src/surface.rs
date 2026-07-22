@@ -126,7 +126,7 @@ impl SurfaceAction {
 /// log streams, or any other terminal-native interaction. The trait is object-safe
 /// so a shell can host heterogeneous surfaces together.
 pub trait Surface: Send {
-    /// The short title shown in tabs and the surface switcher.
+    /// The short title shown in tabs and the command palette.
     fn title(&self) -> Cow<'_, str>;
 
     /// Current state shown beside the title.

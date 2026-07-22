@@ -52,6 +52,11 @@ pub struct ShellConfig {
     /// Whether direct `Ctrl-D` detaches shell-managed surfaces.
     pub direct_detach: bool,
     /// Whether to capture terminal mouse events while attached.
+    ///
+    /// Disabled by default so drag gestures remain available for native
+    /// terminal text selection. Enable it only when a surface needs mouse
+    /// events; users can typically hold their terminal's override modifier
+    /// while dragging when capture is active.
     pub mouse_capture: bool,
     /// Semantic shell styles.
     pub theme: Theme,
@@ -64,7 +69,7 @@ impl ShellConfig {
             title: title.into(),
             tick_rate: Duration::from_millis(100),
             direct_detach: true,
-            mouse_capture: true,
+            mouse_capture: false,
             theme: Theme::default(),
         }
     }
@@ -103,10 +108,27 @@ struct Entry {
     surface: Box<dyn Surface>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Overlay {
-    Switcher { selected: usize },
+    Palette { query: String, selected: usize },
     Help,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PaletteAction {
+    SelectSurface(usize),
+    NextSurface,
+    PreviousSurface,
+    CloseSurface,
+    Detach,
+    Help,
+}
+
+pub(crate) struct PaletteItem {
+    pub(crate) label: String,
+    pub(crate) detail: String,
+    pub(crate) status: Option<crate::SurfaceStatus>,
+    pub(crate) action: PaletteAction,
 }
 
 /// A reusable terminal shell containing heterogeneous surfaces.
@@ -249,7 +271,14 @@ impl Shell {
             }
             Event::Key(_) => ShellSignal::Continue,
             Event::Mouse(mouse) => self.handle_mouse(mouse),
-            Event::Paste(text) => self.dispatch_to_active(SurfaceEvent::Paste(text)),
+            Event::Paste(text) => {
+                if matches!(self.overlay, Some(Overlay::Palette { .. })) {
+                    self.append_palette_query(&text);
+                    ShellSignal::Continue
+                } else {
+                    self.dispatch_to_active(SurfaceEvent::Paste(text))
+                }
+            }
             Event::Resize(columns, rows) => {
                 self.dirty = true;
                 self.dispatch_to_all(SurfaceEvent::Resize { columns, rows })
@@ -302,8 +331,13 @@ impl Shell {
 
         if is_ctrl(key, 'g') {
             self.leader_armed = true;
-            self.notice = Some("Ctrl-G: d detach · s surfaces · ? help".to_string());
+            self.notice = Some("Ctrl-G: d detach · s palette · ? help".to_string());
             self.dirty = true;
+            return ShellSignal::Continue;
+        }
+
+        if is_ctrl(key, 'p') {
+            self.open_palette();
             return ShellSignal::Continue;
         }
 
@@ -323,10 +357,6 @@ impl Shell {
                 }
                 KeyCode::BackTab => {
                     self.select_relative(-1);
-                    return ShellSignal::Continue;
-                }
-                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.open_switcher();
                     return ShellSignal::Continue;
                 }
                 KeyCode::Char('?') if key.modifiers.is_empty() => {
@@ -351,7 +381,7 @@ impl Shell {
         match key.code {
             KeyCode::Char('d') => ShellSignal::Exit(ExitReason::Detached),
             KeyCode::Char('s') => {
-                self.open_switcher();
+                self.open_palette();
                 ShellSignal::Continue
             }
             KeyCode::Char('n') | KeyCode::Tab => {
@@ -378,8 +408,9 @@ impl Shell {
     }
 
     fn handle_overlay_key(&mut self, key: KeyEvent) -> ShellSignal {
-        let previous_overlay = self.overlay;
-        match self.overlay {
+        let previous_overlay = self.overlay.clone();
+        let mut signal = ShellSignal::Continue;
+        match self.overlay.clone() {
             Some(Overlay::Help) => {
                 if matches!(
                     key.code,
@@ -388,35 +419,69 @@ impl Shell {
                     self.overlay = None;
                 }
             }
-            Some(Overlay::Switcher { selected }) => match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => self.overlay = None,
-                KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
-                    let next = wrap_index(selected, 1, self.entries.len());
-                    self.overlay = Some(Overlay::Switcher { selected: next });
-                }
-                KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
-                    let next = wrap_index(selected, -1, self.entries.len());
-                    self.overlay = Some(Overlay::Switcher { selected: next });
-                }
-                KeyCode::Enter => {
-                    self.overlay = None;
-                    self.select_index(selected);
-                }
-                KeyCode::Char(digit @ '1'..='9') => {
-                    let index = usize::from(digit as u8 - b'1');
-                    if index < self.entries.len() {
-                        self.overlay = None;
-                        self.select_index(index);
+            Some(Overlay::Palette {
+                mut query,
+                mut selected,
+            }) => {
+                let item_count = self.palette_items(&query).len();
+                match key.code {
+                    KeyCode::Esc => self.overlay = None,
+                    KeyCode::Down | KeyCode::Tab => {
+                        selected = wrap_index(selected, 1, item_count);
+                        self.overlay = Some(Overlay::Palette { query, selected });
                     }
+                    KeyCode::Up | KeyCode::BackTab => {
+                        selected = wrap_index(selected, -1, item_count);
+                        self.overlay = Some(Overlay::Palette { query, selected });
+                    }
+                    KeyCode::Enter => {
+                        if let Some(action) = self
+                            .palette_items(&query)
+                            .get(selected)
+                            .map(|item| item.action)
+                        {
+                            signal = self.execute_palette_action(action);
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        query.pop();
+                        self.overlay = Some(Overlay::Palette { query, selected: 0 });
+                    }
+                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.overlay = Some(Overlay::Palette {
+                            query: String::new(),
+                            selected: 0,
+                        });
+                    }
+                    KeyCode::Char(digit @ '1'..='9')
+                        if query.is_empty() && key.modifiers.is_empty() =>
+                    {
+                        let index = usize::from(digit as u8 - b'1');
+                        if index < self.entries.len() {
+                            signal =
+                                self.execute_palette_action(PaletteAction::SelectSurface(index));
+                        } else {
+                            query.push(digit);
+                            self.overlay = Some(Overlay::Palette { query, selected: 0 });
+                        }
+                    }
+                    KeyCode::Char(character)
+                        if !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    {
+                        query.push(character);
+                        self.overlay = Some(Overlay::Palette { query, selected: 0 });
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
+            }
             None => {}
         }
         if self.overlay != previous_overlay {
             self.dirty = true;
         }
-        ShellSignal::Continue
+        signal
     }
 
     fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) -> ShellSignal {
@@ -500,10 +565,105 @@ impl Shell {
         }
     }
 
-    fn open_switcher(&mut self) {
+    fn open_palette(&mut self) {
         let selected = self.active.unwrap_or(0);
-        self.overlay = Some(Overlay::Switcher { selected });
+        self.overlay = Some(Overlay::Palette {
+            query: String::new(),
+            selected,
+        });
         self.dirty = true;
+    }
+
+    fn append_palette_query(&mut self, text: &str) {
+        let Some(Overlay::Palette { query, selected }) = &mut self.overlay else {
+            return;
+        };
+        for character in text.chars() {
+            if character.is_whitespace() {
+                query.push(' ');
+            } else if !character.is_control() {
+                query.push(character);
+            }
+        }
+        *selected = 0;
+        self.dirty = true;
+    }
+
+    fn execute_palette_action(&mut self, action: PaletteAction) -> ShellSignal {
+        self.overlay = None;
+        match action {
+            PaletteAction::SelectSurface(index) => {
+                self.select_index(index);
+                ShellSignal::Continue
+            }
+            PaletteAction::NextSurface => {
+                self.select_relative(1);
+                ShellSignal::Continue
+            }
+            PaletteAction::PreviousSurface => {
+                self.select_relative(-1);
+                ShellSignal::Continue
+            }
+            PaletteAction::CloseSurface => self.close_active(),
+            PaletteAction::Detach => ShellSignal::Exit(ExitReason::Detached),
+            PaletteAction::Help => {
+                self.overlay = Some(Overlay::Help);
+                ShellSignal::Continue
+            }
+        }
+    }
+
+    pub(crate) fn palette_items(&self, query: &str) -> Vec<PaletteItem> {
+        let mut items = self
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let status = entry.surface.status();
+                PaletteItem {
+                    label: format!("Switch to {}", entry.surface.title()),
+                    detail: format!("surface · {}", status.label()),
+                    status: Some(status),
+                    action: PaletteAction::SelectSurface(index),
+                }
+            })
+            .collect::<Vec<_>>();
+        items.extend([
+            PaletteItem {
+                label: "Next surface".to_owned(),
+                detail: "shell · Ctrl-G n".to_owned(),
+                status: None,
+                action: PaletteAction::NextSurface,
+            },
+            PaletteItem {
+                label: "Previous surface".to_owned(),
+                detail: "shell · Ctrl-G p".to_owned(),
+                status: None,
+                action: PaletteAction::PreviousSurface,
+            },
+            PaletteItem {
+                label: "Close active surface".to_owned(),
+                detail: "shell · Ctrl-G x".to_owned(),
+                status: None,
+                action: PaletteAction::CloseSurface,
+            },
+            PaletteItem {
+                label: "Detach".to_owned(),
+                detail: "shell · Ctrl-G d".to_owned(),
+                status: None,
+                action: PaletteAction::Detach,
+            },
+            PaletteItem {
+                label: "Show keyboard help".to_owned(),
+                detail: "shell · Ctrl-G ?".to_owned(),
+                status: None,
+                action: PaletteAction::Help,
+            },
+        ]);
+        items
+            .into_iter()
+            .filter(|item| palette_matches(item, query))
+            .collect()
     }
 
     fn close_active(&mut self) -> ShellSignal {
@@ -603,6 +763,24 @@ fn contains(area: Rect, x: u16, y: u16) -> bool {
         && y < area.y.saturating_add(area.height)
 }
 
+fn palette_matches(item: &PaletteItem, query: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+    let haystack = format!("{} {}", item.label, item.detail).to_lowercase();
+    query
+        .split_whitespace()
+        .all(|needle| fuzzy_subsequence(needle, &haystack))
+}
+
+fn fuzzy_subsequence(needle: &str, haystack: &str) -> bool {
+    let mut characters = haystack.chars();
+    needle
+        .chars()
+        .all(|needle| characters.by_ref().any(|candidate| candidate == needle))
+}
+
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
@@ -610,6 +788,11 @@ mod tests {
     use ratatui::{Frame, layout::Rect};
 
     use super::*;
+
+    #[test]
+    fn native_terminal_selection_is_enabled_by_default() {
+        assert!(!ShellConfig::new("test").mouse_capture);
+    }
 
     struct TickSurface {
         redraw: bool,

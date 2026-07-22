@@ -6,7 +6,10 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap},
 };
 
-use crate::{Shell, SurfaceStatus, shell::Overlay};
+use crate::{
+    Shell, SurfaceStatus,
+    shell::{Overlay, PaletteAction},
+};
 
 pub(crate) fn draw(frame: &mut Frame<'_>, shell: &mut Shell) {
     let area = frame.area();
@@ -23,8 +26,10 @@ pub(crate) fn draw(frame: &mut Frame<'_>, shell: &mut Shell) {
     draw_active(frame, sections[1], shell);
     draw_status(frame, sections[2], shell);
 
-    match shell.overlay {
-        Some(Overlay::Switcher { selected }) => draw_switcher(frame, area, shell, selected),
+    match shell.overlay.clone() {
+        Some(Overlay::Palette { query, selected }) => {
+            draw_palette(frame, area, shell, &query, selected);
+        }
         Some(Overlay::Help) => draw_help(frame, area, shell),
         None => {}
     }
@@ -102,7 +107,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, shell: &Shell) {
             Span::styled(" Ctrl-G", shell.config.theme.accent),
             Span::styled(" then ", shell.config.theme.muted),
             Span::styled("s", shell.config.theme.accent),
-            Span::styled(" surfaces · ", shell.config.theme.muted),
+            Span::styled(" palette · ", shell.config.theme.muted),
             Span::styled("d", shell.config.theme.accent),
             Span::styled(" detach · ", shell.config.theme.muted),
             Span::styled("?", shell.config.theme.accent),
@@ -115,7 +120,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, shell: &Shell) {
             Span::styled("Ctrl-D", shell.config.theme.accent),
             Span::styled(" detach · ", shell.config.theme.muted),
             Span::styled("Ctrl-P", shell.config.theme.accent),
-            Span::styled(" surfaces · ", shell.config.theme.muted),
+            Span::styled(" palette · ", shell.config.theme.muted),
             Span::styled("?", shell.config.theme.accent),
             Span::styled(" help", shell.config.theme.muted),
         ])
@@ -123,53 +128,83 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, shell: &Shell) {
     frame.render_widget(content, area);
 }
 
-fn draw_switcher(frame: &mut Frame<'_>, viewport: Rect, shell: &Shell, selected: usize) {
+fn draw_palette(
+    frame: &mut Frame<'_>,
+    viewport: Rect,
+    shell: &Shell,
+    query: &str,
+    selected: usize,
+) {
+    let palette_items = shell.palette_items(query);
+    let item_count = palette_items.len();
     let width = viewport.width.saturating_sub(4).clamp(24, 64);
-    let desired_height = shell.entries().count().saturating_add(4);
+    let desired_height = palette_items.len().saturating_add(5);
     let height = (desired_height as u16)
         .min(viewport.height.saturating_sub(2))
-        .max(5);
+        .max(6);
     let area = centered(viewport, width, height);
-    let items = shell.entries().enumerate().map(|(index, (_, surface))| {
-        let number = if index < 9 {
-            format!("{}", index + 1)
-        } else {
-            "·".to_string()
-        };
-        ListItem::new(Line::from(vec![
-            Span::styled(format!(" {number} "), shell.config.theme.muted),
-            Span::styled(
-                format!("{} ", surface.status().marker()),
-                status_style(shell, surface.status()),
-            ),
-            Span::raw(surface.title().into_owned()),
-            Span::styled(
-                format!("  {}", surface.status().label()),
+    let block = Block::bordered()
+        .title(" Command palette ")
+        .title_bottom(
+            Line::styled(
+                " ↑↓ move · Enter run · Esc close ",
                 shell.config.theme.muted,
-            ),
+            )
+            .centered(),
+        )
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(1)])
+        .split(inner);
+    let search = Line::from(vec![
+        Span::styled("› ", shell.config.theme.accent),
+        Span::raw(query.to_owned()),
+        Span::styled("_", shell.config.theme.muted),
+    ]);
+    let items = palette_items.into_iter().map(|item| {
+        let prefix = match item.action {
+            PaletteAction::SelectSurface(index) if query.is_empty() && index < 9 => {
+                format!(" {} ", index + 1)
+            }
+            PaletteAction::SelectSurface(_) => {
+                format!(" {} ", item.status.unwrap_or(SurfaceStatus::Ready).marker())
+            }
+            _ => " › ".to_owned(),
+        };
+        let marker_style = item.status.map_or(shell.config.theme.accent, |status| {
+            status_style(shell, status)
+        });
+        ListItem::new(Line::from(vec![
+            Span::styled(prefix, marker_style),
+            Span::raw(item.label),
+            Span::styled(format!("  {}", item.detail), shell.config.theme.muted),
         ]))
     });
     let list = List::new(items)
-        .block(
-            Block::bordered().title(" Surfaces ").title_bottom(
-                Line::styled(
-                    " ↑↓ move · Enter open · 1–9 select · Esc close ",
-                    shell.config.theme.muted,
-                )
-                .centered(),
-            ),
-        )
         .highlight_style(shell.config.theme.selected)
         .highlight_symbol("→");
-    let mut state = ListState::default().with_selected(Some(selected));
+    let selection = (item_count > 0).then_some(selected.min(item_count.saturating_sub(1)));
+    let mut state = ListState::default().with_selected(selection);
     frame.render_widget(Clear, area);
-    frame.render_stateful_widget(list, area, &mut state);
+    frame.render_widget(block, area);
+    frame.render_widget(search, sections[0]);
+    if selection.is_some() {
+        frame.render_stateful_widget(list, sections[1], &mut state);
+    } else {
+        frame.render_widget(
+            Paragraph::new("No matching commands").style(shell.config.theme.muted),
+            sections[1],
+        );
+    }
 }
 
 fn draw_help(frame: &mut Frame<'_>, viewport: Rect, shell: &Shell) {
     let mut lines = vec![
         help_line("Ctrl-G d", "Detach and return to the host terminal", shell),
-        help_line("Ctrl-G s", "Open the surface switcher", shell),
+        help_line("Ctrl-P", "Open the command palette", shell),
+        help_line("Ctrl-G s", "Open the command palette", shell),
         help_line("Ctrl-G n/p", "Focus next or previous surface", shell),
         help_line("Ctrl-G x", "Close only the active surface", shell),
         help_line("Ctrl-G ?", "Open this help", shell),

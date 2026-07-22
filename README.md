@@ -7,7 +7,7 @@ small `Surface` trait.
 
 TurtleTap owns the shell chrome and behavior:
 
-- stable surface identity, focus, tabs, and a searchable-ready switcher boundary;
+- stable surface identity, focus, tabs, and a searchable command palette;
 - clean attach/detach terminal lifecycle;
 - direct `Ctrl-D` detach for shell-managed surfaces;
 - a `Ctrl-G` leader that remains available when a surface captures input;
@@ -74,16 +74,22 @@ raw mode are restored and the caller receives control with every surface still i
 memory. A host can attach the same shell again. Keeping it alive after the host
 process exits is deliberately a supervisor concern, not a terminal-rendering trick.
 
+Native terminal text selection is available by default: drag across text and use
+your terminal's normal copy command. TurtleTap does not capture mouse events unless
+the host explicitly opts in with `ShellConfig::with_mouse_capture(true)`. Mouse-aware
+surfaces can enable capture; most terminals then provide an override modifier such
+as Shift or Option for native selection.
+
 ## Navigation contract
 
 | Key | Shell-managed surface | Captured surface |
 | --- | --- | --- |
 | `Ctrl-D` | Detach | Delivered to the surface |
 | `Tab` / `Shift-Tab` | Next / previous surface | Delivered to the surface |
-| `Ctrl-P` | Open surface switcher | Delivered to the surface |
+| `Ctrl-P` | Open command palette | Open command palette |
 | `?` | Contextual help | Delivered to the surface |
 | `Ctrl-G d` | Detach | Detach |
-| `Ctrl-G s` | Open surface switcher | Open surface switcher |
+| `Ctrl-G s` | Open command palette | Open command palette |
 | `Ctrl-G n` / `Ctrl-G p` | Next / previous | Next / previous |
 | `Ctrl-G x` | Close active surface | Close active surface |
 | `Ctrl-G ?` | Contextual help | Contextual help |

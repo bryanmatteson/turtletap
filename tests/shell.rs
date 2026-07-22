@@ -98,6 +98,27 @@ fn ctrl_d_is_forwarded_to_a_captured_surface() {
 }
 
 #[test]
+fn ctrl_p_opens_the_palette_over_a_captured_surface() {
+    let (surface, events) = Probe::new("terminal", InputPolicy::Captured);
+    let mut shell = Shell::new(ShellConfig::new("Talos"));
+    shell.add_surface(surface);
+
+    let signal = shell.handle_event(key(KeyCode::Char('p'), KeyModifiers::CONTROL));
+    let rendered = shell
+        .render_to_string(72, 12)
+        .expect("palette should render");
+
+    assert_eq!(signal, ShellSignal::Continue);
+    assert!(rendered.contains("Command palette"));
+    assert!(
+        events
+            .lock()
+            .expect("probe lock should be healthy")
+            .is_empty()
+    );
+}
+
+#[test]
 fn leader_d_detaches_from_a_captured_surface() {
     let (surface, events) = Probe::new("terminal", InputPolicy::Captured);
     let mut shell = Shell::new(ShellConfig::new("Talos"));
@@ -120,7 +141,7 @@ fn leader_d_detaches_from_a_captured_surface() {
 }
 
 #[test]
-fn switcher_numbers_select_the_visible_item() {
+fn palette_numbers_select_the_visible_surface() {
     let (first, _) = Probe::new("first", InputPolicy::Shell);
     let (second, _) = Probe::new("second", InputPolicy::Shell);
     let (third, _) = Probe::new("third", InputPolicy::Shell);
@@ -133,6 +154,67 @@ fn switcher_numbers_select_the_visible_item() {
     shell.handle_event(key(KeyCode::Char('1'), KeyModifiers::empty()));
 
     assert_eq!(shell.active_id(), Some(first_id));
+}
+
+#[test]
+fn palette_filters_surfaces_and_opens_the_match() {
+    let (first, _) = Probe::new("first agent", InputPolicy::Shell);
+    let (second, _) = Probe::new("second terminal", InputPolicy::Shell);
+    let mut shell = Shell::new(ShellConfig::new("Koda"));
+    let first_id = shell.add_surface(first);
+    shell.add_surface(second);
+
+    shell.handle_event(key(KeyCode::Char('p'), KeyModifiers::CONTROL));
+    for character in "first".chars() {
+        shell.handle_event(key(KeyCode::Char(character), KeyModifiers::empty()));
+    }
+    let rendered = shell
+        .render_to_string(72, 12)
+        .expect("palette should render");
+    assert!(rendered.contains("Command palette"));
+    assert!(rendered.contains("Switch to first agent"));
+    assert!(!rendered.contains("Switch to second terminal"));
+
+    shell.handle_event(key(KeyCode::Enter, KeyModifiers::empty()));
+    assert_eq!(shell.active_id(), Some(first_id));
+}
+
+#[test]
+fn palette_runs_shell_actions() {
+    let (surface, _) = Probe::new("agent", InputPolicy::Shell);
+    let mut shell = Shell::new(ShellConfig::new("Koda"));
+    shell.add_surface(surface);
+
+    shell.handle_event(key(KeyCode::Char('p'), KeyModifiers::CONTROL));
+    for character in "dtch".chars() {
+        shell.handle_event(key(KeyCode::Char(character), KeyModifiers::empty()));
+    }
+
+    assert_eq!(
+        shell.handle_event(key(KeyCode::Enter, KeyModifiers::empty())),
+        ShellSignal::Exit(turtletap::ExitReason::Detached)
+    );
+}
+
+#[test]
+fn palette_accepts_pasted_queries_and_reports_no_matches() {
+    let (surface, events) = Probe::new("agent", InputPolicy::Shell);
+    let mut shell = Shell::new(ShellConfig::new("Koda"));
+    shell.add_surface(surface);
+
+    shell.handle_event(key(KeyCode::Char('p'), KeyModifiers::CONTROL));
+    shell.handle_event(Event::Paste("nothing matches this".to_owned()));
+    let rendered = shell
+        .render_to_string(72, 12)
+        .expect("palette should render");
+
+    assert!(rendered.contains("No matching commands"));
+    assert!(
+        events
+            .lock()
+            .expect("probe lock should be healthy")
+            .is_empty()
+    );
 }
 
 #[test]
