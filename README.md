@@ -10,7 +10,8 @@ TurtleTap owns the shell chrome and behavior:
 - stable surface identity, focus, tabs, and a searchable command palette;
 - clean attach/detach terminal lifecycle;
 - direct `Ctrl-D` detach for shell-managed surfaces;
-- a `Ctrl-G` leader that remains available when a surface captures input;
+- direct `Alt` screen switching, plus a configurable `Ctrl-Space` leader that
+  remains available when a surface captures input;
 - background tick and resize delivery for inactive agents and PTYs;
 - change-driven redraws that stay quiet while surfaces are idle;
 - contextual help and status without requiring each host to reinvent navigation;
@@ -84,19 +85,29 @@ as Shift or Option for native selection.
 
 | Key | Shell-managed surface | Captured surface |
 | --- | --- | --- |
+| `Alt-Left` / `Alt-Right` | Previous / next surface | Previous / next surface |
+| `Alt-1` … `Alt-9` | Jump to numbered surface | Jump to numbered surface |
+| `Ctrl-PageUp` / `Ctrl-PageDown` | Previous / next surface | Previous / next surface |
+| `PageUp` / `PageDown` | Surface scrollback | Surface scrollback |
+| `Ctrl-Home` / `Ctrl-End` | Oldest output / live tail | Oldest output / live tail |
 | `Ctrl-D` | Detach | Delivered to the surface |
 | `Tab` / `Shift-Tab` | Next / previous surface | Delivered to the surface |
 | `Ctrl-P` | Open command palette | Open command palette |
 | `?` | Contextual help | Delivered to the surface |
-| `Ctrl-G d` | Detach | Detach |
-| `Ctrl-G s` | Open command palette | Open command palette |
-| `Ctrl-G n` / `Ctrl-G p` | Next / previous | Next / previous |
-| `Ctrl-G x` | Close active surface | Close active surface |
-| `Ctrl-G ?` | Contextual help | Contextual help |
+| `Ctrl-Space d` | Detach | Detach |
+| `Ctrl-Space s` | Open command palette | Open command palette |
+| `Ctrl-Space n` / `Ctrl-Space p` | Next / previous | Next / previous |
+| `Ctrl-Space 1` … `Ctrl-Space 9` | Jump to numbered surface | Jump to numbered surface |
+| `Ctrl-Space x` | Close active surface | Close active surface |
+| `Ctrl-Space ?` | Contextual help | Contextual help |
 
 Use `InputPolicy::Captured` for an embedded PTY or editor. TurtleTap never steals
 `Ctrl-D` from a captured child; the leader chord is the escape hatch back to shell
 chrome.
+
+Navigation is configurable. `Ctrl-G` remains a secondary leader by default for
+backward compatibility, but the footer and contextual help teach the first active
+binding rather than hardcoding either chord.
 
 Run the included demo with:
 
@@ -137,19 +148,93 @@ turtletap stop build      # stop and delete one session
 turtletap stop            # stop the leader; durable sessions remain
 ```
 
+`list` and `status` default to human-readable output. Pass `--format json` for a
+stable machine-readable report suitable for scripts and other tools.
+
 One terminal holds a session's driver lease while any number of terminals may view
 it. A forced takeover increments the lease epoch, so buffered input from the former
 driver cannot execute afterward. `turtletap start` starts the resident without
 attaching. Set `TURTLETAP_SOCKET` to use an explicit local socket path and
 `TURTLETAP_STATE_DIR` to override durable storage.
 
-The dashboard is itself a tab. Use `/` to filter, `Enter` to open the selected
+The dashboard is itself screen 1. Use `/` to filter, `Enter` to open the selected
 session, `v` to view, `t` to take its driver lease, and `n`, `r`, or `x` to create,
-rename, or delete. Each opened session becomes another tab; `Ctrl-G s` switches
-between them. In a session tab, `F2` releases the driver and `F3` takes it. `q`
-closes only the dashboard tab, `Ctrl-D` detaches the terminal, `x` deletes only the
-selected session after confirmation, and `!` stops only the leader while preserving
-all sessions.
+rename, or delete. Each opened session becomes another numbered screen; use
+`Alt-Left` / `Alt-Right` to cycle or `Alt-1` … `Alt-9` to jump directly. Named
+`attach`, `view`, `take`, and `new` commands open the dashboard alongside the
+requested session, so another session is always one switch away. In a session tab,
+`F2` releases the driver and `F3` takes it. Background output adds a `+N` unread
+count to that screen until it is focused. When the tab row is too narrow, `‹` and
+`›` mark hidden screens while the active screen stays visible. `q` closes only the
+dashboard tab, `Ctrl-D` detaches the terminal, `x` deletes only the selected session
+after confirmation, and `!` stops only the leader while preserving all sessions.
+
+## Settings and keybindings
+
+TurtleTap reads both KDL and TOML. `TURTLETAP_CONFIG` has highest priority and its
+path must end in `.kdl` or `.toml`. Without that override,
+`~/.config/turtletap/config.kdl` wins when present, then `config.toml`; missing
+files are fine and built-in defaults remain active.
+
+```console
+turtletap config          # show resolved settings in the active format
+turtletap config show toml # translate the resolved model to canonical TOML
+turtletap config path     # print the active file path
+turtletap config init     # create a commented KDL starter file
+turtletap config init toml # create a commented TOML starter file
+turtletap config check    # validate syntax, key names, and conflicts
+```
+
+Every top-level command and config action accepts `--help`; `turtletap help
+<command>` is the equivalent discoverable form. Usage mistakes exit with status 2,
+while runtime failures exit with status 1.
+
+The canonical KDL shape uses properties for shell behavior and child nodes with
+repeated arguments for binding lists:
+
+```kdl
+shell mouse-capture=false direct-detach=true tick-rate-ms=100
+
+bindings {
+    leaders "ctrl-space" "ctrl-g"
+    palette "ctrl-p"
+    next-screen "alt-right" "ctrl-pagedown"
+    previous-screen "alt-left" "ctrl-pageup"
+    jump-modifiers "alt"
+}
+```
+
+The equivalent TOML is:
+
+```toml
+[shell]
+mouse_capture = false
+direct_detach = true
+tick_rate_ms = 100
+
+[bindings]
+leaders = ["ctrl-space", "ctrl-g"]
+palette = ["ctrl-p"]
+next_screen = ["alt-right", "ctrl-pagedown"]
+previous_screen = ["alt-left", "ctrl-pageup"]
+jump_modifiers = ["alt"]
+```
+
+Binding lists accept `ctrl`, `alt`/`option`, `shift`, and `super`/`cmd` modifiers;
+named arrows, navigation keys, `space`, `tab`, `escape`, and `F1` through `F24`
+are supported. An empty list disables that action. Conflicting bindings fail fast
+with the two setting names involved, and the shell footer, palette, and help overlay
+always show the resolved primary chords.
+
+## Transcript scrollback
+
+Command screens follow live output at the bottom by default. `PageUp` and
+`PageDown` move by a viewport, while `Ctrl-Home` and `Ctrl-End` jump to the oldest
+output and live tail. While history is visible, new output increments the
+"newer lines" counter without moving the text being read; returning to the bottom
+resumes follow mode. Mouse-wheel scrolling uses the same model when
+`shell.mouse_capture` is enabled. Scroll position is per screen and intentionally
+ephemeral, while the transcript itself remains durable.
 
 ## Resident applications
 

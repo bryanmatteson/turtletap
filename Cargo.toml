@@ -18,11 +18,13 @@
     crc32fast     = "1"
     crossterm     = "0.29"
     fs2           = "0.4"
+    kdl           = "4.7"
     ratatui       = { version = "0.30.2", default-features = false, features = ["crossterm_0_29"] }
     semver        = "1"
     serde         = { version = "1", features = ["derive"] }
     serde_json    = { version = "1", features = ["raw_value"] }
     tokio         = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+    toml          = "1.1"
     uuid          = { version = "1", features = ["serde", "v4"] }
 
 [lints.rust]

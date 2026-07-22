@@ -12,6 +12,7 @@ use std::{
     thread,
 };
 
+use crossterm::event::MouseEventKind;
 use serde::{Deserialize, Serialize};
 use turtletap::{
     Frame, InputPolicy, KeyCode, KeyModifiers, Rect, Shortcut, Surface, SurfaceAction,
@@ -25,14 +26,103 @@ use turtletap::{
 };
 
 mod resident;
+mod settings;
 
 const MAX_TRANSCRIPT_LINES: usize = 5_000;
 const MAX_HISTORY_LINES: usize = 1_000;
+
+#[derive(Clone, Debug, Default)]
+struct Scrollback {
+    lines_from_bottom: usize,
+    viewport_height: usize,
+}
+
+impl Scrollback {
+    fn window(&mut self, total_lines: usize, viewport_height: usize) -> (usize, usize) {
+        self.viewport_height = viewport_height;
+        self.lines_from_bottom = self
+            .lines_from_bottom
+            .min(total_lines.saturating_sub(viewport_height));
+        let end = total_lines.saturating_sub(self.lines_from_bottom);
+        (end.saturating_sub(viewport_height), end)
+    }
+
+    fn scroll_up(&mut self, total_lines: usize, amount: usize) {
+        let maximum = total_lines.saturating_sub(self.viewport_height);
+        self.lines_from_bottom = self.lines_from_bottom.saturating_add(amount).min(maximum);
+    }
+
+    fn scroll_down(&mut self, amount: usize) {
+        self.lines_from_bottom = self.lines_from_bottom.saturating_sub(amount);
+    }
+
+    fn top(&mut self, total_lines: usize) {
+        self.lines_from_bottom = total_lines.saturating_sub(self.viewport_height);
+    }
+
+    fn follow(&mut self) {
+        self.lines_from_bottom = 0;
+    }
+
+    fn appended(&mut self, count: usize, total_lines: usize) {
+        if self.lines_from_bottom > 0 {
+            self.lines_from_bottom = self
+                .lines_from_bottom
+                .saturating_add(count)
+                .min(total_lines.saturating_sub(self.viewport_height));
+        }
+    }
+
+    fn page_size(&self) -> usize {
+        self.viewport_height.saturating_sub(1).max(1)
+    }
+
+    fn status_line(&self) -> Line<'static> {
+        if self.lines_from_bottom == 0 {
+            Line::from(vec![
+                Span::styled("● live", Style::default().fg(Color::Green)),
+                Span::styled(" · PageUp scrollback", Style::default().fg(Color::DarkGray)),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled("↑ history", Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    format!(
+                        " · {} newer line{} · PageDown return",
+                        self.lines_from_bottom,
+                        if self.lines_from_bottom == 1 { "" } else { "s" }
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])
+        }
+    }
+}
 
 fn main() -> ExitCode {
     let arguments: Vec<OsString> = env::args_os().skip(1).collect();
     match arguments.as_slice() {
         [] => finish(resident::open()),
+        [argument]
+            if argument == OsStr::new("-h")
+                || argument == OsStr::new("--help")
+                || argument == OsStr::new("help") =>
+        {
+            print_help();
+            ExitCode::SUCCESS
+        }
+        [help, command] if help == OsStr::new("help") => {
+            show_command_help(&command.to_string_lossy())
+        }
+        [help, command, action]
+            if help == OsStr::new("help")
+                && (command == OsStr::new("config") || command == OsStr::new("settings")) =>
+        {
+            finish_config(settings::print_help(Some(&action.to_string_lossy())))
+        }
+        [command, help] if help == OsStr::new("-h") || help == OsStr::new("--help") => {
+            show_command_help(&command.to_string_lossy())
+        }
         [argument] if argument == OsStr::new("attach") => finish(resident::attach()),
         [command, name] if command == OsStr::new("attach") => {
             finish(resident::attach_named(&name.to_string_lossy()))
@@ -50,16 +140,24 @@ fn main() -> ExitCode {
             &old.to_string_lossy(),
             &new.to_string_lossy(),
         )),
-        [argument] if argument == OsStr::new("list") => finish(resident::list()),
+        [command, rest @ ..]
+            if command == OsStr::new("list") || command == OsStr::new("status") =>
+        {
+            report_command(&command.to_string_lossy(), rest)
+        }
         [argument] if argument == OsStr::new("start") => finish(resident::start()),
-        [argument] if argument == OsStr::new("status") => finish(resident::status()),
         [argument] if argument == OsStr::new("stop") => finish(resident::stop()),
         [command, name] if command == OsStr::new("stop") => {
             finish(resident::stop_session(&name.to_string_lossy()))
         }
-        [argument] if argument == OsStr::new("-h") || argument == OsStr::new("--help") => {
-            print_help();
-            ExitCode::SUCCESS
+        [command, rest @ ..]
+            if command == OsStr::new("config") || command == OsStr::new("settings") =>
+        {
+            let rest = rest
+                .iter()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            finish_config(settings::command(&rest))
         }
         [argument] if argument == OsStr::new("-V") || argument == OsStr::new("--version") => {
             println!("turtletap {}", env!("CARGO_PKG_VERSION"));
@@ -91,15 +189,144 @@ fn finish(result: io::Result<()>) -> ExitCode {
     }
 }
 
+fn finish_config(result: io::Result<()>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
+            usage_error(error, "turtletap config --help")
+        }
+        Err(error) => {
+            eprintln!("turtletap: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn report_command(command: &str, arguments: &[OsString]) -> ExitCode {
+    let format = match report_format(arguments) {
+        Ok(format) => format,
+        Err(error) => return usage_error(error, &format!("turtletap {command} --help")),
+    };
+    match command {
+        "list" => finish(resident::list(format)),
+        "status" => finish(resident::status(format)),
+        _ => ExitCode::from(2),
+    }
+}
+
+fn report_format(arguments: &[OsString]) -> io::Result<resident::OutputFormat> {
+    let value = match arguments {
+        [] => return Ok(resident::OutputFormat::Human),
+        [flag, value] if flag == OsStr::new("--format") => value.to_string_lossy().into_owned(),
+        [argument] => {
+            let argument = argument.to_string_lossy();
+            let Some(value) = argument.strip_prefix("--format=") else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unexpected argument '{argument}'"),
+                ));
+            };
+            value.to_owned()
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expected at most '--format human|json'",
+            ));
+        }
+    };
+    match value.as_str() {
+        "human" => Ok(resident::OutputFormat::Human),
+        "json" => Ok(resident::OutputFormat::Json),
+        unknown => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unknown output format '{unknown}'; expected human or json"),
+        )),
+    }
+}
+
+fn usage_error(error: impl std::fmt::Display, help: &str) -> ExitCode {
+    eprintln!("turtletap: {error}");
+    eprintln!("Try '{help}'.");
+    ExitCode::from(2)
+}
+
+fn show_command_help(command: &str) -> ExitCode {
+    if matches!(command, "config" | "settings") {
+        return finish_config(settings::print_help(None));
+    }
+    let Some(help) = command_help(command) else {
+        eprintln!("turtletap: unknown command '{command}'");
+        eprintln!("Try 'turtletap --help'.");
+        return ExitCode::from(2);
+    };
+    println!("{help}");
+    ExitCode::SUCCESS
+}
+
+fn command_help(command: &str) -> Option<&'static str> {
+    match command {
+        "attach" => Some(
+            "Attach to a resident session as its driver.\n\n\
+             Usage:\n  turtletap attach [name]\n\n\
+             Arguments:\n  [name]  Session name; defaults to 'default'\n\n\
+             Examples:\n  turtletap attach\n  turtletap attach build",
+        ),
+        "view" => Some(
+            "Observe a resident session without mutation authority.\n\n\
+             Usage:\n  turtletap view <name>\n\n\
+             Example:\n  turtletap view build",
+        ),
+        "take" => Some(
+            "Attach and take the fenced driver lease from its current owner.\n\n\
+             Usage:\n  turtletap take <name>\n\n\
+             Example:\n  turtletap take build",
+        ),
+        "new" => Some(
+            "Create a durable named session and attach as its driver.\n\n\
+             Usage:\n  turtletap new <name>\n\n\
+             Example:\n  turtletap new build",
+        ),
+        "rename" => Some(
+            "Rename a durable resident session.\n\n\
+             Usage:\n  turtletap rename <old-name> <new-name>\n\n\
+             Example:\n  turtletap rename build release",
+        ),
+        "list" => Some(
+            "List resident sessions and attached clients.\n\n\
+             Usage:\n  turtletap list [--format human|json]\n\n\
+             Options:\n  --format <format>  Output human-readable text or JSON [default: human]",
+        ),
+        "start" => Some(
+            "Start the resident leader without attaching a terminal.\n\n\
+             Usage:\n  turtletap start",
+        ),
+        "status" => Some(
+            "Show resident health and session status.\n\n\
+             Usage:\n  turtletap status [--format human|json]\n\n\
+             Options:\n  --format <format>  Output human-readable text or JSON [default: human]",
+        ),
+        "stop" => Some(
+            "Stop one session, or stop the resident leader while preserving sessions.\n\n\
+             Usage:\n  turtletap stop [name]\n\n\
+             Arguments:\n  [name]  Session to stop and delete; omit to stop only the leader\n\n\
+             Examples:\n  turtletap stop build\n  turtletap stop",
+        ),
+        _ => None,
+    }
+}
+
 fn print_help() {
     println!(
         "TurtleTap command shell\n\n\
          Usage:\n  turtletap [command]\n\n\
-         Commands:\n  attach [name]   Attach as the session driver\n  view <name>     Attach without mutation authority\n  take <name>     Attach and take the driver lease\n  new <name>      Create and attach to a named session\n  rename <old> <new>\n                   Rename a durable session\n  list            List resident sessions\n  start           Start the resident without attaching\n  status          Show resident and session status\n  stop [name]     Stop one session, or the resident when omitted\n\n\
+         Commands:\n  attach [name]   Attach as the session driver\n  view <name>     Attach without mutation authority\n  take <name>     Attach and take the driver lease\n  new <name>      Create and attach to a named session\n  rename <old> <new>\n                   Rename a durable session\n  list            List resident sessions\n  start           Start the resident without attaching\n  status          Show resident and session status\n  stop [name]     Stop one session, or the resident when omitted\n  config [action] Show or manage KDL/TOML settings\n  help [command]  Show command-specific help\n\n\
          Options:\n  -h, --help       Show this help\n  -V, --version    Show the version\n\n\
          Shell commands:\n  :add <name> <command>    Add a session-local command\n  :commands                List added commands\n  :remove <name>           Remove an added command\n  :cd [path]               Change working directory\n  :history                 Show command history\n  :clear                   Clear the transcript\n  :help                    Show in-shell help\n  :quit                    Detach\n\n\
          Running turtletap without a command opens the resident session dashboard.\n\
-         Type any other line inside the session to execute it through your login shell."
+         Type any other line inside the session to execute it through your login shell.\n\
+         Set TURTLETAP_CONFIG to use a non-default configuration file.\n\n\
+         Examples:\n  turtletap\n  turtletap new build\n  turtletap help config"
     );
 }
 
@@ -155,6 +382,7 @@ pub(crate) struct CommandSurface {
     running: Option<RunningCommand>,
     last_failed: bool,
     revision: u64,
+    scrollback: Scrollback,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -186,6 +414,7 @@ impl CommandSurface {
             running: None,
             last_failed: false,
             revision: 0,
+            scrollback: Scrollback::default(),
         };
         surface.push(TranscriptKind::System, "TurtleTap command shell");
         surface.push(
@@ -204,6 +433,7 @@ impl CommandSurface {
         if excess > 0 {
             self.transcript.drain(..excess);
         }
+        self.scrollback.appended(1, self.transcript.len());
         self.touch();
     }
 
@@ -277,6 +507,7 @@ impl CommandSurface {
             running: None,
             last_failed: state.last_failed,
             revision: state.revision,
+            scrollback: Scrollback::default(),
         };
         if let Some(command) = interrupted {
             surface.last_failed = true;
@@ -349,6 +580,7 @@ impl CommandSurface {
             ":quit" | ":detach" | "exit" => Some(SurfaceAction::Detach),
             ":clear" | "clear" => {
                 self.transcript.clear();
+                self.scrollback.follow();
                 self.touch();
                 Some(SurfaceAction::Consumed)
             }
@@ -759,11 +991,15 @@ impl Surface for CommandSurface {
     fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
         let sections = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(0), Constraint::Length(1)])
+            .constraints([
+                Constraint::Min(0),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
             .split(area);
         let visible_lines = usize::from(sections[0].height);
-        let start = self.transcript.len().saturating_sub(visible_lines);
-        let lines: Vec<Line<'_>> = self.transcript[start..]
+        let (start, end) = self.scrollback.window(self.transcript.len(), visible_lines);
+        let lines: Vec<Line<'_>> = self.transcript[start..end]
             .iter()
             .map(|entry| {
                 let style = match entry.kind {
@@ -779,7 +1015,8 @@ impl Surface for CommandSurface {
             })
             .collect();
         frame.render_widget(Paragraph::new(lines), sections[0]);
-        self.render_prompt(frame, sections[1]);
+        frame.render_widget(Paragraph::new(self.scrollback.status_line()), sections[1]);
+        self.render_prompt(frame, sections[2]);
     }
 
     fn handle(&mut self, event: SurfaceEvent) -> SurfaceAction {
@@ -802,7 +1039,16 @@ impl Surface for CommandSurface {
                         }
                         KeyCode::Char('l') => {
                             self.transcript.clear();
+                            self.scrollback.follow();
                             self.touch();
+                            SurfaceAction::Consumed
+                        }
+                        KeyCode::Home => {
+                            self.scrollback.top(self.transcript.len());
+                            SurfaceAction::Consumed
+                        }
+                        KeyCode::End => {
+                            self.scrollback.follow();
                             SurfaceAction::Consumed
                         }
                         _ => SurfaceAction::Ignored,
@@ -810,6 +1056,16 @@ impl Surface for CommandSurface {
                 }
 
                 match key.code {
+                    KeyCode::PageUp => {
+                        let page = self.scrollback.page_size();
+                        self.scrollback.scroll_up(self.transcript.len(), page);
+                        SurfaceAction::Consumed
+                    }
+                    KeyCode::PageDown => {
+                        let page = self.scrollback.page_size();
+                        self.scrollback.scroll_down(page);
+                        SurfaceAction::Consumed
+                    }
                     KeyCode::Enter => self.submit(),
                     KeyCode::Char(character) => {
                         self.input.insert(self.cursor, character);
@@ -864,7 +1120,18 @@ impl Surface for CommandSurface {
                     _ => SurfaceAction::Ignored,
                 }
             }
-            SurfaceEvent::Mouse(_) | SurfaceEvent::Resize { .. } => SurfaceAction::Ignored,
+            SurfaceEvent::Mouse(mouse) => match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    self.scrollback.scroll_up(self.transcript.len(), 3);
+                    SurfaceAction::Consumed
+                }
+                MouseEventKind::ScrollDown => {
+                    self.scrollback.scroll_down(3);
+                    SurfaceAction::Consumed
+                }
+                _ => SurfaceAction::Ignored,
+            },
+            SurfaceEvent::Resize { .. } => SurfaceAction::Ignored,
         }
     }
 
@@ -873,6 +1140,8 @@ impl Surface for CommandSurface {
             Shortcut::new("Enter", "Run command"),
             Shortcut::new("↑ / ↓", "Command history"),
             Shortcut::new("Tab", "Complete added command"),
+            Shortcut::new("PgUp / PgDn", "Scroll transcript history"),
+            Shortcut::new("Ctrl-Home / Ctrl-End", "Oldest output or live tail"),
             Shortcut::new("Ctrl-C", "Interrupt command or clear input"),
             Shortcut::new("Ctrl-D", "Detach when input is empty"),
         ]
@@ -1124,5 +1393,21 @@ mod tests {
         assert!(restored.transcript.iter().any(|entry| {
             entry.text.contains("Resident restarted") && entry.text.contains("printf once")
         }));
+    }
+
+    #[test]
+    fn scrollback_holds_position_while_new_output_arrives() {
+        let mut scrollback = Scrollback::default();
+        assert_eq!(scrollback.window(100, 10), (90, 100));
+
+        scrollback.scroll_up(100, 9);
+        assert_eq!(scrollback.window(100, 10), (81, 91));
+
+        scrollback.appended(3, 103);
+        assert_eq!(scrollback.window(103, 10), (81, 91));
+        assert_eq!(scrollback.lines_from_bottom, 12);
+
+        scrollback.follow();
+        assert_eq!(scrollback.window(103, 10), (93, 103));
     }
 }

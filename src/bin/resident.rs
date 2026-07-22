@@ -3,6 +3,12 @@
 #[cfg(not(unix))]
 use std::{io, path::PathBuf};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OutputFormat {
+    Human,
+    Json,
+}
+
 #[cfg(unix)]
 mod unix {
     use std::{
@@ -18,10 +24,11 @@ mod unix {
         time::{Duration, Instant},
     };
 
+    use crossterm::event::MouseEventKind;
     use serde::{Deserialize, Serialize, de::DeserializeOwned};
     use turtletap::{
-        Frame, InputPolicy, KeyCode, KeyModifiers, Rect, Shell, ShellConfig, Shortcut, Surface,
-        SurfaceAction, SurfaceEvent, SurfaceStatus,
+        Frame, InputPolicy, KeyCode, KeyModifiers, Rect, Shell, Shortcut, Surface, SurfaceAction,
+        SurfaceEvent, SurfaceStatus,
         resident::{
             ApplicationError, AttachmentMode, ClientCapabilities, ClientEnvelope, ClientHello,
             ClientInstanceId, ClientRequest, ControlResult, Durability, EffectContext, EffectId,
@@ -40,9 +47,10 @@ mod unix {
     };
 
     use super::super::{
-        CommandSurface, PersistedCommandSurface, RunningCommand, TranscriptEntry, TranscriptKind,
-        char_slice_width, spawn_command, split_command,
+        CommandSurface, PersistedCommandSurface, RunningCommand, Scrollback, TranscriptEntry,
+        TranscriptKind, char_slice_width, spawn_command, split_command,
     };
+    use super::OutputFormat;
 
     const START_TIMEOUT: Duration = Duration::from_secs(5);
     const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -167,6 +175,15 @@ mod unix {
         fn persisted_state(&self) -> Option<&PersistedCommandSurface> {
             match self {
                 Self::Appended { state, .. } | Self::Reset { state, .. } => state.as_ref(),
+            }
+        }
+
+        fn appended_count(&self, previous: &SessionSnapshot) -> usize {
+            match self {
+                Self::Appended { entries, .. } => entries.len(),
+                Self::Reset { snapshot, .. } => {
+                    transcript_append_count(&previous.transcript, &snapshot.transcript)
+                }
             }
         }
 
@@ -297,6 +314,7 @@ mod unix {
                 }
                 ShellCommand::Clear => {
                     self.transcript.clear();
+                    self.scrollback.follow();
                     self.touch();
                     Vec::new()
                 }
@@ -392,6 +410,22 @@ mod unix {
 
     fn shell_io(error: io::Error) -> ApplicationError {
         ApplicationError::new("shell_io", error.to_string())
+    }
+
+    fn transcript_append_count(previous: &[TranscriptEntry], current: &[TranscriptEntry]) -> usize {
+        if current.starts_with(previous) {
+            return current.len().saturating_sub(previous.len());
+        }
+        if current.is_empty() {
+            return 0;
+        }
+        for removed in 1..previous.len() {
+            let overlap = previous.len() - removed;
+            if overlap <= current.len() && previous[removed..] == current[..overlap] {
+                return current.len() - overlap;
+            }
+        }
+        current.len()
     }
 
     fn read_sync<T: DeserializeOwned>(stream: &mut UnixStream) -> io::Result<T> {
@@ -791,11 +825,12 @@ mod unix {
                 notice: None,
                 refresh_elapsed: Duration::ZERO,
             };
-            dashboard.refresh()?;
+            let _ = dashboard.refresh()?;
             Ok(dashboard)
         }
 
-        fn refresh(&mut self) -> io::Result<()> {
+        fn refresh(&mut self) -> io::Result<bool> {
+            self.refresh_elapsed = Duration::ZERO;
             let result = self.client.request(ClientRequest::ListSessions)?;
             let ControlResult::Sessions { sessions } = result else {
                 return Err(io::Error::new(
@@ -803,12 +838,20 @@ mod unix {
                     "resident returned the wrong list response",
                 ));
             };
+            let previous_selected = self.selected;
+            let mut changed = self.sessions != sessions;
             self.sessions = sessions;
-            self.selected = self
-                .selected
-                .min(self.filtered_indices().len().saturating_sub(1));
-            self.refresh_elapsed = Duration::ZERO;
-            Ok(())
+            self.selected = previous_selected.min(self.filtered_indices().len().saturating_sub(1));
+            changed |= self.selected != previous_selected;
+            if self
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.starts_with("Disconnected · retrying:"))
+            {
+                self.notice = Some("Reconnected to the resident.".to_owned());
+                changed = true;
+            }
+            Ok(changed)
         }
 
         fn filtered_indices(&self) -> Vec<usize> {
@@ -893,7 +936,7 @@ mod unix {
                 _ => Ok(()),
             };
             match result.and_then(|()| self.refresh()) {
-                Ok(()) => {
+                Ok(_) => {
                     self.query.clear();
                     self.notice = Some(format!("Saved session '{value}'."));
                     SurfaceAction::Consumed
@@ -914,7 +957,7 @@ mod unix {
                 })
                 .and_then(|()| self.refresh())
             {
-                Ok(()) => {
+                Ok(_) => {
                     self.mode = DashboardMode::Browse;
                     self.notice = Some("Session stopped and its durable state deleted.".to_owned());
                     SurfaceAction::Consumed
@@ -924,8 +967,13 @@ mod unix {
         }
 
         fn fail(&mut self, error: impl std::fmt::Display) -> SurfaceAction {
-            self.notice = Some(error.to_string());
-            SurfaceAction::Consumed
+            let message = error.to_string();
+            if self.notice.as_deref() == Some(&message) {
+                SurfaceAction::Ignored
+            } else {
+                self.notice = Some(message);
+                SurfaceAction::Consumed
+            }
         }
 
         fn render_input<'a>(&'a self) -> Option<Line<'a>> {
@@ -949,10 +997,24 @@ mod unix {
         }
 
         fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
+            let driven = self
+                .sessions
+                .iter()
+                .filter(|session| session.driver.is_some())
+                .count();
+            let attached: usize = self.sessions.iter().map(|session| session.viewers).sum();
             let mut lines = vec![
                 Line::styled(
                     "Resident sessions",
                     Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Line::styled(
+                    format!(
+                        "{} session{} · {driven} driven · {attached} attached",
+                        self.sessions.len(),
+                        if self.sessions.len() == 1 { "" } else { "s" }
+                    ),
+                    Style::default().fg(Color::DarkGray),
                 ),
                 Line::styled(
                     "Enter open · v view · t take over · n new · r rename · x delete · / search",
@@ -963,7 +1025,11 @@ mod unix {
             let filtered = self.filtered_indices();
             if filtered.is_empty() {
                 lines.push(Line::styled(
-                    "  No sessions match this filter.",
+                    if self.sessions.is_empty() {
+                        "  No sessions yet. Press n to create one."
+                    } else {
+                        "  No sessions match this filter."
+                    },
                     Style::default().fg(Color::Yellow),
                 ));
             }
@@ -971,25 +1037,29 @@ mod unix {
                 let session = &self.sessions[index];
                 let selected = visible == self.selected;
                 let marker = if selected { "→" } else { " " };
-                let role = if session.driver.is_some() {
-                    "DRIVEN"
+                let (activity, role, activity_style) = if session.driver.is_some() {
+                    ("●", "DRIVEN", Style::default().fg(Color::Green))
                 } else {
-                    "IDLE"
+                    ("○", "IDLE", Style::default().fg(Color::DarkGray))
                 };
-                let style = if selected {
+                let name_style = if selected {
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                 };
-                lines.push(Line::styled(
-                    format!(
-                        "{marker} {:<24} [{role:<6}]  {} attached  seq {}",
-                        session.name, session.viewers, session.sequence.0
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{marker} {activity} "), activity_style),
+                    Span::styled(format!("{:<24}", session.name), name_style),
+                    Span::styled(
+                        format!(
+                            " [{role:<6}]  {} attached  seq {}",
+                            session.viewers, session.sequence.0
+                        ),
+                        Style::default().fg(Color::DarkGray),
                     ),
-                    style,
-                ));
+                ]));
             }
             lines.push(Line::raw(""));
             match self.mode {
@@ -1022,7 +1092,8 @@ mod unix {
                     self.refresh_elapsed += elapsed;
                     if self.refresh_elapsed >= Duration::from_secs(1) {
                         return match self.refresh() {
-                            Ok(()) => SurfaceAction::Consumed,
+                            Ok(true) => SurfaceAction::Consumed,
+                            Ok(false) => SurfaceAction::Ignored,
                             Err(error) => self.fail(format!("Disconnected · retrying: {error}")),
                         };
                     }
@@ -1158,6 +1229,29 @@ mod unix {
         }
     }
 
+    #[derive(Default)]
+    struct ScreenActivity {
+        focused: bool,
+        unread_lines: usize,
+    }
+
+    impl ScreenActivity {
+        fn appended(&mut self, lines: usize) {
+            if !self.focused {
+                self.unread_lines = self.unread_lines.saturating_add(lines);
+            }
+        }
+
+        fn focus(&mut self) {
+            self.focused = true;
+            self.unread_lines = 0;
+        }
+
+        fn blur(&mut self) {
+            self.focused = false;
+        }
+    }
+
     struct RemoteSurface {
         client: SessionClient,
         name: String,
@@ -1170,6 +1264,8 @@ mod unix {
         connection_error: Option<String>,
         planned_shutdown: Option<ShutdownReason>,
         banner: Option<String>,
+        scrollback: Scrollback,
+        activity: ScreenActivity,
     }
 
     impl RemoteSurface {
@@ -1192,6 +1288,8 @@ mod unix {
                 connection_error: None,
                 planned_shutdown: None,
                 banner: None,
+                scrollback: Scrollback::default(),
+                activity: ScreenActivity::default(),
             })
         }
 
@@ -1300,9 +1398,16 @@ mod unix {
                         sequence,
                         state,
                     } if self.client.session().ok() == Some(session) => {
-                        match serde_json::from_value(state) {
+                        match serde_json::from_value::<SessionSnapshot>(state) {
                             Ok(snapshot) => {
+                                let appended = transcript_append_count(
+                                    &self.snapshot.transcript,
+                                    &snapshot.transcript,
+                                );
                                 self.snapshot = snapshot;
+                                self.scrollback
+                                    .appended(appended, self.snapshot.transcript.len());
+                                self.activity.appended(appended);
                                 self.client.set_cursor(sequence);
                                 changed = true;
                             }
@@ -1316,7 +1421,11 @@ mod unix {
                     } if self.client.session().ok() == Some(session) => {
                         match serde_json::from_value::<ShellEvent>(event) {
                             Ok(event) => {
+                                let appended = event.appended_count(&self.snapshot);
                                 event.apply(&mut self.snapshot);
+                                self.scrollback
+                                    .appended(appended, self.snapshot.transcript.len());
+                                self.activity.appended(appended);
                                 self.client.set_cursor(sequence);
                                 changed = true;
                             }
@@ -1344,6 +1453,7 @@ mod unix {
                             kind: TranscriptKind::System,
                             text: format!("Resident is shutting down: {reason:?}"),
                         });
+                        self.activity.appended(1);
                         changed = true;
                     }
                     ServerMessage::Shutdown { reason } => {
@@ -1371,14 +1481,16 @@ mod unix {
 
         fn fail(&mut self, error: impl std::fmt::Display) -> SurfaceAction {
             let message = error.to_string();
-            if self.connection_error.as_deref() != Some(&message) {
-                self.snapshot.transcript.push(TranscriptEntry {
-                    kind: TranscriptKind::Error,
-                    text: message.clone(),
-                });
-                self.snapshot.last_failed = true;
-                self.connection_error = Some(message);
+            if self.connection_error.as_deref() == Some(&message) {
+                return SurfaceAction::Ignored;
             }
+            self.snapshot.transcript.push(TranscriptEntry {
+                kind: TranscriptKind::Error,
+                text: message.clone(),
+            });
+            self.snapshot.last_failed = true;
+            self.connection_error = Some(message);
+            self.activity.appended(1);
             SurfaceAction::Consumed
         }
 
@@ -1522,12 +1634,18 @@ mod unix {
             } else {
                 "VIEW"
             };
-            format!("{} [{role}]", self.name).into()
+            if self.activity.unread_lines == 0 {
+                format!("{} [{role}]", self.name).into()
+            } else {
+                format!("{} [{role}] +{}", self.name, self.activity.unread_lines).into()
+            }
         }
 
         fn status(&self) -> SurfaceStatus {
             if self.connection_error.is_some() || self.snapshot.last_failed {
                 SurfaceStatus::Failed
+            } else if self.activity.unread_lines > 0 && !self.snapshot.running {
+                SurfaceStatus::Attention
             } else if self.snapshot.running {
                 SurfaceStatus::Working
             } else {
@@ -1545,15 +1663,20 @@ mod unix {
                     Constraint::Length(1),
                     Constraint::Min(0),
                     Constraint::Length(1),
+                    Constraint::Length(1),
                 ]
             } else {
-                vec![Constraint::Min(0), Constraint::Length(1)]
+                vec![
+                    Constraint::Min(0),
+                    Constraint::Length(1),
+                    Constraint::Length(1),
+                ]
             };
             let sections = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints(constraints)
                 .split(area);
-            let (transcript_area, prompt_area) = if let Some(banner) = &self.banner {
+            let (transcript_area, scroll_area, prompt_area) = if let Some(banner) = &self.banner {
                 frame.render_widget(
                     Paragraph::new(Line::styled(
                         banner.as_str(),
@@ -1563,13 +1686,15 @@ mod unix {
                     )),
                     sections[0],
                 );
-                (sections[1], sections[2])
+                (sections[1], sections[2], sections[3])
             } else {
-                (sections[0], sections[1])
+                (sections[0], sections[1], sections[2])
             };
             let visible_lines = usize::from(transcript_area.height);
-            let start = self.snapshot.transcript.len().saturating_sub(visible_lines);
-            let lines: Vec<Line<'_>> = self.snapshot.transcript[start..]
+            let (start, end) = self
+                .scrollback
+                .window(self.snapshot.transcript.len(), visible_lines);
+            let lines: Vec<Line<'_>> = self.snapshot.transcript[start..end]
                 .iter()
                 .map(|entry| {
                     let style = match entry.kind {
@@ -1585,6 +1710,7 @@ mod unix {
                 })
                 .collect();
             frame.render_widget(Paragraph::new(lines), transcript_area);
+            frame.render_widget(Paragraph::new(self.scrollback.status_line()), scroll_area);
             self.render_prompt(frame, prompt_area);
         }
 
@@ -1624,10 +1750,29 @@ mod unix {
                                 SurfaceAction::Consumed
                             }
                             KeyCode::Char('l') => self.command(ShellCommand::Clear),
+                            KeyCode::Home => {
+                                self.scrollback.top(self.snapshot.transcript.len());
+                                SurfaceAction::Consumed
+                            }
+                            KeyCode::End => {
+                                self.scrollback.follow();
+                                SurfaceAction::Consumed
+                            }
                             _ => SurfaceAction::Ignored,
                         };
                     }
                     match key.code {
+                        KeyCode::PageUp => {
+                            let page = self.scrollback.page_size();
+                            self.scrollback
+                                .scroll_up(self.snapshot.transcript.len(), page);
+                            SurfaceAction::Consumed
+                        }
+                        KeyCode::PageDown => {
+                            let page = self.scrollback.page_size();
+                            self.scrollback.scroll_down(page);
+                            SurfaceAction::Consumed
+                        }
                         KeyCode::Enter => self.submit(),
                         KeyCode::Char(character) if self.mode == AttachmentMode::Drive => {
                             self.input.insert(self.cursor, character);
@@ -1682,7 +1827,18 @@ mod unix {
                         _ => SurfaceAction::Ignored,
                     }
                 }
-                SurfaceEvent::Mouse(_) | SurfaceEvent::Resize { .. } => SurfaceAction::Ignored,
+                SurfaceEvent::Mouse(mouse) => match mouse.kind {
+                    MouseEventKind::ScrollUp => {
+                        self.scrollback.scroll_up(self.snapshot.transcript.len(), 3);
+                        SurfaceAction::Consumed
+                    }
+                    MouseEventKind::ScrollDown => {
+                        self.scrollback.scroll_down(3);
+                        SurfaceAction::Consumed
+                    }
+                    _ => SurfaceAction::Ignored,
+                },
+                SurfaceEvent::Resize { .. } => SurfaceAction::Ignored,
             }
         }
 
@@ -1691,10 +1847,20 @@ mod unix {
                 Shortcut::new("Enter", "Run command"),
                 Shortcut::new("↑ / ↓", "Command history"),
                 Shortcut::new("Tab", "Complete added command"),
+                Shortcut::new("PgUp / PgDn", "Scroll transcript history"),
+                Shortcut::new("Ctrl-Home / Ctrl-End", "Oldest output or live tail"),
                 Shortcut::new("Ctrl-C", "Interrupt command or clear input"),
                 Shortcut::new("Ctrl-D", "Detach; the session keeps running"),
                 Shortcut::new("F2 / F3", "Release or take driver"),
             ]
+        }
+
+        fn focus(&mut self) {
+            self.activity.focus();
+        }
+
+        fn blur(&mut self) {
+            self.activity.blur();
         }
     }
 
@@ -1702,7 +1868,7 @@ mod unix {
         let path = socket_path();
         ensure_started(&path)?;
         let dashboard = SessionDashboard::connect(&path)?;
-        let mut shell = Shell::new(ShellConfig::new("TurtleTap"));
+        let mut shell = Shell::new(crate::settings::shell_config("TurtleTap")?);
         shell.add_surface(dashboard);
         let _reason = shell.attach()?;
         Ok(())
@@ -1776,7 +1942,7 @@ mod unix {
         }
     }
 
-    pub(crate) fn list() -> io::Result<()> {
+    pub(crate) fn list(format: OutputFormat) -> io::Result<()> {
         let path = socket_path();
         require_running(&path)?;
         let mut client = SessionClient::connect(&path)?;
@@ -1787,6 +1953,9 @@ mod unix {
                 "resident returned the wrong list response",
             ));
         };
+        if format == OutputFormat::Json {
+            return print_json(&sessions);
+        }
         for session in sessions {
             let role = if session.driver.is_some() {
                 "driven"
@@ -1794,11 +1963,8 @@ mod unix {
                 "idle"
             };
             println!(
-                "{:<20} {}  {} viewer{}",
-                session.name,
-                role,
-                session.viewers,
-                if session.viewers == 1 { "" } else { "s" }
+                "{:<20} {}  {} attached",
+                session.name, role, session.viewers
             );
         }
         Ok(())
@@ -1818,9 +1984,17 @@ mod unix {
         Ok(())
     }
 
-    pub(crate) fn status() -> io::Result<()> {
+    pub(crate) fn status(format: OutputFormat) -> io::Result<()> {
         let path = socket_path();
         if !probe_server(&path)? {
+            if format == OutputFormat::Json {
+                return print_json(&serde_json::json!({
+                    "resident": "stopped",
+                    "pid": null,
+                    "leader": null,
+                    "sessions": [],
+                }));
+            }
             println!("Resident: stopped");
             return Ok(());
         }
@@ -1837,6 +2011,14 @@ mod unix {
                 "resident returned the wrong status response",
             ));
         };
+        if format == OutputFormat::Json {
+            return print_json(&serde_json::json!({
+                "resident": "running",
+                "pid": pid,
+                "leader": leader,
+                "sessions": sessions,
+            }));
+        }
         println!("Resident: running");
         println!("PID: {pid}");
         println!("Leader: {leader}");
@@ -1854,6 +2036,11 @@ mod unix {
                 }
             );
         }
+        Ok(())
+    }
+
+    fn print_json(value: &impl Serialize) -> io::Result<()> {
+        println!("{}", serde_json::to_string(value).map_err(protocol_error)?);
         Ok(())
     }
 
@@ -1917,10 +2104,12 @@ mod unix {
     }
 
     fn attach_path(path: &Path, name: &str, mode: AttachmentMode, force: bool) -> io::Result<()> {
+        let dashboard = SessionDashboard::connect(path)?;
         let client = SessionClient::connect(path)?;
         let surface =
             RemoteSurface::attach(client, SessionSelector::Name(name.to_owned()), mode, force)?;
-        let mut shell = Shell::new(ShellConfig::new("TurtleTap"));
+        let mut shell = Shell::new(crate::settings::shell_config("TurtleTap")?);
+        shell.add_surface(dashboard);
         shell.add_surface(surface);
         let _reason = shell.attach()?;
         Ok(())
@@ -2163,6 +2352,36 @@ mod unix {
             event.apply(&mut before);
             assert_eq!(before, after);
         }
+
+        #[test]
+        fn transcript_append_count_handles_a_pruned_front() {
+            let entry = |text: &str| TranscriptEntry {
+                kind: TranscriptKind::Stdout,
+                text: text.to_owned(),
+            };
+            let previous = vec![entry("a"), entry("b"), entry("c"), entry("d")];
+            let current = vec![entry("c"), entry("d"), entry("e"), entry("f")];
+
+            assert_eq!(transcript_append_count(&previous, &current), 2);
+            assert_eq!(transcript_append_count(&previous, &[]), 0);
+            assert_eq!(transcript_append_count(&previous, &[entry("new")]), 1);
+        }
+
+        #[test]
+        fn screen_activity_counts_only_while_unfocused() {
+            let mut activity = ScreenActivity::default();
+
+            activity.focus();
+            activity.appended(2);
+            assert_eq!(activity.unread_lines, 0);
+
+            activity.blur();
+            activity.appended(3);
+            assert_eq!(activity.unread_lines, 3);
+
+            activity.focus();
+            assert_eq!(activity.unread_lines, 0);
+        }
     }
 }
 
@@ -2174,7 +2393,7 @@ pub(crate) use unix::{
 
 #[cfg(not(unix))]
 pub(crate) fn open() -> io::Result<()> {
-    let mut shell = turtletap::Shell::new(turtletap::ShellConfig::new("TurtleTap"));
+    let mut shell = turtletap::Shell::new(crate::settings::shell_config("TurtleTap")?);
     shell.add_surface(super::CommandSurface::new()?);
     let _reason = shell.attach()?;
     Ok(())
@@ -2205,7 +2424,7 @@ pub(crate) fn rename(_old: &str, _new: &str) -> io::Result<()> {
     unsupported()
 }
 #[cfg(not(unix))]
-pub(crate) fn list() -> io::Result<()> {
+pub(crate) fn list(_format: OutputFormat) -> io::Result<()> {
     unsupported()
 }
 #[cfg(not(unix))]
@@ -2213,7 +2432,7 @@ pub(crate) fn start() -> io::Result<()> {
     unsupported()
 }
 #[cfg(not(unix))]
-pub(crate) fn status() -> io::Result<()> {
+pub(crate) fn status(_format: OutputFormat) -> io::Result<()> {
     unsupported()
 }
 #[cfg(not(unix))]

@@ -42,6 +42,144 @@ pub enum ShellSignal {
     Exit(ExitReason),
 }
 
+/// One key chord reserved by the shell.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KeyBinding {
+    /// The non-modifier key.
+    pub code: KeyCode,
+    /// Required modifier keys.
+    pub modifiers: KeyModifiers,
+}
+
+impl KeyBinding {
+    /// Creates a key binding.
+    #[must_use]
+    pub const fn new(code: KeyCode, modifiers: KeyModifiers) -> Self {
+        Self { code, modifiers }
+    }
+
+    fn matches(self, key: KeyEvent) -> bool {
+        self.code == key.code && self.modifiers == key.modifiers
+    }
+
+    /// Returns the compact label used by help and shell chrome.
+    #[must_use]
+    pub fn label(self) -> String {
+        let mut parts = Vec::new();
+        if self.modifiers.contains(KeyModifiers::CONTROL) {
+            parts.push("Ctrl".to_owned());
+        }
+        if self.modifiers.contains(KeyModifiers::ALT) {
+            parts.push("Alt".to_owned());
+        }
+        if self.modifiers.contains(KeyModifiers::SHIFT) {
+            parts.push("Shift".to_owned());
+        }
+        if self.modifiers.contains(KeyModifiers::SUPER) {
+            parts.push("Super".to_owned());
+        }
+        parts.push(match self.code {
+            KeyCode::Backspace => "Backspace".to_owned(),
+            KeyCode::Enter => "Enter".to_owned(),
+            KeyCode::Left => "Left".to_owned(),
+            KeyCode::Right => "Right".to_owned(),
+            KeyCode::Up => "Up".to_owned(),
+            KeyCode::Down => "Down".to_owned(),
+            KeyCode::Home => "Home".to_owned(),
+            KeyCode::End => "End".to_owned(),
+            KeyCode::PageUp => "PageUp".to_owned(),
+            KeyCode::PageDown => "PageDown".to_owned(),
+            KeyCode::Tab => "Tab".to_owned(),
+            KeyCode::BackTab => "BackTab".to_owned(),
+            KeyCode::Delete => "Delete".to_owned(),
+            KeyCode::Insert => "Insert".to_owned(),
+            KeyCode::F(number) => format!("F{number}"),
+            KeyCode::Char(' ') => "Space".to_owned(),
+            KeyCode::Char(character) => character.to_string().to_uppercase(),
+            KeyCode::Esc => "Esc".to_owned(),
+            _ => "Key".to_owned(),
+        });
+        parts.join("-")
+    }
+}
+
+/// Configurable global navigation bindings.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShellBindings {
+    /// Chords that arm the shell leader.
+    pub leaders: Vec<KeyBinding>,
+    /// Chords that open the command palette.
+    pub palette: Vec<KeyBinding>,
+    /// Chords that focus the next screen.
+    pub next_screen: Vec<KeyBinding>,
+    /// Chords that focus the previous screen.
+    pub previous_screen: Vec<KeyBinding>,
+    /// Modifiers which, with digits 1 through 9, jump to a screen.
+    pub jump_modifiers: Vec<KeyModifiers>,
+}
+
+impl Default for ShellBindings {
+    fn default() -> Self {
+        Self {
+            leaders: vec![
+                KeyBinding::new(KeyCode::Char(' '), KeyModifiers::CONTROL),
+                KeyBinding::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+            ],
+            palette: vec![KeyBinding::new(KeyCode::Char('p'), KeyModifiers::CONTROL)],
+            next_screen: vec![
+                KeyBinding::new(KeyCode::Right, KeyModifiers::ALT),
+                KeyBinding::new(KeyCode::PageDown, KeyModifiers::CONTROL),
+            ],
+            previous_screen: vec![
+                KeyBinding::new(KeyCode::Left, KeyModifiers::ALT),
+                KeyBinding::new(KeyCode::PageUp, KeyModifiers::CONTROL),
+            ],
+            jump_modifiers: vec![KeyModifiers::ALT],
+        }
+    }
+}
+
+impl ShellBindings {
+    fn matches(bindings: &[KeyBinding], key: KeyEvent) -> bool {
+        bindings.iter().any(|binding| binding.matches(key))
+    }
+
+    pub(crate) fn primary_leader_label(&self) -> String {
+        self.leaders
+            .first()
+            .map_or_else(|| "leader".to_owned(), |binding| binding.label())
+    }
+
+    pub(crate) fn primary_palette_label(&self) -> String {
+        self.palette
+            .first()
+            .map_or_else(|| "palette".to_owned(), |binding| binding.label())
+    }
+
+    pub(crate) fn primary_next_label(&self) -> String {
+        self.next_screen
+            .first()
+            .map_or_else(|| "next".to_owned(), |binding| binding.label())
+    }
+
+    pub(crate) fn primary_previous_label(&self) -> String {
+        self.previous_screen
+            .first()
+            .map_or_else(|| "previous".to_owned(), |binding| binding.label())
+    }
+
+    pub(crate) fn primary_jump_label(&self) -> String {
+        self.jump_modifiers.first().map_or_else(
+            || "1…9".to_owned(),
+            |modifiers| {
+                KeyBinding::new(KeyCode::Char('1'), *modifiers)
+                    .label()
+                    .replace('1', "1…9")
+            },
+        )
+    }
+}
+
 /// Configuration for shell chrome and terminal behavior.
 #[derive(Clone, Debug)]
 pub struct ShellConfig {
@@ -60,6 +198,8 @@ pub struct ShellConfig {
     pub mouse_capture: bool,
     /// Semantic shell styles.
     pub theme: Theme,
+    /// Global navigation key bindings.
+    pub bindings: ShellBindings,
 }
 
 impl ShellConfig {
@@ -71,6 +211,7 @@ impl ShellConfig {
             direct_detach: true,
             mouse_capture: false,
             theme: Theme::default(),
+            bindings: ShellBindings::default(),
         }
     }
 
@@ -99,6 +240,13 @@ impl ShellConfig {
     #[must_use]
     pub fn with_theme(mut self, theme: Theme) -> Self {
         self.theme = theme;
+        self
+    }
+
+    /// Replaces the shell's global navigation bindings.
+    #[must_use]
+    pub fn with_bindings(mut self, bindings: ShellBindings) -> Self {
+        self.bindings = bindings;
         self
     }
 }
@@ -329,15 +477,33 @@ impl Shell {
             return self.handle_leader_key(key);
         }
 
-        if is_ctrl(key, 'g') {
+        if ShellBindings::matches(&self.config.bindings.leaders, key) {
             self.leader_armed = true;
-            self.notice = Some("Ctrl-G: d detach · s palette · ? help".to_string());
+            self.notice =
+                Some("Leader: 1-9 jump · n/p switch · d detach · s commands · ? help".to_string());
             self.dirty = true;
             return ShellSignal::Continue;
         }
 
-        if is_ctrl(key, 'p') {
+        if ShellBindings::matches(&self.config.bindings.palette, key) {
             self.open_palette();
+            return ShellSignal::Continue;
+        }
+
+        // Direct screen navigation is intentionally available even when the
+        // active surface captures ordinary input.
+        if ShellBindings::matches(&self.config.bindings.previous_screen, key) {
+            self.select_relative(-1);
+            return ShellSignal::Continue;
+        }
+        if ShellBindings::matches(&self.config.bindings.next_screen, key) {
+            self.select_relative(1);
+            return ShellSignal::Continue;
+        }
+        if let KeyCode::Char(digit @ '1'..='9') = key.code
+            && self.config.bindings.jump_modifiers.contains(&key.modifiers)
+        {
+            self.select_numbered(digit);
             return ShellSignal::Continue;
         }
 
@@ -392,6 +558,10 @@ impl Shell {
                 self.select_relative(-1);
                 ShellSignal::Continue
             }
+            KeyCode::Char(digit @ '1'..='9') => {
+                self.select_numbered(digit);
+                ShellSignal::Continue
+            }
             KeyCode::Char('x') => self.close_active(),
             KeyCode::Char('?') | KeyCode::Char('h') => {
                 self.overlay = Some(Overlay::Help);
@@ -400,7 +570,8 @@ impl Shell {
             }
             KeyCode::Esc => ShellSignal::Continue,
             _ => {
-                self.notice = Some("Unknown Ctrl-G chord; press Ctrl-G ? for help".to_string());
+                let leader = self.config.bindings.primary_leader_label();
+                self.notice = Some(format!("Unknown {leader} chord; press {leader} ? for help"));
                 self.dirty = true;
                 ShellSignal::Continue
             }
@@ -631,31 +802,31 @@ impl Shell {
         items.extend([
             PaletteItem {
                 label: "Next surface".to_owned(),
-                detail: "shell · Ctrl-G n".to_owned(),
+                detail: format!("shell · {}", self.config.bindings.primary_next_label()),
                 status: None,
                 action: PaletteAction::NextSurface,
             },
             PaletteItem {
                 label: "Previous surface".to_owned(),
-                detail: "shell · Ctrl-G p".to_owned(),
+                detail: format!("shell · {}", self.config.bindings.primary_previous_label()),
                 status: None,
                 action: PaletteAction::PreviousSurface,
             },
             PaletteItem {
                 label: "Close active surface".to_owned(),
-                detail: "shell · Ctrl-G x".to_owned(),
+                detail: format!("shell · {} x", self.config.bindings.primary_leader_label()),
                 status: None,
                 action: PaletteAction::CloseSurface,
             },
             PaletteItem {
                 label: "Detach".to_owned(),
-                detail: "shell · Ctrl-G d".to_owned(),
+                detail: format!("shell · {} d", self.config.bindings.primary_leader_label()),
                 status: None,
                 action: PaletteAction::Detach,
             },
             PaletteItem {
                 label: "Show keyboard help".to_owned(),
-                detail: "shell · Ctrl-G ?".to_owned(),
+                detail: format!("shell · {} ?", self.config.bindings.primary_leader_label()),
                 status: None,
                 action: PaletteAction::Help,
             },
@@ -712,6 +883,20 @@ impl Shell {
         }
     }
 
+    fn select_numbered(&mut self, digit: char) {
+        let index = usize::from(digit as u8 - b'1');
+        if index < self.entries.len() {
+            self.select_index(index);
+        } else {
+            self.notice = Some(format!(
+                "Screen {digit} is not open · {} screen{} available",
+                self.entries.len(),
+                if self.entries.len() == 1 { "" } else { "s" }
+            ));
+            self.dirty = true;
+        }
+    }
+
     fn select_index(&mut self, index: usize) {
         if self.entries.is_empty() || index >= self.entries.len() || self.active == Some(index) {
             return;
@@ -732,6 +917,10 @@ impl Shell {
 
     pub(crate) fn active_index(&self) -> Option<usize> {
         self.active
+    }
+
+    pub(crate) fn active_position(&self) -> Option<(usize, usize)> {
+        self.active.map(|index| (index + 1, self.entries.len()))
     }
 
     pub(crate) fn active_surface_mut(&mut self) -> Option<&mut (dyn Surface + '_)> {

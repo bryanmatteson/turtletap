@@ -7,8 +7,8 @@ use std::{
 
 use crossterm::event::{MouseButton, MouseEventKind};
 use turtletap::{
-    Event, Frame, InputPolicy, KeyCode, KeyEvent, KeyModifiers, MouseEvent, Rect, Shell,
-    ShellConfig, ShellSignal, Surface, SurfaceAction, SurfaceEvent,
+    Event, Frame, InputPolicy, KeyBinding, KeyCode, KeyEvent, KeyModifiers, MouseEvent, Rect,
+    Shell, ShellBindings, ShellConfig, ShellSignal, Surface, SurfaceAction, SurfaceEvent,
 };
 
 struct Probe {
@@ -141,6 +141,79 @@ fn leader_d_detaches_from_a_captured_surface() {
 }
 
 #[test]
+fn ctrl_space_is_the_primary_leader() {
+    let (surface, events) = Probe::new("terminal", InputPolicy::Captured);
+    let mut shell = Shell::new(ShellConfig::new("Talos"));
+    shell.add_surface(surface);
+
+    shell.handle_event(key(KeyCode::Char(' '), KeyModifiers::CONTROL));
+    let signal = shell.handle_event(key(KeyCode::Char('d'), KeyModifiers::empty()));
+
+    assert_eq!(signal, ShellSignal::Exit(turtletap::ExitReason::Detached));
+    assert!(
+        events
+            .lock()
+            .expect("probe lock should be healthy")
+            .is_empty()
+    );
+}
+
+#[test]
+fn direct_alt_bindings_switch_and_jump_across_captured_surfaces() {
+    let (first, _) = Probe::new("first", InputPolicy::Captured);
+    let (second, _) = Probe::new("second", InputPolicy::Captured);
+    let (third, _) = Probe::new("third", InputPolicy::Captured);
+    let mut shell = Shell::new(ShellConfig::new("Koda"));
+    let first_id = shell.add_surface(first);
+    let second_id = shell.add_surface(second);
+    shell.add_surface(third);
+
+    shell.handle_event(key(KeyCode::Left, KeyModifiers::ALT));
+    assert_eq!(shell.active_id(), Some(second_id));
+
+    shell.handle_event(key(KeyCode::Char('1'), KeyModifiers::ALT));
+    assert_eq!(shell.active_id(), Some(first_id));
+}
+
+#[test]
+fn host_can_replace_the_default_screen_bindings() {
+    let (first, _) = Probe::new("first", InputPolicy::Captured);
+    let (second, _) = Probe::new("second", InputPolicy::Captured);
+    let bindings = ShellBindings {
+        next_screen: vec![KeyBinding::new(KeyCode::Char('j'), KeyModifiers::CONTROL)],
+        previous_screen: Vec::new(),
+        ..ShellBindings::default()
+    };
+    let mut shell = Shell::new(ShellConfig::new("Koda").with_bindings(bindings));
+    let first_id = shell.add_surface(first);
+    shell.add_surface(second);
+
+    shell.handle_event(key(KeyCode::Right, KeyModifiers::ALT));
+    assert_ne!(shell.active_id(), Some(first_id));
+
+    shell.handle_event(key(KeyCode::Char('j'), KeyModifiers::CONTROL));
+    assert_eq!(shell.active_id(), Some(first_id));
+}
+
+#[test]
+fn contextual_help_renders_the_configured_primary_bindings() {
+    let (surface, _) = Probe::new("terminal", InputPolicy::Captured);
+    let bindings = ShellBindings {
+        leaders: vec![KeyBinding::new(KeyCode::Char('a'), KeyModifiers::CONTROL)],
+        ..ShellBindings::default()
+    };
+    let mut shell = Shell::new(ShellConfig::new("Koda").with_bindings(bindings));
+    shell.add_surface(surface);
+
+    shell.handle_event(key(KeyCode::Char('a'), KeyModifiers::CONTROL));
+    shell.handle_event(key(KeyCode::Char('?'), KeyModifiers::empty()));
+    let rendered = shell.render_to_string(80, 18).expect("help should render");
+
+    assert!(rendered.contains("Ctrl-A d"));
+    assert!(!rendered.contains("Ctrl-Space d"));
+}
+
+#[test]
 fn palette_numbers_select_the_visible_surface() {
     let (first, _) = Probe::new("first", InputPolicy::Shell);
     let (second, _) = Probe::new("second", InputPolicy::Shell);
@@ -232,8 +305,26 @@ fn rendered_chrome_follows_the_active_surface() {
     assert!(rendered.contains("Koda"));
     assert!(rendered.contains("agent"));
     assert!(rendered.contains("terminal body"));
-    assert!(rendered.contains("Ctrl-G"));
-    assert!(rendered.contains("detach"));
+    assert!(rendered.contains("Alt-Left/Alt-Right"));
+    assert!(rendered.contains("screen 2/2"));
+}
+
+#[test]
+fn overflowing_tabs_keep_the_active_screen_visible() {
+    let mut shell = Shell::new(ShellConfig::new("Koda"));
+    for title in ["one-long", "two-long", "three-long", "four-long"] {
+        let (surface, _) = Probe::new(title, InputPolicy::Captured);
+        shell.add_surface(surface);
+    }
+
+    let rendered = shell
+        .render_to_string(34, 8)
+        .expect("narrow shell should render");
+    let tab_row = rendered.lines().next().expect("shell has a tab row");
+
+    assert!(tab_row.contains("4:○ four-long"), "{tab_row:?}");
+    assert!(tab_row.contains('‹'), "{tab_row:?}");
+    assert!(!tab_row.contains("one-long"), "{tab_row:?}");
 }
 
 #[test]

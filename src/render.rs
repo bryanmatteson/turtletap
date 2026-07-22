@@ -49,23 +49,95 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, shell: &mut Shell) {
     ];
     let mut x = area.x.saturating_add(host_width.saturating_add(2));
 
-    for (index, (_, surface)) in shell.entries().enumerate() {
-        let title = surface.title();
-        let text = format!(" {} {} ", surface.status().marker(), title);
-        let width = cell_width(&text);
-        let style = if shell.active_index() == Some(index) {
-            shell.config.theme.selected
-        } else {
-            shell.config.theme.chrome
-        };
-        spans.push(Span::styled(text, style));
-        spans.push(Span::raw(" "));
-        tab_hits.push((Rect::new(x, area.y, width, 1), index));
-        x = x.saturating_add(width.saturating_add(1));
+    let active = shell.active_index().unwrap_or_default();
+    let tabs: Vec<_> = shell
+        .entries()
+        .enumerate()
+        .map(|(index, (_, surface))| {
+            let text = format!(
+                " {}:{} {} ",
+                index + 1,
+                surface.status().marker(),
+                surface.title()
+            );
+            let width = cell_width(&text);
+            let style = if active == index {
+                shell.config.theme.selected
+            } else {
+                shell.config.theme.chrome
+            };
+            (index, text, width, style)
+        })
+        .collect();
+    let available = area.width.saturating_sub(host_width.saturating_add(2));
+    let widths: Vec<_> = tabs.iter().map(|(_, _, width, _)| *width).collect();
+    let visible = visible_tab_range(&widths, active, available);
+
+    if visible.start > 0 {
+        spans.push(Span::styled("‹ ", shell.config.theme.muted));
+        x = x.saturating_add(2);
+    }
+    for (visible_index, (index, text, width, style)) in tabs[visible.clone()].iter().enumerate() {
+        spans.push(Span::styled(text.clone(), *style));
+        tab_hits.push((Rect::new(x, area.y, *width, 1), *index));
+        x = x.saturating_add(*width);
+        if visible_index + 1 < visible.len() {
+            spans.push(Span::raw(" "));
+            x = x.saturating_add(1);
+        }
+    }
+    if visible.end < tabs.len() {
+        spans.push(Span::styled(" ›", shell.config.theme.muted));
     }
     shell.tab_hits = tab_hits;
 
     frame.render_widget(Line::from(spans), area);
+}
+
+fn visible_tab_range(widths: &[u16], active: usize, available: u16) -> std::ops::Range<usize> {
+    if widths.is_empty() || available == 0 {
+        return 0..0;
+    }
+
+    let active = active.min(widths.len() - 1);
+    let full_width = widths
+        .iter()
+        .copied()
+        .reduce(|total, width| total.saturating_add(1).saturating_add(width))
+        .unwrap_or_default();
+    if full_width <= available {
+        return 0..widths.len();
+    }
+
+    let mut best = active..active + 1;
+    let mut best_rank = (1_usize, 0_u16, usize::MAX);
+    for start in 0..=active {
+        let mut tab_width = 0_u16;
+        for end in start + 1..=widths.len() {
+            tab_width = tab_width
+                .saturating_add(widths[end - 1])
+                .saturating_add(u16::from(end > start + 1));
+            if end <= active {
+                continue;
+            }
+            let occupied = tab_width
+                .saturating_add(if start > 0 { 2 } else { 0 })
+                .saturating_add(if end < widths.len() { 2 } else { 0 });
+            if occupied > available {
+                continue;
+            }
+            let count = end - start;
+            let imbalance = active
+                .saturating_sub(start)
+                .abs_diff(end.saturating_sub(active + 1));
+            let rank = (count, occupied, usize::MAX - imbalance);
+            if rank > best_rank {
+                best = start..end;
+                best_rank = rank;
+            }
+        }
+    }
+    best
 }
 
 fn draw_active(frame: &mut Frame<'_>, area: Rect, shell: &mut Shell) {
@@ -97,6 +169,10 @@ fn draw_active(frame: &mut Frame<'_>, area: Rect, shell: &mut Shell) {
 }
 
 fn draw_status(frame: &mut Frame<'_>, area: Rect, shell: &Shell) {
+    let previous = shell.config.bindings.primary_previous_label();
+    let next = shell.config.bindings.primary_next_label();
+    let jump = shell.config.bindings.primary_jump_label();
+    let palette = shell.config.bindings.primary_palette_label();
     let content = if let Some(notice) = &shell.notice {
         Line::styled(format!(" {notice}"), shell.config.theme.attention)
     } else if shell
@@ -104,28 +180,43 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, shell: &Shell) {
         .is_some_and(|surface| surface.input_policy() == crate::InputPolicy::Captured)
     {
         Line::from(vec![
-            Span::styled(" Ctrl-G", shell.config.theme.accent),
-            Span::styled(" then ", shell.config.theme.muted),
-            Span::styled("s", shell.config.theme.accent),
-            Span::styled(" palette · ", shell.config.theme.muted),
-            Span::styled("d", shell.config.theme.accent),
-            Span::styled(" detach · ", shell.config.theme.muted),
-            Span::styled("?", shell.config.theme.accent),
-            Span::styled(" help", shell.config.theme.muted),
+            Span::styled(format!(" {previous}/{next}"), shell.config.theme.accent),
+            Span::styled(" switch · ", shell.config.theme.muted),
+            Span::styled(jump, shell.config.theme.accent),
+            Span::styled(" jump · ", shell.config.theme.muted),
+            Span::styled(palette, shell.config.theme.accent),
+            Span::styled(" commands", shell.config.theme.muted),
         ])
     } else {
         Line::from(vec![
             Span::styled(" Tab", shell.config.theme.accent),
             Span::styled(" switch · ", shell.config.theme.muted),
+            Span::styled(jump, shell.config.theme.accent),
+            Span::styled(" jump · ", shell.config.theme.muted),
             Span::styled("Ctrl-D", shell.config.theme.accent),
             Span::styled(" detach · ", shell.config.theme.muted),
-            Span::styled("Ctrl-P", shell.config.theme.accent),
-            Span::styled(" palette · ", shell.config.theme.muted),
             Span::styled("?", shell.config.theme.accent),
             Span::styled(" help", shell.config.theme.muted),
         ])
     };
-    frame.render_widget(content, area);
+    let position = shell
+        .active_position()
+        .map_or_else(String::new, |(active, total)| {
+            format!("screen {active}/{total} ")
+        });
+    let position_width = cell_width(&position);
+    let sections = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(position_width.min(area.width)),
+        ])
+        .split(area);
+    frame.render_widget(content, sections[0]);
+    frame.render_widget(
+        Line::styled(position, shell.config.theme.muted).right_aligned(),
+        sections[1],
+    );
 }
 
 fn draw_palette(
@@ -201,13 +292,30 @@ fn draw_palette(
 }
 
 fn draw_help(frame: &mut Frame<'_>, viewport: Rect, shell: &Shell) {
+    let previous = shell.config.bindings.primary_previous_label();
+    let next = shell.config.bindings.primary_next_label();
+    let jump = shell.config.bindings.primary_jump_label();
+    let palette = shell.config.bindings.primary_palette_label();
+    let leader = shell.config.bindings.primary_leader_label();
     let mut lines = vec![
-        help_line("Ctrl-G d", "Detach and return to the host terminal", shell),
-        help_line("Ctrl-P", "Open the command palette", shell),
-        help_line("Ctrl-G s", "Open the command palette", shell),
-        help_line("Ctrl-G n/p", "Focus next or previous surface", shell),
-        help_line("Ctrl-G x", "Close only the active surface", shell),
-        help_line("Ctrl-G ?", "Open this help", shell),
+        help_line(
+            &format!("{previous} / {next}"),
+            "Focus previous or next screen",
+            shell,
+        ),
+        help_line(&jump, "Jump directly to a numbered screen", shell),
+        help_line(&palette, "Open the command palette", shell),
+        help_line(
+            &format!("{leader} d"),
+            "Detach and return to the host terminal",
+            shell,
+        ),
+        help_line(
+            &format!("{leader} x"),
+            "Close only the active surface",
+            shell,
+        ),
+        help_line(&format!("{leader} ?"), "Show keyboard help", shell),
     ];
 
     if let Some(surface) = shell.active_surface() {
@@ -242,7 +350,7 @@ fn draw_help(frame: &mut Frame<'_>, viewport: Rect, shell: &Shell) {
 
 fn help_line(key: &str, description: &str, shell: &Shell) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{key:<12}"), shell.config.theme.accent),
+        Span::styled(format!("{key:<18}"), shell.config.theme.accent),
         Span::raw(description.to_owned()),
     ])
 }

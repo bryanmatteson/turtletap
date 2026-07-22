@@ -9,7 +9,8 @@ pub enum InputPolicy {
     /// TurtleTap handles its direct shortcuts before forwarding unrecognized input.
     #[default]
     Shell,
-    /// Turtle forwards all ordinary input, reserving only the `Ctrl-G` leader.
+    /// Turtle forwards ordinary input while reserving screen navigation and the
+    /// configured leader chords.
     Captured,
 }
 

@@ -9,7 +9,9 @@ mod theme;
 
 pub use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 pub use ratatui::{Frame, layout::Rect};
-pub use shell::{ExitReason, Shell, ShellConfig, ShellSignal, SurfaceId};
+pub use shell::{
+    ExitReason, KeyBinding, Shell, ShellBindings, ShellConfig, ShellSignal, SurfaceId,
+};
 pub use surface::{InputPolicy, Shortcut, Surface, SurfaceAction, SurfaceEvent, SurfaceStatus};
 pub use theme::Theme;
 

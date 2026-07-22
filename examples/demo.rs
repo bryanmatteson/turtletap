@@ -103,7 +103,7 @@ fn main() -> std::io::Result<()> {
         true,
         &[
             "This surface captures ordinary keys.",
-            "Ctrl-D is delivered here; Ctrl-G d detaches.",
+            "Ctrl-D is delivered here; Ctrl-Space d detaches.",
         ],
     ));
 
