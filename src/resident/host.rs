@@ -202,6 +202,17 @@ struct StoredManifest {
     name: String,
 }
 
+#[derive(Deserialize)]
+struct LegacyStoredSession {
+    control: SessionControlSnapshot,
+    state: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+struct LegacyRootCheckpoint {
+    sessions: Vec<LegacyStoredSession>,
+}
+
 struct HostState<A: ResidentApplication> {
     application: A,
     config: ResidentHostConfig,
@@ -293,6 +304,31 @@ impl<A: ResidentApplication> HostState<A> {
                 }
             }
             sessions.insert(id, HostedSession { session, events });
+        }
+
+        let legacy_root = config.state_dir.join("checkpoint.json");
+        if let Ok(Some(legacy)) =
+            FileJournal::<A::Event>::read_checkpoint::<LegacyRootCheckpoint>(&legacy_root)
+        {
+            for stored in legacy.sessions {
+                let id = stored.control.id;
+                if sessions.contains_key(&id) {
+                    continue;
+                }
+                let state = application
+                    .migrate(0, stored.state)
+                    .map_err(io::Error::other)?;
+                let session = application.restore(state).map_err(io::Error::other)?;
+                core.restore_session(stored.control)
+                    .map_err(io::Error::other)?;
+                sessions.insert(
+                    id,
+                    HostedSession {
+                        session,
+                        events: VecDeque::new(),
+                    },
+                );
+            }
         }
 
         if sessions.is_empty()

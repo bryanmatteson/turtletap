@@ -16,6 +16,11 @@ struct StoredSessionFixture {
     state: serde_json::Value,
 }
 
+#[derive(Deserialize)]
+struct LegacyRootFixture {
+    sessions: Vec<StoredSessionFixture>,
+}
+
 #[test]
 fn protocol_v1_fixtures_remain_readable() {
     let client: ClientHello = fixture("protocol/client-hello-v1.json");
@@ -51,6 +56,10 @@ fn storage_v0_and_v1_fixtures_remain_readable() {
     let record: JournalRecord<serde_json::Value> = fixture("storage/journal-record-v1.json");
     assert_eq!(record.sequence.0, 2);
     assert_eq!(record.event["value"], 41);
+
+    let root: LegacyRootFixture = fixture("storage/root-checkpoint-host-v0.json");
+    assert_eq!(root.sessions.len(), 1);
+    assert_eq!(root.sessions[0].control.name, "fixture");
 }
 
 fn fixture<T: serde::de::DeserializeOwned>(path: &str) -> T {
@@ -75,6 +84,9 @@ fn fixture<T: serde::de::DeserializeOwned>(path: &str) -> T {
         }
         "storage/journal-record-v1.json" => {
             include_str!("fixtures/storage/journal-record-v1.json")
+        }
+        "storage/root-checkpoint-host-v0.json" => {
+            include_str!("fixtures/storage/root-checkpoint-host-v0.json")
         }
         _ => panic!("unknown fixture: {path}"),
     };

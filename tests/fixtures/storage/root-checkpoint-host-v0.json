@@ -1,0 +1,14 @@
+{
+  "sessions": [
+    {
+      "control": {
+        "id": "33333333-3333-4333-8333-333333333333",
+        "name": "fixture",
+        "sequence": 0,
+        "lease_epoch": 1,
+        "committed": []
+      },
+      "state": { "value": 40 }
+    }
+  ]
+}

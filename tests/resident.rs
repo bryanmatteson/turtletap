@@ -739,6 +739,54 @@ fn version_zero_checkpoint_is_migrated_in_place() {
 }
 
 #[test]
+fn root_only_legacy_session_is_imported_into_per_session_storage() {
+    let resident = ResidentSession::start();
+    let mut client = resident.client();
+    let created = client
+        .request(ClientRequest::CreateSession {
+            name: "legacy-only".to_owned(),
+        })
+        .expect("legacy session should be created");
+    let ControlResult::Created { session } = created else {
+        panic!("wrong create result");
+    };
+    drop(client);
+    assert_success(&resident.command(&["stop"]), "stop");
+    resident.wait_stopped();
+
+    let session_directory = resident.state.join(session.id.to_string());
+    let checkpoint: serde_json::Value = serde_json::from_slice(
+        &fs::read(session_directory.join("checkpoint.json"))
+            .expect("session checkpoint should be readable"),
+    )
+    .expect("session checkpoint should be JSON");
+    fs::write(
+        resident.state.join("checkpoint.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "sessions": [{
+                "control": checkpoint["control"],
+                "state": checkpoint["state"]
+            }]
+        }))
+        .expect("legacy root should encode"),
+    )
+    .expect("legacy root should write");
+    fs::remove_dir_all(&session_directory).expect("per-session state should be removed");
+
+    assert_success(&resident.command(&["start"]), "legacy root import");
+    let sessions = resident.command(&["list"]);
+    assert_success(&sessions, "list after legacy root import");
+    assert!(
+        String::from_utf8_lossy(&sessions.stdout).contains("legacy-only"),
+        "legacy-only session was not imported"
+    );
+    assert!(
+        session_directory.join("checkpoint.json").exists(),
+        "legacy session was not migrated to per-session storage"
+    );
+}
+
+#[test]
 fn killed_leader_is_replaced_and_sessions_restore() {
     let resident = ResidentSession::start();
     let original = resident.pid();
