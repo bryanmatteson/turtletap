@@ -6,6 +6,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::value::RawValue;
 
 use super::{EventSequence, RequestId};
 
@@ -30,9 +31,9 @@ pub struct JournalRecord<E> {
     pub event: E,
 }
 
-#[derive(Deserialize, Serialize)]
-struct StoredRecord<E> {
-    record: JournalRecord<E>,
+#[derive(Deserialize)]
+struct RawStoredRecord {
+    record: Box<RawValue>,
     checksum: u32,
 }
 
@@ -148,12 +149,11 @@ where
                 break;
             }
             line.pop();
-            let stored: StoredRecord<E> = serde_json::from_slice(&line)?;
-            let payload = serde_json::to_vec(&stored.record)?;
-            if crc32fast::hash(&payload) != stored.checksum {
+            let stored: RawStoredRecord = serde_json::from_slice(&line)?;
+            if crc32fast::hash(stored.record.get().as_bytes()) != stored.checksum {
                 return Err(JournalError::Corrupt { line: line_number });
             }
-            records.push(stored.record);
+            records.push(serde_json::from_str(stored.record.get())?);
         }
         Ok(records)
     }
@@ -241,6 +241,18 @@ mod tests {
 
     use super::*;
 
+    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    struct LegacyEvent {
+        value: String,
+    }
+
+    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    struct CurrentEvent {
+        value: String,
+        #[serde(default)]
+        added_later: Option<u64>,
+    }
+
     fn path(name: &str) -> PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -289,6 +301,35 @@ mod tests {
             .compact(std::slice::from_ref(&latest))
             .expect("compact");
         assert_eq!(journal.load().expect("load"), vec![latest]);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn checksum_survives_compatible_schema_evolution() {
+        let path = path("schema-evolution-journal");
+        let legacy = FileJournal::new(&path, Durability::Flush);
+        legacy
+            .append(&JournalRecord {
+                sequence: EventSequence(1),
+                request: None,
+                event: LegacyEvent {
+                    value: "before-upgrade".to_owned(),
+                },
+            })
+            .expect("append legacy record");
+
+        let current = FileJournal::<CurrentEvent>::new(&path, Durability::Flush);
+        assert_eq!(
+            current.load().expect("load evolved record"),
+            vec![JournalRecord {
+                sequence: EventSequence(1),
+                request: None,
+                event: CurrentEvent {
+                    value: "before-upgrade".to_owned(),
+                    added_later: None,
+                },
+            }]
+        );
         let _ = fs::remove_file(path);
     }
 }

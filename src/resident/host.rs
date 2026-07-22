@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fs, io,
     path::{Path, PathBuf},
     time::Duration,
@@ -9,15 +9,16 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use super::{
     ApplicationError, AttachmentMode, Authorization, ClientEnvelope, ClientHello, ClientInstanceId,
-    ClientRequest, ConnectionId, ControlResult, DriverChange, Durability, EventSequence,
-    FileJournal, JournalRecord, LeaderCapabilities, LeaderCore, LeaderInstanceId, LeaderLock,
-    ProtocolRejection, RequestId, ResidentApplication, ResidentSession, ServerHandshake,
-    ServerHello, ServerMessage, SessionControlSnapshot, SessionId, SessionSelector, SessionSummary,
-    SessionTransition, ShutdownReason, VersionRange, WireError, encode_frame,
+    ClientRequest, ConnectionId, ControlResult, DriverChange, Durability, EffectCancellation,
+    EffectContext, EffectDelivery, EffectId, EffectRequest, EventSequence, FileJournal,
+    JournalRecord, LeaderCapabilities, LeaderCore, LeaderInstanceId, LeaderLock, ProtocolRejection,
+    RequestId, ResidentApplication, ResidentSession, ServerHandshake, ServerHello, ServerMessage,
+    SessionControlSnapshot, SessionId, SessionSelector, SessionSummary, SessionTransition,
+    ShutdownReason, VersionRange, WireError, encode_frame,
     runtime::{Clock, FrameWriter as _, Listener as _, Spawner, Transport},
 };
 
-const HOST_STORAGE_VERSION: u32 = 1;
+const HOST_STORAGE_VERSION: u32 = 2;
 
 /// Configuration shared by every resident application host.
 #[derive(Clone, Debug)]
@@ -38,6 +39,10 @@ pub struct ResidentHostConfig {
     pub durability: Durability,
     /// Session created when no durable sessions exist.
     pub initial_session: Option<String>,
+    /// Default deadline for an effect without an explicit timeout.
+    pub effect_timeout: Option<Duration>,
+    /// Maximum effects executing concurrently across all sessions.
+    pub max_concurrent_effects: usize,
 }
 
 impl ResidentHostConfig {
@@ -57,6 +62,8 @@ impl ResidentHostConfig {
             event_history: 1_024,
             durability: Durability::Flush,
             initial_session: None,
+            effect_timeout: Some(Duration::from_secs(30 * 60)),
+            max_concurrent_effects: 32,
         }
     }
 
@@ -112,7 +119,10 @@ where
 
         let leader = LeaderInstanceId::new();
         let inbound_capacity = self.config.outbound_capacity.saturating_mul(4).max(64);
-        let (incoming_tx, incoming_rx) = async_channel::bounded(inbound_capacity);
+        let (incoming_tx, incoming_rx): (
+            IncomingSender<A::EffectOutput>,
+            IncomingReceiver<A::EffectOutput>,
+        ) = async_channel::bounded(inbound_capacity);
         let next_connection = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
 
         let accept_runtime = self.runtime.clone();
@@ -148,7 +158,7 @@ where
         });
 
         let tick_runtime = self.runtime.clone();
-        let tick_sender = incoming_tx;
+        let tick_sender = incoming_tx.clone();
         let tick_rate = self.config.tick_rate.max(Duration::from_millis(1));
         self.runtime.clone().spawn(async move {
             loop {
@@ -159,12 +169,20 @@ where
             }
         });
 
-        let mut state = HostState::load(self.application, self.config, leader, incoming_rx)?;
+        let mut state = HostState::load(
+            self.application,
+            self.runtime,
+            self.config,
+            leader,
+            incoming_tx,
+            incoming_rx,
+        )?;
+        state.dispatch_recovered_effects()?;
         state.run().await
     }
 }
 
-enum Incoming {
+enum Incoming<O> {
     Connected {
         connection: ConnectionId,
         client: ClientInstanceId,
@@ -175,13 +193,74 @@ enum Incoming {
         envelope: ClientEnvelope,
     },
     Disconnected(ConnectionId),
+    EffectCompleted {
+        session: SessionId,
+        effect: EffectId,
+        output: Result<O, ApplicationError>,
+    },
+    EffectTimedOut {
+        session: SessionId,
+        effect: EffectId,
+    },
     Tick(Duration),
     ListenerFailed(io::Error),
 }
 
+type IncomingSender<O> = async_channel::Sender<Incoming<O>>;
+type IncomingReceiver<O> = async_channel::Receiver<Incoming<O>>;
+
 struct HostedSession<A: ResidentApplication> {
     session: A::Session,
     events: VecDeque<(EventSequence, A::Event)>,
+    pending_effects: VecDeque<PendingEffect<A::Effect>>,
+    active_effect: Option<ActiveEffect>,
+    log_sequence: EventSequence,
+}
+
+#[derive(Clone)]
+struct PendingEffect<F> {
+    id: EffectId,
+    delivery: EffectDelivery,
+    attempts: u32,
+    effect: F,
+    timeout: Option<Duration>,
+}
+
+struct ActiveEffect {
+    id: EffectId,
+    cancellation: EffectCancellation,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct StoredEffect {
+    id: EffectId,
+    delivery: EffectDelivery,
+    attempts: u32,
+    effect: serde_json::Value,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct SequencedEvent<E> {
+    sequence: EventSequence,
+    event: E,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum HostLogEvent<E> {
+    Transition {
+        request: Option<RequestId>,
+        control_sequence: EventSequence,
+        events: Vec<SequencedEvent<E>>,
+        effects: Vec<StoredEffect>,
+        completed_effect: Option<EffectId>,
+    },
+    EffectAttempted {
+        effect: EffectId,
+        attempt: u32,
+    },
 }
 
 #[derive(Deserialize, Serialize)]
@@ -192,6 +271,10 @@ struct StoredSession {
     application_version: u32,
     control: SessionControlSnapshot,
     state: serde_json::Value,
+    #[serde(default)]
+    log_sequence: EventSequence,
+    #[serde(default)]
+    pending_effects: Vec<StoredEffect>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -213,22 +296,32 @@ struct LegacyRootCheckpoint {
     sessions: Vec<LegacyStoredSession>,
 }
 
-struct HostState<A: ResidentApplication> {
+struct HostState<A: ResidentApplication, R: Clock + Spawner> {
     application: A,
+    runtime: R,
     config: ResidentHostConfig,
     leader: LeaderInstanceId,
     core: LeaderCore,
     sessions: HashMap<SessionId, HostedSession<A>>,
     clients: HashMap<ConnectionId, async_channel::Sender<ServerMessage>>,
-    incoming: async_channel::Receiver<Incoming>,
+    incoming_tx: IncomingSender<A::EffectOutput>,
+    incoming: IncomingReceiver<A::EffectOutput>,
+    ready_effects: VecDeque<SessionId>,
+    ready_effect_set: HashSet<SessionId>,
 }
 
-impl<A: ResidentApplication> HostState<A> {
+impl<A, R> HostState<A, R>
+where
+    A: ResidentApplication,
+    R: Clock + Spawner,
+{
     fn load(
         application: A,
+        runtime: R,
         config: ResidentHostConfig,
         leader: LeaderInstanceId,
-        incoming: async_channel::Receiver<Incoming>,
+        incoming_tx: IncomingSender<A::EffectOutput>,
+        incoming: IncomingReceiver<A::EffectOutput>,
     ) -> io::Result<Self> {
         let mut core = LeaderCore::new();
         let mut sessions = HashMap::new();
@@ -240,24 +333,41 @@ impl<A: ResidentApplication> HostState<A> {
             }
             prepare_private_directory(&path)?;
             let checkpoint_path = path.join("checkpoint.json");
-            let journal = FileJournal::new(path.join("journal.log"), config.durability);
-            let records = journal.load().map_err(io::Error::other)?;
             let checkpoint =
                 FileJournal::<A::Event>::read_checkpoint::<StoredSession>(&checkpoint_path);
-            let (id, mut session, checkpoint_sequence) = match checkpoint {
+            let (
+                id,
+                mut session,
+                checkpoint_sequence,
+                checkpoint_log_sequence,
+                host_version,
+                mut pending_effects,
+            ) = match checkpoint {
                 Ok(Some(stored)) => {
                     require_host_version(stored.host_version, &checkpoint_path)?;
+                    let host_version = stored.host_version;
                     let state = application
                         .migrate(stored.application_version, stored.state)
                         .map_err(io::Error::other)?;
                     let session = application.restore(state).map_err(io::Error::other)?;
                     let id = stored.control.id;
                     let checkpoint_sequence = stored.control.sequence;
+                    let pending_effects = stored
+                        .pending_effects
+                        .into_iter()
+                        .map(decode_effect)
+                        .collect::<io::Result<VecDeque<_>>>()?;
                     core.restore_session(stored.control)
                         .map_err(io::Error::other)?;
-                    (id, session, checkpoint_sequence)
+                    (
+                        id,
+                        session,
+                        checkpoint_sequence,
+                        stored.log_sequence,
+                        host_version,
+                        pending_effects,
+                    )
                 }
-                Ok(None) if records.is_empty() => continue,
                 Ok(None) | Err(_) => {
                     let manifest_path = path.join("manifest.json");
                     let manifest =
@@ -288,28 +398,106 @@ impl<A: ResidentApplication> HostState<A> {
                         .map_err(io::Error::other)?;
                     core.create_session(manifest.id, manifest.name)
                         .map_err(io::Error::other)?;
-                    (manifest.id, session, EventSequence(0))
+                    (
+                        manifest.id,
+                        session,
+                        EventSequence(0),
+                        EventSequence(0),
+                        manifest.host_version,
+                        VecDeque::new(),
+                    )
                 }
             };
             let mut events = VecDeque::new();
-            for record in records {
-                if record.sequence > checkpoint_sequence {
-                    session.replay(&record.event).map_err(io::Error::other)?;
-                    core.replay(id, record.sequence, record.request)
-                        .map_err(io::Error::other)?;
+            let mut log_sequence = checkpoint_log_sequence;
+            if host_version >= 2 {
+                let journal = FileJournal::new(path.join("journal-v2.log"), config.durability);
+                for record in journal.load().map_err(io::Error::other)? {
+                    log_sequence = log_sequence.max(record.sequence);
+                    let replay = record.sequence > checkpoint_log_sequence;
+                    match record.event {
+                        HostLogEvent::Transition {
+                            request,
+                            control_sequence,
+                            events: transition_events,
+                            effects,
+                            completed_effect,
+                        } => {
+                            let has_events = !transition_events.is_empty();
+                            for (index, event) in transition_events.into_iter().enumerate() {
+                                if replay {
+                                    session.replay(&event.event).map_err(io::Error::other)?;
+                                    core.replay(
+                                        id,
+                                        event.sequence,
+                                        (index == 0).then_some(request).flatten(),
+                                    )
+                                    .map_err(io::Error::other)?;
+                                }
+                                events.push_back((event.sequence, event.event));
+                            }
+                            if replay {
+                                if !has_events && let Some(request) = request {
+                                    core.replay(id, control_sequence, Some(request))
+                                        .map_err(io::Error::other)?;
+                                }
+                                if let Some(completed) = completed_effect {
+                                    pending_effects.retain(|effect| effect.id != completed);
+                                }
+                                pending_effects.extend(
+                                    effects
+                                        .into_iter()
+                                        .map(decode_effect)
+                                        .collect::<io::Result<Vec<_>>>()?,
+                                );
+                            }
+                        }
+                        HostLogEvent::EffectAttempted { effect, attempt } if replay => {
+                            if let Some(pending) = pending_effects
+                                .iter_mut()
+                                .find(|pending| pending.id == effect)
+                            {
+                                pending.attempts = pending.attempts.max(attempt);
+                            }
+                        }
+                        HostLogEvent::EffectAttempted { .. } => {}
+                    }
+                    while events.len() > config.event_history {
+                        events.pop_front();
+                    }
                 }
-                events.push_back((record.sequence, record.event));
-                while events.len() > config.event_history {
-                    events.pop_front();
+            } else {
+                let journal = FileJournal::new(path.join("journal.log"), config.durability);
+                for record in journal.load().map_err(io::Error::other)? {
+                    if record.sequence > checkpoint_sequence {
+                        session.replay(&record.event).map_err(io::Error::other)?;
+                        core.replay(id, record.sequence, record.request)
+                            .map_err(io::Error::other)?;
+                    }
+                    events.push_back((record.sequence, record.event));
+                    while events.len() > config.event_history {
+                        events.pop_front();
+                    }
                 }
             }
-            sessions.insert(id, HostedSession { session, events });
+            sessions.insert(
+                id,
+                HostedSession {
+                    session,
+                    events,
+                    pending_effects,
+                    active_effect: None,
+                    log_sequence,
+                },
+            );
         }
 
         let legacy_root = config.state_dir.join("checkpoint.json");
+        let mut imported_legacy_root = false;
         if let Ok(Some(legacy)) =
             FileJournal::<A::Event>::read_checkpoint::<LegacyRootCheckpoint>(&legacy_root)
         {
+            imported_legacy_root = true;
             for stored in legacy.sessions {
                 let id = stored.control.id;
                 if sessions.contains_key(&id) {
@@ -326,6 +514,9 @@ impl<A: ResidentApplication> HostState<A> {
                     HostedSession {
                         session,
                         events: VecDeque::new(),
+                        pending_effects: VecDeque::new(),
+                        active_effect: None,
+                        log_sequence: EventSequence(0),
                     },
                 );
             }
@@ -342,22 +533,36 @@ impl<A: ResidentApplication> HostState<A> {
                 HostedSession {
                     session,
                     events: VecDeque::new(),
+                    pending_effects: VecDeque::new(),
+                    active_effect: None,
+                    log_sequence: EventSequence(0),
                 },
             );
         }
 
         let state = Self {
             application,
+            runtime,
             config,
             leader,
             core,
             sessions,
             clients: HashMap::new(),
+            incoming_tx,
             incoming,
+            ready_effects: VecDeque::new(),
+            ready_effect_set: HashSet::new(),
         };
         for id in state.sessions.keys().copied() {
             state.persist_manifest(id)?;
             state.persist_checkpoint(id)?;
+        }
+        if imported_legacy_root {
+            let archive = state
+                .config
+                .state_dir
+                .join(format!("checkpoint.legacy-v0-{}.json", state.leader));
+            fs::rename(&legacy_root, archive)?;
         }
         Ok(state)
     }
@@ -374,6 +579,14 @@ impl<A: ResidentApplication> HostState<A> {
                     self.clients.insert(connection, outbound);
                 }
                 Incoming::Disconnected(connection) => self.disconnect(connection),
+                Incoming::EffectCompleted {
+                    session,
+                    effect,
+                    output,
+                } => self.complete_effect(session, effect, output)?,
+                Incoming::EffectTimedOut { session, effect } => {
+                    self.timeout_effect(session, effect)?;
+                }
                 Incoming::Message {
                     connection,
                     envelope,
@@ -501,6 +714,9 @@ impl<A: ResidentApplication> HostState<A> {
             HostedSession {
                 session,
                 events: VecDeque::new(),
+                pending_effects: VecDeque::new(),
+                active_effect: None,
+                log_sequence: EventSequence(0),
             },
         );
         self.persist_checkpoint(id).map_err(wire_io)?;
@@ -564,7 +780,7 @@ impl<A: ResidentApplication> HostState<A> {
             .command(command)
             .map_err(wire_application)?;
         let sequence = self
-            .apply_transition(session, Some(request), transition)
+            .apply_transition(session, Some(request), None, transition)
             .map_err(wire_io)?;
         Ok(ControlResult::Accepted {
             session,
@@ -577,79 +793,81 @@ impl<A: ResidentApplication> HostState<A> {
         &mut self,
         session: SessionId,
         request: Option<RequestId>,
+        completed_effect: Option<EffectId>,
         transition: SessionTransition<A::Event, A::Effect>,
     ) -> io::Result<EventSequence> {
-        enum Work<E, F> {
-            Transition(Option<RequestId>, SessionTransition<E, F>),
-            Effect(F),
-        }
-
-        let mut work = VecDeque::from([Work::Transition(request, transition)]);
         let mut request_sequence = None;
         let mut last_sequence = None;
-
-        while let Some(item) = work.pop_front() {
-            match item {
-                Work::Transition(transition_request, transition) => {
-                    let has_events = !transition.events.is_empty();
-                    let has_effects = !transition.effects.is_empty();
-                    let mut emitted = Vec::new();
-                    for (index, event) in transition.events.into_iter().enumerate() {
-                        let event_request = (index == 0).then_some(transition_request).flatten();
-                        let sequence = match event_request {
-                            Some(request) => self.core.commit(session, request),
-                            None => self.core.publish(session),
-                        }
-                        .map_err(io::Error::other)?;
-                        if event_request.is_some() {
-                            request_sequence.get_or_insert(sequence);
-                        }
-                        last_sequence = Some(sequence);
-                        self.journal(session)
-                            .append(&JournalRecord {
-                                sequence,
-                                request: event_request,
-                                event: event.clone(),
-                            })
-                            .map_err(io::Error::other)?;
-                        emitted.push((sequence, event));
-                    }
-
-                    if !has_events && let Some(request) = transition_request {
-                        let sequence = self
-                            .core
-                            .commit(session, request)
-                            .map_err(io::Error::other)?;
-                        request_sequence = Some(sequence);
-                        last_sequence = Some(sequence);
-                    }
-
-                    // The checkpoint is the durability barrier before effects.
-                    if has_events || has_effects || transition_request.is_some() {
-                        self.persist_checkpoint(session)?;
-                    }
-                    for (sequence, event) in emitted {
-                        self.record_and_broadcast(session, sequence, event)?;
-                    }
-                    for effect in transition.effects.into_iter().rev() {
-                        work.push_front(Work::Effect(effect));
-                    }
-                }
-                Work::Effect(effect) => {
-                    let transition = self
-                        .sessions
-                        .get_mut(&session)
-                        .ok_or_else(|| io::Error::other("unknown resident session"))?
-                        .session
-                        .effect(effect)
-                        .map_err(io::Error::other)?;
-                    work.push_front(Work::Transition(None, transition));
-                }
+        let mut emitted = Vec::new();
+        for (index, event) in transition.events.into_iter().enumerate() {
+            let event_request = (index == 0).then_some(request).flatten();
+            let sequence = match event_request {
+                Some(request) => self.core.commit(session, request),
+                None => self.core.publish(session),
             }
+            .map_err(io::Error::other)?;
+            if event_request.is_some() {
+                request_sequence = Some(sequence);
+            }
+            last_sequence = Some(sequence);
+            emitted.push(SequencedEvent { sequence, event });
         }
-        request_sequence.or(last_sequence).ok_or_else(|| {
-            io::Error::other("transition did not commit a request or publish an event")
-        })
+        if emitted.is_empty()
+            && let Some(request) = request
+        {
+            let sequence = self
+                .core
+                .commit(session, request)
+                .map_err(io::Error::other)?;
+            request_sequence = Some(sequence);
+            last_sequence = Some(sequence);
+        }
+
+        let pending = transition
+            .effects
+            .into_iter()
+            .map(|request| pending_effect(request, self.config.effect_timeout))
+            .collect::<Vec<_>>();
+        let stored_effects = pending
+            .iter()
+            .map(encode_effect)
+            .collect::<io::Result<Vec<_>>>()?;
+        let control_sequence = self
+            .summary(session)
+            .ok_or_else(|| io::Error::other("unknown resident session"))?
+            .sequence;
+        self.append_log(
+            session,
+            HostLogEvent::Transition {
+                request,
+                control_sequence,
+                events: emitted.clone(),
+                effects: stored_effects,
+                completed_effect,
+            },
+        )?;
+        {
+            let hosted = self
+                .sessions
+                .get_mut(&session)
+                .ok_or_else(|| io::Error::other("unknown resident session"))?;
+            if let Some(completed) = completed_effect {
+                hosted
+                    .pending_effects
+                    .retain(|effect| effect.id != completed);
+                hosted.active_effect = None;
+            }
+            hosted.pending_effects.extend(pending);
+        }
+        self.persist_checkpoint(session)?;
+        for event in emitted {
+            self.record_and_broadcast(session, event.sequence, event.event)?;
+        }
+        self.schedule_effect(session);
+        self.dispatch_effects()?;
+        Ok(request_sequence
+            .or(last_sequence)
+            .unwrap_or(control_sequence))
     }
 
     fn poll(&mut self, elapsed: Duration) -> io::Result<()> {
@@ -663,10 +881,184 @@ impl<A: ResidentApplication> HostState<A> {
                 .poll(elapsed)
                 .map_err(io::Error::other)?;
             if !transition.events.is_empty() || !transition.effects.is_empty() {
-                let _ = self.apply_transition(id, None, transition)?;
+                let _ = self.apply_transition(id, None, None, transition)?;
             }
         }
         Ok(())
+    }
+
+    fn complete_effect(
+        &mut self,
+        session: SessionId,
+        effect: EffectId,
+        output: Result<A::EffectOutput, ApplicationError>,
+    ) -> io::Result<()> {
+        let hosted = match self.sessions.get_mut(&session) {
+            Some(hosted) => hosted,
+            None => return Ok(()),
+        };
+        if hosted.active_effect.as_ref().map(|active| active.id) != Some(effect)
+            || hosted.pending_effects.front().map(|pending| pending.id) != Some(effect)
+        {
+            return Ok(());
+        }
+        let transition = hosted
+            .session
+            .effect_completed(effect, output)
+            .map_err(io::Error::other)?;
+        let _ = self.apply_transition(session, None, Some(effect), transition)?;
+        Ok(())
+    }
+
+    fn dispatch_recovered_effects(&mut self) -> io::Result<()> {
+        let sessions = self.sessions.keys().copied().collect::<Vec<_>>();
+        for session in sessions {
+            self.schedule_effect(session);
+        }
+        self.dispatch_effects()
+    }
+
+    fn schedule_effect(&mut self, session: SessionId) {
+        let ready = self.sessions.get(&session).is_some_and(|hosted| {
+            hosted.active_effect.is_none() && !hosted.pending_effects.is_empty()
+        });
+        if ready && self.ready_effect_set.insert(session) {
+            self.ready_effects.push_back(session);
+        }
+    }
+
+    fn dispatch_effects(&mut self) -> io::Result<()> {
+        let limit = self.config.max_concurrent_effects.max(1);
+        while self
+            .sessions
+            .values()
+            .filter(|hosted| hosted.active_effect.is_some())
+            .count()
+            < limit
+        {
+            let Some(session) = self.ready_effects.pop_front() else {
+                break;
+            };
+            self.ready_effect_set.remove(&session);
+            self.dispatch_one_effect(session)?;
+        }
+        Ok(())
+    }
+
+    fn dispatch_one_effect(&mut self, session: SessionId) -> io::Result<()> {
+        let Some(pending) = self.sessions.get(&session).and_then(|hosted| {
+            (hosted.active_effect.is_none())
+                .then(|| hosted.pending_effects.front().cloned())
+                .flatten()
+        }) else {
+            return Ok(());
+        };
+        if pending.delivery == EffectDelivery::AtMostOnce && pending.attempts > 0 {
+            self.sessions
+                .get_mut(&session)
+                .expect("session exists")
+                .active_effect = Some(ActiveEffect {
+                id: pending.id,
+                cancellation: EffectCancellation::new(),
+            });
+            let sender = self.incoming_tx.clone();
+            self.runtime.spawn(async move {
+                let _ = sender
+                    .send(Incoming::EffectCompleted {
+                        session,
+                        effect: pending.id,
+                        output: Err(ApplicationError::new(
+                            "effect_outcome_unknown",
+                            "leader stopped after an at-most-once effect may have started",
+                        )),
+                    })
+                    .await;
+            });
+            return Ok(());
+        }
+
+        let attempt = pending.attempts.saturating_add(1);
+        if let Some(effect) = self
+            .sessions
+            .get_mut(&session)
+            .and_then(|hosted| hosted.pending_effects.front_mut())
+        {
+            effect.attempts = attempt;
+        }
+        self.append_log(
+            session,
+            HostLogEvent::EffectAttempted {
+                effect: pending.id,
+                attempt,
+            },
+        )?;
+        self.persist_checkpoint(session)?;
+        let cancellation = EffectCancellation::new();
+        self.sessions
+            .get_mut(&session)
+            .expect("session exists")
+            .active_effect = Some(ActiveEffect {
+            id: pending.id,
+            cancellation: cancellation.clone(),
+        });
+        let application = self.application.clone();
+        let sender = self.incoming_tx.clone();
+        let effect_id = pending.id;
+        let effect_cancellation = cancellation.clone();
+        self.runtime.spawn(async move {
+            let output = application
+                .execute(
+                    EffectContext {
+                        session,
+                        effect: effect_id,
+                        attempt,
+                        cancellation: effect_cancellation,
+                    },
+                    pending.effect,
+                )
+                .await;
+            let _ = sender
+                .send(Incoming::EffectCompleted {
+                    session,
+                    effect: effect_id,
+                    output,
+                })
+                .await;
+        });
+        if let Some(timeout) = pending.timeout {
+            let timer = self.runtime.clone();
+            let sender = self.incoming_tx.clone();
+            self.runtime.spawn(async move {
+                timer.sleep(timeout).await;
+                let _ = sender
+                    .send(Incoming::EffectTimedOut {
+                        session,
+                        effect: effect_id,
+                    })
+                    .await;
+            });
+        }
+        Ok(())
+    }
+
+    fn timeout_effect(&mut self, session: SessionId, effect: EffectId) -> io::Result<()> {
+        let Some(active) = self
+            .sessions
+            .get(&session)
+            .and_then(|hosted| hosted.active_effect.as_ref())
+            .filter(|active| active.id == effect)
+        else {
+            return Ok(());
+        };
+        active.cancellation.cancel();
+        self.complete_effect(
+            session,
+            effect,
+            Err(ApplicationError::new(
+                "effect_timed_out",
+                "effect exceeded its execution deadline",
+            )),
+        )
     }
 
     fn record_and_broadcast(
@@ -755,6 +1147,12 @@ impl<A: ResidentApplication> HostState<A> {
             application_version: A::STORAGE_VERSION,
             control: self.core.snapshot(session).map_err(io::Error::other)?,
             state: serde_json::to_value(hosted.session.state()).map_err(io::Error::other)?,
+            log_sequence: hosted.log_sequence,
+            pending_effects: hosted
+                .pending_effects
+                .iter()
+                .map(encode_effect)
+                .collect::<io::Result<Vec<_>>>()?,
         };
         FileJournal::<A::Event>::write_checkpoint(&directory.join("checkpoint.json"), &stored)
             .map_err(io::Error::other)
@@ -776,17 +1174,47 @@ impl<A: ResidentApplication> HostState<A> {
         .map_err(io::Error::other)
     }
 
-    fn journal(&self, session: SessionId) -> FileJournal<A::Event> {
+    fn journal(&self, session: SessionId) -> FileJournal<HostLogEvent<A::Event>> {
         FileJournal::new(
-            self.session_directory(session).join("journal.log"),
+            self.session_directory(session).join("journal-v2.log"),
             self.config.durability,
         )
     }
 
-    fn stop_session(&mut self, session: SessionId) -> io::Result<()> {
+    fn append_log(&mut self, session: SessionId, event: HostLogEvent<A::Event>) -> io::Result<()> {
+        let sequence = self
+            .sessions
+            .get(&session)
+            .ok_or_else(|| io::Error::other("unknown resident session"))?
+            .log_sequence
+            .0
+            .checked_add(1)
+            .map(EventSequence)
+            .ok_or_else(|| io::Error::other("session log sequence exhausted"))?;
+        self.journal(session)
+            .append(&JournalRecord {
+                sequence,
+                request: None,
+                event,
+            })
+            .map_err(io::Error::other)?;
         self.sessions
+            .get_mut(&session)
+            .expect("session exists")
+            .log_sequence = sequence;
+        Ok(())
+    }
+
+    fn stop_session(&mut self, session: SessionId) -> io::Result<()> {
+        let hosted = self
+            .sessions
             .remove(&session)
             .ok_or_else(|| io::Error::other("unknown resident session"))?;
+        if let Some(active) = hosted.active_effect {
+            active.cancellation.cancel();
+        }
+        self.ready_effect_set.remove(&session);
+        self.ready_effects.retain(|ready| *ready != session);
         self.core
             .remove_session(session)
             .map_err(io::Error::other)?;
@@ -847,7 +1275,12 @@ impl<A: ResidentApplication> HostState<A> {
         }
     }
 
-    async fn shutdown(&self, reason: ShutdownReason) {
+    async fn shutdown(&mut self, reason: ShutdownReason) {
+        for hosted in self.sessions.values() {
+            if let Some(active) = &hosted.active_effect {
+                active.cancellation.cancel();
+            }
+        }
         let clients: Vec<_> = self.clients.values().cloned().collect();
         for client in &clients {
             let _ = client.send(ServerMessage::ShuttingDown { reason }).await;
@@ -858,17 +1291,18 @@ impl<A: ResidentApplication> HostState<A> {
     }
 }
 
-async fn serve_connection<R, C>(
+async fn serve_connection<R, C, O>(
     runtime: R,
     connection: C,
     id: ConnectionId,
     leader: LeaderInstanceId,
     binary_version: String,
     outbound_capacity: usize,
-    incoming: async_channel::Sender<Incoming>,
+    incoming: async_channel::Sender<Incoming<O>>,
 ) where
     R: Spawner,
     C: super::runtime::Connection,
+    O: Send + 'static,
 {
     let (mut reader, mut writer) = connection.split();
     let hello: ClientHello = match receive_json(&mut reader).await {
@@ -992,8 +1426,43 @@ fn prepare_private_directory(path: &Path) -> io::Result<()> {
     }
 }
 
+fn pending_effect<F>(
+    request: EffectRequest<F>,
+    default_timeout: Option<Duration>,
+) -> PendingEffect<F> {
+    PendingEffect {
+        id: EffectId::new(),
+        delivery: request.delivery,
+        attempts: 0,
+        effect: request.effect,
+        timeout: request.timeout.or(default_timeout),
+    }
+}
+
+fn encode_effect<F: Serialize>(pending: &PendingEffect<F>) -> io::Result<StoredEffect> {
+    Ok(StoredEffect {
+        id: pending.id,
+        delivery: pending.delivery,
+        attempts: pending.attempts,
+        effect: serde_json::to_value(&pending.effect).map_err(io::Error::other)?,
+        timeout_ms: pending
+            .timeout
+            .map(|timeout| u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)),
+    })
+}
+
+fn decode_effect<F: DeserializeOwned>(stored: StoredEffect) -> io::Result<PendingEffect<F>> {
+    Ok(PendingEffect {
+        id: stored.id,
+        delivery: stored.delivery,
+        attempts: stored.attempts,
+        effect: serde_json::from_value(stored.effect).map_err(io::Error::other)?,
+        timeout: stored.timeout_ms.map(Duration::from_millis),
+    })
+}
+
 fn require_host_version(version: u32, path: &Path) -> io::Result<()> {
-    if matches!(version, 0 | HOST_STORAGE_VERSION) {
+    if matches!(version, 0 | 1 | HOST_STORAGE_VERSION) {
         return Ok(());
     }
     Err(io::Error::new(
@@ -1062,5 +1531,402 @@ fn replacement_is_newer(current: &str, requested: &str) -> bool {
     ) {
         (Ok(current), Ok(requested)) => requested > current,
         _ => requested > current,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        future,
+        sync::{Arc, Mutex},
+    };
+
+    use serde::{Deserialize, Serialize};
+
+    use super::*;
+    use crate::resident::runtime::tokio::TokioRuntime;
+
+    #[derive(Clone)]
+    struct EffectApplication {
+        complete: bool,
+        attempts: Arc<Mutex<Vec<EffectContext>>>,
+    }
+
+    #[derive(Clone, Debug, Deserialize, Serialize)]
+    struct TestEffect;
+
+    #[derive(Clone, Debug, Default, Deserialize, Serialize)]
+    struct TestState {
+        completed: Option<EffectId>,
+        attempt: u32,
+        error: Option<String>,
+    }
+
+    struct TestSession(TestState);
+
+    impl ResidentApplication for EffectApplication {
+        type Command = ();
+        type Event = TestState;
+        type Snapshot = TestState;
+        type State = TestState;
+        type Effect = TestEffect;
+        type EffectOutput = EffectContext;
+        type Session = TestSession;
+
+        const STORAGE_VERSION: u32 = 1;
+
+        fn create(&self, _name: &str) -> Result<Self::Session, ApplicationError> {
+            Ok(TestSession(TestState::default()))
+        }
+
+        fn restore(&self, state: Self::State) -> Result<Self::Session, ApplicationError> {
+            Ok(TestSession(state))
+        }
+
+        async fn execute(
+            &self,
+            context: EffectContext,
+            _effect: Self::Effect,
+        ) -> Result<Self::EffectOutput, ApplicationError> {
+            self.attempts
+                .lock()
+                .expect("attempt log should be healthy")
+                .push(context.clone());
+            if !self.complete {
+                future::pending::<()>().await;
+            }
+            Ok(context)
+        }
+    }
+
+    impl ResidentSession for TestSession {
+        type Command = ();
+        type Event = TestState;
+        type Snapshot = TestState;
+        type State = TestState;
+        type Effect = TestEffect;
+        type EffectOutput = EffectContext;
+
+        fn snapshot(&self) -> Self::Snapshot {
+            self.0.clone()
+        }
+
+        fn state(&self) -> Self::State {
+            self.0.clone()
+        }
+
+        fn command(
+            &mut self,
+            _command: Self::Command,
+        ) -> Result<SessionTransition<Self::Event, Self::Effect>, ApplicationError> {
+            Ok(SessionTransition::new(Vec::new(), vec![TestEffect]))
+        }
+
+        fn effect_completed(
+            &mut self,
+            _effect: EffectId,
+            output: Result<Self::EffectOutput, ApplicationError>,
+        ) -> Result<SessionTransition<Self::Event, Self::Effect>, ApplicationError> {
+            match output {
+                Ok(context) => {
+                    self.0.completed = Some(context.effect);
+                    self.0.attempt = context.attempt;
+                }
+                Err(error) => {
+                    self.0.completed = Some(_effect);
+                    self.0.error = Some(error.code().to_owned());
+                }
+            }
+            Ok(SessionTransition::events([self.0.clone()]))
+        }
+
+        fn replay(&mut self, event: &Self::Event) -> Result<(), ApplicationError> {
+            self.0.clone_from(event);
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unfinished_effect_is_redriven_without_blocking_the_actor() {
+        let directory = std::env::temp_dir().join(format!(
+            "turtletap-effect-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&directory).expect("test directory should be created");
+        let endpoint = directory.join("resident.sock");
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let config =
+            ResidentHostConfig::new(&endpoint, &directory, "test").with_initial_session("effect");
+        let (sender, receiver) = async_channel::bounded(16);
+        let mut first = HostState::load(
+            EffectApplication {
+                complete: false,
+                attempts: Arc::clone(&attempts),
+            },
+            TokioRuntime,
+            config.clone(),
+            LeaderInstanceId::new(),
+            sender,
+            receiver,
+        )
+        .expect("first host should load");
+        let session = *first.sessions.keys().next().expect("initial session");
+        let transition = first
+            .sessions
+            .get_mut(&session)
+            .expect("initial session")
+            .session
+            .command(())
+            .expect("command should reduce");
+        let _ = first
+            .apply_transition(session, None, None, transition)
+            .expect("effect should be durably queued");
+        let effect = first
+            .sessions
+            .get(&session)
+            .and_then(|hosted| hosted.pending_effects.front())
+            .map(|pending| pending.id)
+            .expect("pending effect");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !attempts
+                    .lock()
+                    .expect("attempt log should be healthy")
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first effect attempt should start");
+        assert_eq!(
+            attempts.lock().expect("attempt log should be healthy")[0].attempt,
+            1
+        );
+        drop(first);
+
+        let (sender, receiver) = async_channel::bounded(16);
+        let mut recovered = HostState::load(
+            EffectApplication {
+                complete: true,
+                attempts: Arc::clone(&attempts),
+            },
+            TokioRuntime,
+            config,
+            LeaderInstanceId::new(),
+            sender,
+            receiver,
+        )
+        .expect("recovered host should load");
+        recovered
+            .dispatch_recovered_effects()
+            .expect("recovered effect should dispatch");
+        let incoming = tokio::time::timeout(Duration::from_secs(1), recovered.incoming.recv())
+            .await
+            .expect("effect should complete")
+            .expect("host mailbox should remain open");
+        let Incoming::EffectCompleted {
+            session,
+            effect: completed,
+            output,
+        } = incoming
+        else {
+            panic!("expected effect completion");
+        };
+        recovered
+            .complete_effect(session, completed, output)
+            .expect("completion should reduce");
+        let state = recovered
+            .sessions
+            .get(&session)
+            .expect("recovered session")
+            .session
+            .snapshot();
+        assert_eq!(state.completed, Some(effect));
+        assert_eq!(state.attempt, 2);
+        fs::remove_dir_all(directory).expect("test directory should be removed");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn effect_timeout_cancels_and_reduces_an_error() {
+        let directory = std::env::temp_dir().join(format!(
+            "turtletap-timeout-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&directory).expect("test directory should be created");
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let mut config =
+            ResidentHostConfig::new(directory.join("resident.sock"), &directory, "test")
+                .with_initial_session("effect");
+        config.effect_timeout = Some(Duration::from_millis(10));
+        let (sender, receiver) = async_channel::bounded(16);
+        let mut state = HostState::load(
+            EffectApplication {
+                complete: false,
+                attempts,
+            },
+            TokioRuntime,
+            config,
+            LeaderInstanceId::new(),
+            sender,
+            receiver,
+        )
+        .expect("host should load");
+        let session = *state.sessions.keys().next().expect("initial session");
+        let transition = state
+            .sessions
+            .get_mut(&session)
+            .expect("initial session")
+            .session
+            .command(())
+            .expect("command should reduce");
+        let _ = state
+            .apply_transition(session, None, None, transition)
+            .expect("effect should queue");
+        let cancellation = state
+            .sessions
+            .get(&session)
+            .and_then(|hosted| hosted.active_effect.as_ref())
+            .map(|active| active.cancellation.clone())
+            .expect("active effect cancellation");
+        let incoming = tokio::time::timeout(Duration::from_secs(1), state.incoming.recv())
+            .await
+            .expect("timeout should fire")
+            .expect("mailbox should remain open");
+        let Incoming::EffectTimedOut { session, effect } = incoming else {
+            panic!("expected effect timeout");
+        };
+        state
+            .timeout_effect(session, effect)
+            .expect("timeout should reduce");
+        assert!(cancellation.is_cancelled());
+        let hosted = state.sessions.get(&session).expect("session remains");
+        assert!(hosted.active_effect.is_none());
+        assert!(hosted.pending_effects.is_empty());
+        assert_eq!(
+            hosted.session.snapshot().error.as_deref(),
+            Some("effect_timed_out")
+        );
+        fs::remove_dir_all(directory).expect("test directory should be removed");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn global_effect_limit_advances_waiting_sessions() {
+        let directory = std::env::temp_dir().join(format!(
+            "turtletap-effect-limit-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&directory).expect("test directory should be created");
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let mut config =
+            ResidentHostConfig::new(directory.join("resident.sock"), &directory, "test")
+                .with_initial_session("first");
+        config.effect_timeout = None;
+        config.max_concurrent_effects = 1;
+        let (sender, receiver) = async_channel::bounded(16);
+        let mut state = HostState::load(
+            EffectApplication {
+                complete: false,
+                attempts: Arc::clone(&attempts),
+            },
+            TokioRuntime,
+            config,
+            LeaderInstanceId::new(),
+            sender,
+            receiver,
+        )
+        .expect("host should load");
+        let first = state.core.session_named("first").expect("first session");
+        state
+            .create_session("second".to_owned())
+            .expect("second session should be created");
+        let second = state.core.session_named("second").expect("second session");
+
+        for session in [first, second] {
+            let transition = state
+                .sessions
+                .get_mut(&session)
+                .expect("session should exist")
+                .session
+                .command(())
+                .expect("command should reduce");
+            let _ = state
+                .apply_transition(session, None, None, transition)
+                .expect("effect should queue");
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if attempts
+                    .lock()
+                    .expect("attempt log should be healthy")
+                    .len()
+                    == 1
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first effect should start");
+        assert!(
+            state
+                .sessions
+                .get(&first)
+                .expect("first session")
+                .active_effect
+                .is_some()
+        );
+        assert!(
+            state
+                .sessions
+                .get(&second)
+                .expect("second session")
+                .active_effect
+                .is_none()
+        );
+
+        let first_context = attempts.lock().expect("attempt log should be healthy")[0].clone();
+        first_context.cancellation.cancel();
+        state
+            .complete_effect(first, first_context.effect, Ok(first_context.clone()))
+            .expect("first effect should complete");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if attempts
+                    .lock()
+                    .expect("attempt log should be healthy")
+                    .len()
+                    == 2
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("waiting effect should start");
+        assert!(
+            state
+                .sessions
+                .get(&first)
+                .expect("first session")
+                .active_effect
+                .is_none()
+        );
+        let second_active = state
+            .sessions
+            .get(&second)
+            .expect("second session")
+            .active_effect
+            .as_ref()
+            .expect("second effect should be active");
+        second_active.cancellation.cancel();
+        fs::remove_dir_all(directory).expect("test directory should be removed");
     }
 }

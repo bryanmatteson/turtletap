@@ -14,7 +14,10 @@ mod journal;
 mod protocol;
 pub mod runtime;
 
-pub use application::{ApplicationError, ResidentApplication, ResidentSession, SessionTransition};
+pub use application::{
+    ApplicationError, EffectCancellation, EffectContext, EffectDelivery, EffectRequest,
+    ResidentApplication, ResidentSession, SessionTransition,
+};
 pub use client::{ClientError, ResidentClient};
 pub use core::{
     AttachError, AttachOutcome, Authorization, CoreError, DriverChange, LeaderCore,
@@ -26,8 +29,8 @@ pub use host::{ResidentHost, ResidentHostConfig};
 pub use journal::{Durability, FileJournal, JournalError, JournalRecord};
 pub use protocol::{
     AttachmentMode, ClientCapabilities, ClientEnvelope, ClientHello, ClientInstanceId,
-    ClientRequest, ConnectionId, ControlResult, DriverLease, EventSequence, LeaderCapabilities,
-    LeaderInstanceId, LeaseEpoch, PROTOCOL_VERSION, ProtocolRejection, ProtocolVersion, RequestId,
-    ServerHandshake, ServerHello, ServerMessage, SessionId, SessionSelector, SessionSummary,
-    ShutdownReason, VersionRange, WireError,
+    ClientRequest, ConnectionId, ControlResult, DriverLease, EffectId, EventSequence,
+    LeaderCapabilities, LeaderInstanceId, LeaseEpoch, PROTOCOL_VERSION, ProtocolRejection,
+    ProtocolVersion, RequestId, ServerHandshake, ServerHello, ServerMessage, SessionId,
+    SessionSelector, SessionSummary, ShutdownReason, VersionRange, WireError,
 };

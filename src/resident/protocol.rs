@@ -46,6 +46,7 @@ macro_rules! uuid_id {
 }
 
 uuid_id!(ClientInstanceId);
+uuid_id!(EffectId);
 uuid_id!(LeaderInstanceId);
 uuid_id!(SessionId);
 

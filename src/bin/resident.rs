@@ -24,11 +24,11 @@ mod unix {
         SurfaceAction, SurfaceEvent, SurfaceStatus,
         resident::{
             ApplicationError, AttachmentMode, ClientCapabilities, ClientEnvelope, ClientHello,
-            ClientInstanceId, ClientRequest, ControlResult, Durability, EventSequence, LeaderLock,
-            LeaseEpoch, MAX_FRAME_SIZE, PROTOCOL_VERSION, RequestId, ResidentApplication,
-            ResidentHost, ResidentHostConfig, ResidentSession, ServerHandshake, ServerMessage,
-            SessionId, SessionSelector, SessionSummary, SessionTransition, ShutdownReason,
-            VersionRange, WireError, encode_frame,
+            ClientInstanceId, ClientRequest, ControlResult, Durability, EffectContext, EffectId,
+            EffectRequest, EventSequence, LeaderLock, LeaseEpoch, MAX_FRAME_SIZE, PROTOCOL_VERSION,
+            RequestId, ResidentApplication, ResidentHost, ResidentHostConfig, ResidentSession,
+            ServerHandshake, ServerMessage, SessionId, SessionSelector, SessionSummary,
+            SessionTransition, ShutdownReason, VersionRange, WireError, encode_frame,
             runtime::tokio::{TokioRuntime, TokioUnixTransport},
         },
         tui::{
@@ -40,8 +40,8 @@ mod unix {
     };
 
     use super::super::{
-        CommandSurface, PersistedCommandSurface, TranscriptEntry, TranscriptKind, char_slice_width,
-        split_command,
+        CommandSurface, PersistedCommandSurface, RunningCommand, TranscriptEntry, TranscriptKind,
+        char_slice_width, spawn_command, split_command,
     };
 
     const START_TIMEOUT: Duration = Duration::from_secs(5);
@@ -209,10 +209,10 @@ mod unix {
     #[derive(Clone, Copy, Debug)]
     pub(crate) struct ShellApplication;
 
-    #[derive(Debug)]
+    #[derive(Clone, Debug, Deserialize, Serialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
     pub(crate) enum ShellEffect {
-        MarkNextStarted,
-        RunPending,
+        Run { command: String, cwd: PathBuf },
     }
 
     impl ResidentApplication for ShellApplication {
@@ -221,6 +221,7 @@ mod unix {
         type Snapshot = SessionSnapshot;
         type State = PersistedCommandSurface;
         type Effect = ShellEffect;
+        type EffectOutput = RunningCommand;
         type Session = CommandSurface;
 
         const STORAGE_VERSION: u32 = 1;
@@ -231,6 +232,18 @@ mod unix {
 
         fn restore(&self, state: Self::State) -> Result<Self::Session, ApplicationError> {
             Ok(CommandSurface::restore(state))
+        }
+
+        async fn execute(
+            &self,
+            _context: EffectContext,
+            effect: Self::Effect,
+        ) -> Result<Self::EffectOutput, ApplicationError> {
+            match effect {
+                ShellEffect::Run { command, cwd } => {
+                    spawn_command(&command, &cwd).map_err(shell_io)
+                }
+            }
         }
 
         fn migrate(
@@ -258,6 +271,7 @@ mod unix {
         type Snapshot = SessionSnapshot;
         type State = PersistedCommandSurface;
         type Effect = ShellEffect;
+        type EffectOutput = RunningCommand;
 
         fn snapshot(&self) -> Self::Snapshot {
             SessionSnapshot::from_session(self)
@@ -275,7 +289,7 @@ mod unix {
             let effects = match command {
                 ShellCommand::Submit { line } => {
                     let _ = self.accept_line(line);
-                    vec![ShellEffect::MarkNextStarted]
+                    resident_effects(self)
                 }
                 ShellCommand::Interrupt => {
                     let _ = self.interrupt();
@@ -296,31 +310,37 @@ mod unix {
         ) -> Result<SessionTransition<Self::Event, Self::Effect>, ApplicationError> {
             let previous = SessionSnapshot::from_session(self);
             let _ = self.poll_command_deferred();
-            let should_start = self.running.is_none()
-                && self.started_command.is_none()
-                && !self.pending.is_empty();
-            let effects = should_start
-                .then_some(ShellEffect::MarkNextStarted)
-                .into_iter()
-                .collect();
+            let effects = resident_effects(self);
             Ok(shell_transition(previous, self, effects))
         }
 
-        fn effect(
+        fn effect_completed(
             &mut self,
-            effect: Self::Effect,
+            _effect: EffectId,
+            output: Result<Self::EffectOutput, ApplicationError>,
         ) -> Result<SessionTransition<Self::Event, Self::Effect>, ApplicationError> {
             let previous = SessionSnapshot::from_session(self);
-            let effects = match effect {
-                ShellEffect::MarkNextStarted if self.mark_next_started() => {
-                    vec![ShellEffect::RunPending]
+            if self.started_command.is_some() {
+                let _ = self.pending.pop_front();
+            }
+            match output {
+                Ok(running) => {
+                    self.running = Some(running);
+                    self.last_failed = false;
                 }
-                ShellEffect::MarkNextStarted => Vec::new(),
-                ShellEffect::RunPending => {
-                    let _ = self.run_pending();
-                    Vec::new()
+                Err(error)
+                    if error.code() == "effect_outcome_unknown"
+                        && self.started_command.is_none() => {}
+                Err(error) => {
+                    self.started_command = None;
+                    self.last_failed = true;
+                    self.push(
+                        TranscriptKind::Error,
+                        format!("Could not start command: {error}"),
+                    );
                 }
-            };
+            }
+            let effects = resident_effects(self);
             Ok(shell_transition(previous, self, effects))
         }
 
@@ -339,14 +359,35 @@ mod unix {
     fn shell_transition(
         previous: SessionSnapshot,
         surface: &CommandSurface,
-        effects: Vec<ShellEffect>,
+        effects: Vec<EffectRequest<ShellEffect>>,
     ) -> SessionTransition<ShellEvent, ShellEffect> {
         let current = SessionSnapshot::from_session(surface);
         let events = (current != previous)
             .then(|| ShellEvent::from_surface(&previous, surface))
             .into_iter()
             .collect();
-        SessionTransition::new(events, effects)
+        SessionTransition::with_effects(events, effects)
+    }
+
+    fn resident_effects(surface: &mut CommandSurface) -> Vec<EffectRequest<ShellEffect>> {
+        while surface.running.is_none() && surface.started_command.is_none() {
+            let Some(line) = surface.pending.front().cloned() else {
+                break;
+            };
+            surface.started_command = Some(line.clone());
+            surface.touch();
+            if surface.run_builtin(&line).is_some() {
+                let _ = surface.pending.pop_front();
+                surface.started_command = None;
+                surface.touch();
+                continue;
+            }
+            return vec![EffectRequest::at_most_once(ShellEffect::Run {
+                command: surface.expand_command(&line),
+                cwd: surface.cwd.clone(),
+            })];
+        }
+        Vec::new()
     }
 
     fn shell_io(error: io::Error) -> ApplicationError {

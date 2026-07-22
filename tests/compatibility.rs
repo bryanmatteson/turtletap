@@ -2,8 +2,8 @@
 
 use serde::Deserialize;
 use turtletap::resident::{
-    ClientEnvelope, ClientHello, JournalRecord, PROTOCOL_VERSION, ServerHandshake, ServerHello,
-    SessionControlSnapshot,
+    ClientEnvelope, ClientHello, EffectId, EventSequence, JournalRecord, PROTOCOL_VERSION,
+    ServerHandshake, ServerHello, SessionControlSnapshot,
 };
 
 #[derive(Deserialize)]
@@ -14,6 +14,17 @@ struct StoredSessionFixture {
     application_version: u32,
     control: SessionControlSnapshot,
     state: serde_json::Value,
+    #[serde(default)]
+    log_sequence: EventSequence,
+    #[serde(default)]
+    pending_effects: Vec<StoredEffectFixture>,
+}
+
+#[derive(Deserialize)]
+struct StoredEffectFixture {
+    id: EffectId,
+    attempts: u32,
+    effect: serde_json::Value,
 }
 
 #[derive(Deserialize)]
@@ -40,7 +51,7 @@ fn protocol_v1_fixtures_remain_readable() {
 }
 
 #[test]
-fn storage_v0_and_v1_fixtures_remain_readable() {
+fn storage_v0_v1_and_v2_fixtures_remain_readable() {
     let legacy: StoredSessionFixture = fixture("storage/checkpoint-host-v0.json");
     assert_eq!(legacy.host_version, 0);
     assert_eq!(legacy.application_version, 0);
@@ -52,6 +63,17 @@ fn storage_v0_and_v1_fixtures_remain_readable() {
     assert_eq!(current.application_version, 3);
     assert_eq!(current.control.sequence.0, 2);
     assert_eq!(current.state["value"], 41);
+
+    let effectful: StoredSessionFixture = fixture("storage/checkpoint-host-v2.json");
+    assert_eq!(effectful.host_version, 2);
+    assert_eq!(effectful.log_sequence.0, 6);
+    assert_eq!(effectful.pending_effects.len(), 1);
+    assert_eq!(effectful.pending_effects[0].attempts, 1);
+    assert_eq!(effectful.pending_effects[0].effect["operation"], "refresh");
+    assert_eq!(
+        effectful.pending_effects[0].id.to_string(),
+        "66666666-6666-4666-8666-666666666666"
+    );
 
     let record: JournalRecord<serde_json::Value> = fixture("storage/journal-record-v1.json");
     assert_eq!(record.sequence.0, 2);
@@ -81,6 +103,9 @@ fn fixture<T: serde::de::DeserializeOwned>(path: &str) -> T {
         }
         "storage/checkpoint-host-v1.json" => {
             include_str!("fixtures/storage/checkpoint-host-v1.json")
+        }
+        "storage/checkpoint-host-v2.json" => {
+            include_str!("fixtures/storage/checkpoint-host-v2.json")
         }
         "storage/journal-record-v1.json" => {
             include_str!("fixtures/storage/journal-record-v1.json")

@@ -1,0 +1,21 @@
+{
+  "host_version": 2,
+  "application_version": 3,
+  "control": {
+    "id": "55555555-5555-4555-8555-555555555555",
+    "name": "fixture-v2",
+    "sequence": 4,
+    "lease_epoch": 5,
+    "committed": []
+  },
+  "state": { "value": 43 },
+  "log_sequence": 6,
+  "pending_effects": [
+    {
+      "id": "66666666-6666-4666-8666-666666666666",
+      "delivery": "at_least_once",
+      "attempts": 1,
+      "effect": { "operation": "refresh" }
+    }
+  ]
+}

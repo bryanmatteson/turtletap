@@ -734,7 +734,7 @@ fn version_zero_checkpoint_is_migrated_in_place() {
         &fs::read(&checkpoint).expect("migrated checkpoint should be readable"),
     )
     .expect("migrated checkpoint should be JSON");
-    assert_eq!(migrated["host_version"], 1);
+    assert_eq!(migrated["host_version"], 2);
     assert_eq!(migrated["application_version"], 1);
 }
 
@@ -783,6 +783,34 @@ fn root_only_legacy_session_is_imported_into_per_session_storage() {
     assert!(
         session_directory.join("checkpoint.json").exists(),
         "legacy session was not migrated to per-session storage"
+    );
+    assert!(
+        !resident.state.join("checkpoint.json").exists(),
+        "legacy root should be archived after a successful import"
+    );
+    assert!(
+        fs::read_dir(&resident.state)
+            .expect("state directory should be readable")
+            .filter_map(Result::ok)
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("checkpoint.legacy-v0-")),
+        "legacy root archive should be retained"
+    );
+
+    assert_success(
+        &resident.command(&["stop", "legacy-only"]),
+        "delete imported session",
+    );
+    assert_success(&resident.command(&["stop"]), "stop after delete");
+    resident.wait_stopped();
+    assert_success(&resident.command(&["start"]), "restart after delete");
+    let sessions = resident.command(&["list"]);
+    assert_success(&sessions, "list after deleting imported session");
+    assert!(
+        !String::from_utf8_lossy(&sessions.stdout).contains("legacy-only"),
+        "deleted imported session should not be resurrected"
     );
 }
 

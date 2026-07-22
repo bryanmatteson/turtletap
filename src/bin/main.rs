@@ -330,6 +330,7 @@ impl CommandSurface {
         SurfaceAction::Consumed
     }
 
+    #[cfg(test)]
     fn mark_next_started(&mut self) -> bool {
         if self.running.is_some() || self.started_command.is_some() {
             return false;

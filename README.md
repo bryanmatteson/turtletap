@@ -155,12 +155,24 @@ transport contracts.
 
 Applications implement `ResidentApplication` and `ResidentSession`. A transition
 returns durable events plus follow-on effects: the host journals events and writes a
-checkpoint before it runs those effects. That ordering makes accepted requests
-idempotent across disconnects and process death. Storage carries independent host and
-application versions, replays journal records newer than the checkpoint, and can
-reconstruct a corrupt checkpoint from the session manifest plus replayable events.
-The fixture corpus under `tests/fixtures/` freezes protocol v1 and host storage v0/v1
-for compatibility review.
+checkpoint before it runs those effects. Session reducers remain synchronous and
+deterministic. External effects execute asynchronously without borrowing the actor,
+then return through its mailbox for a synchronous completion transition.
+
+Every effect has a durable `EffectId`. At-least-once effects are redriven after leader
+recovery with the same identity and an incremented attempt number, allowing downstream
+idempotency. At-most-once effects are never repeated after execution may have begun;
+their completion instead reports `effect_outcome_unknown`. Effects run sequentially
+within a session and concurrently across sessions, bounded by the host's
+`max_concurrent_effects` setting. `EffectContext` carries a cooperative cancellation
+signal that fires when its deadline expires, its session is deleted, or the leader
+shuts down. Effects inherit the host deadline unless an `EffectRequest` overrides it.
+This ordering makes accepted requests and their effect outbox recoverable across
+disconnects and process death.
+Storage carries independent host and application versions, replays journal records
+newer than the checkpoint, and can reconstruct a corrupt checkpoint from the session
+manifest plus replayable transitions. The fixture corpus under `tests/fixtures/`
+freezes protocol v1 and host storage v0/v1/v2 for compatibility review.
 
 `ResidentHost` owns election, registration, request routing, bounded client queues,
 driver fencing, deduplication, persistence, reconnect cursors, and graceful shutdown.
