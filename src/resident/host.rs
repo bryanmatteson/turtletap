@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use super::{
     ApplicationError, AttachmentMode, Authorization, ClientEnvelope, ClientHello, ClientInstanceId,
     ClientRequest, ConnectionId, ControlResult, DriverChange, Durability, EffectCancellation,
-    EffectContext, EffectDelivery, EffectId, EffectRequest, EventSequence, FileJournal,
+    EffectContext, EffectDelivery, EffectId, EffectRequest, EffectWake, EventSequence, FileJournal,
     JournalRecord, LeaderCapabilities, LeaderCore, LeaderInstanceId, LeaderLock, ProtocolRejection,
     RequestId, ResidentApplication, ResidentSession, ServerHandshake, ServerHello, ServerMessage,
     SessionControlSnapshot, SessionId, SessionSelector, SessionSummary, SessionTransition,
@@ -202,6 +202,10 @@ enum Incoming<O> {
         session: SessionId,
         effect: EffectId,
     },
+    SessionReady {
+        session: SessionId,
+        wake: EffectWake,
+    },
     Tick(Duration),
     ListenerFailed(io::Error),
 }
@@ -253,6 +257,8 @@ enum HostLogEvent<E> {
     Transition {
         request: Option<RequestId>,
         control_sequence: EventSequence,
+        #[serde(default)]
+        committed_at: Option<u64>,
         events: Vec<SequencedEvent<E>>,
         effects: Vec<StoredEffect>,
         completed_effect: Option<EffectId>,
@@ -315,6 +321,25 @@ where
     A: ResidentApplication,
     R: Clock + Spawner,
 {
+    /// Core summaries enriched with each application session's digest.
+    ///
+    /// The core owns identity and sequencing but knows nothing about domain
+    /// state, so the digest can only be attached here, where hosted sessions
+    /// live.
+    fn summaries(&self) -> Vec<SessionSummary> {
+        self.core
+            .sessions()
+            .into_iter()
+            .map(|mut summary| {
+                summary.digest = self
+                    .sessions
+                    .get(&summary.id)
+                    .and_then(|hosted| hosted.session.digest());
+                summary
+            })
+            .collect()
+    }
+
     fn load(
         application: A,
         runtime: R,
@@ -419,6 +444,7 @@ where
                         HostLogEvent::Transition {
                             request,
                             control_sequence,
+                            committed_at,
                             events: transition_events,
                             effects,
                             completed_effect,
@@ -450,6 +476,9 @@ where
                                         .map(decode_effect)
                                         .collect::<io::Result<Vec<_>>>()?,
                                 );
+                            }
+                            if let Some(committed_at) = committed_at {
+                                core.stamp_activity(id, committed_at);
                             }
                         }
                         HostLogEvent::EffectAttempted { effect, attempt } if replay => {
@@ -587,6 +616,10 @@ where
                 Incoming::EffectTimedOut { session, effect } => {
                     self.timeout_effect(session, effect)?;
                 }
+                Incoming::SessionReady { session, wake } => {
+                    wake.acknowledge();
+                    self.poll_session(session, Duration::ZERO)?;
+                }
                 Incoming::Message {
                     connection,
                     envelope,
@@ -618,10 +651,10 @@ where
                 ClientRequest::Status => Ok(ControlResult::Status {
                     pid: std::process::id(),
                     leader: self.leader,
-                    sessions: self.core.sessions(),
+                    sessions: self.summaries(),
                 }),
                 ClientRequest::ListSessions => Ok(ControlResult::Sessions {
-                    sessions: self.core.sessions(),
+                    sessions: self.summaries(),
                 }),
                 ClientRequest::CreateSession { name } => self.create_session(name),
                 ClientRequest::RenameSession { session, name } => {
@@ -687,7 +720,7 @@ where
                     Ok(ControlResult::Stopping)
                 }
                 ClientRequest::ReplaceLeader { binary_version } => {
-                    if replacement_is_newer(&self.config.binary_version, &binary_version) {
+                    if super::replacement_is_newer(&self.config.binary_version, &binary_version) {
                         shutdown = Some(ShutdownReason::Upgrade);
                         Ok(ControlResult::Stopping)
                     } else {
@@ -825,6 +858,11 @@ where
             last_sequence = Some(sequence);
         }
 
+        let committed_at = last_sequence.is_some().then(unix_millis);
+        if let Some(committed_at) = committed_at {
+            self.core.stamp_activity(session, committed_at);
+        }
+
         let pending = transition
             .effects
             .into_iter()
@@ -843,6 +881,7 @@ where
             HostLogEvent::Transition {
                 request,
                 control_sequence,
+                committed_at,
                 events: emitted.clone(),
                 effects: stored_effects,
                 completed_effect,
@@ -878,16 +917,18 @@ where
     fn poll(&mut self, elapsed: Duration) -> io::Result<()> {
         let sessions: Vec<_> = self.sessions.keys().copied().collect();
         for id in sessions {
-            let transition = self
-                .sessions
-                .get_mut(&id)
-                .expect("session id came from map")
-                .session
-                .poll(elapsed)
-                .map_err(io::Error::other)?;
-            if !transition.events.is_empty() || !transition.effects.is_empty() {
-                let _ = self.apply_transition(id, None, None, transition)?;
-            }
+            self.poll_session(id, elapsed)?;
+        }
+        Ok(())
+    }
+
+    fn poll_session(&mut self, session: SessionId, elapsed: Duration) -> io::Result<()> {
+        let Some(hosted) = self.sessions.get_mut(&session) else {
+            return Ok(());
+        };
+        let transition = hosted.session.poll(elapsed).map_err(io::Error::other)?;
+        if !transition.events.is_empty() || !transition.effects.is_empty() {
+            let _ = self.apply_transition(session, None, None, transition)?;
         }
         Ok(())
     }
@@ -912,6 +953,10 @@ where
             .effect_completed(effect, output)
             .map_err(io::Error::other)?;
         let _ = self.apply_transition(session, None, Some(effect), transition)?;
+        // The effect may have made output readable before its completion was
+        // reduced into session state. Poll once now so an early coalesced wake
+        // cannot be lost behind the periodic fallback tick.
+        self.poll_session(session, Duration::ZERO)?;
         Ok(())
     }
 
@@ -1007,6 +1052,21 @@ where
         });
         let application = self.application.clone();
         let sender = self.incoming_tx.clone();
+        let wake_sender = self.incoming_tx.clone();
+        let wake = EffectWake::new(move |wake| {
+            if wake_sender
+                .try_send(Incoming::SessionReady {
+                    session,
+                    wake: wake.clone(),
+                })
+                .is_err()
+            {
+                // A saturated or closing mailbox must not leave the handle
+                // permanently coalesced. A later notification can retry, and
+                // the periodic poll remains the overload fallback.
+                wake.acknowledge();
+            }
+        });
         let effect_id = pending.id;
         let effect_cancellation = cancellation.clone();
         self.runtime.spawn(async move {
@@ -1017,6 +1077,7 @@ where
                         effect: effect_id,
                         attempt,
                         cancellation: effect_cancellation,
+                        wake,
                     },
                     pending.effect,
                 )
@@ -1531,17 +1592,7 @@ fn wire_io(error: impl std::fmt::Display) -> WireError {
     }
 }
 
-fn replacement_is_newer(current: &str, requested: &str) -> bool {
-    match (
-        semver::Version::parse(current),
-        semver::Version::parse(requested),
-    ) {
-        (Ok(current), Ok(requested)) => requested > current,
-        _ => requested > current,
-    }
-}
-
-#[cfg(test)]
+#[cfg(all(test, feature = "tokio"))]
 mod tests {
     use std::{
         future,
@@ -1936,4 +1987,14 @@ mod tests {
         second_active.cancellation.cancel();
         fs::remove_dir_all(directory).expect("test directory should be removed");
     }
+}
+
+/// Wall-clock milliseconds since the Unix epoch, saturating at zero if the
+/// system clock predates it.
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
 }

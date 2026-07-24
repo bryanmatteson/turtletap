@@ -1,11 +1,17 @@
 use std::{
     io,
+    sync::atomic::{AtomicBool, Ordering},
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
+#[cfg(feature = "async-shell")]
+use crossterm::event::EventStream;
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
 };
+#[cfg(feature = "async-shell")]
+use futures_util::{StreamExt as _, future::OptionFuture};
 use ratatui::{Terminal, backend::TestBackend, layout::Rect};
 
 use crate::{
@@ -13,7 +19,31 @@ use crate::{
 };
 
 const PULSE_FRAME_RATE: Duration = Duration::from_millis(250);
+const DEFAULT_FRAME_INTERVAL: Duration = Duration::from_millis(4);
 const PULSE_FRAMES: [&str; 8] = ["·", "·", "•", "●", "•", "·", "·", "·"];
+static ATTACHED: AtomicBool = AtomicBool::new(false);
+
+struct AttachLease;
+
+impl AttachLease {
+    fn acquire() -> io::Result<Self> {
+        ATTACHED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| Self)
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "already_attached: another TurtleTap shell owns terminal input",
+                )
+            })
+    }
+}
+
+impl Drop for AttachLease {
+    fn drop(&mut self) {
+        ATTACHED.store(false, Ordering::Release);
+    }
+}
 
 /// Stable identity assigned to a surface by its shell.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -61,7 +91,9 @@ impl KeyBinding {
         Self { code, modifiers }
     }
 
-    fn matches(self, key: KeyEvent) -> bool {
+    /// Returns whether this binding matches a terminal key event exactly.
+    #[must_use]
+    pub fn matches(self, key: KeyEvent) -> bool {
         self.code == key.code && self.modifiers == key.modifiers
     }
 
@@ -79,7 +111,14 @@ impl KeyBinding {
             parts.push("Shift".to_owned());
         }
         if self.modifiers.contains(KeyModifiers::SUPER) {
-            parts.push("Super".to_owned());
+            parts.push(
+                if cfg!(target_os = "macos") {
+                    "Cmd"
+                } else {
+                    "Super"
+                }
+                .to_owned(),
+            );
         }
         parts.push(match self.code {
             KeyCode::Backspace => "Backspace".to_owned(),
@@ -106,12 +145,12 @@ impl KeyBinding {
     }
 }
 
-/// Configurable global navigation bindings.
+/// Configurable action bindings for shell and host interaction contexts.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShellBindings {
     /// Chords that arm the shell leader.
     pub leaders: Vec<KeyBinding>,
-    /// Chords that open the command palette.
+    /// Chords that open the action bar.
     pub palette: Vec<KeyBinding>,
     /// Chords that clear and fully redraw the terminal frame.
     pub redraw: Vec<KeyBinding>,
@@ -121,25 +160,201 @@ pub struct ShellBindings {
     pub previous_screen: Vec<KeyBinding>,
     /// Modifiers which, with digits 1 through 9, jump to a screen.
     pub jump_modifiers: Vec<KeyModifiers>,
+    /// Shell-managed-surface shortcuts that detach the terminal.
+    pub shell_detach: Vec<KeyBinding>,
+    /// Shell-managed-surface shortcuts that focus the next screen.
+    pub shell_next_screen: Vec<KeyBinding>,
+    /// Shell-managed-surface shortcuts that focus the previous screen.
+    pub shell_previous_screen: Vec<KeyBinding>,
+    /// Shell-managed-surface shortcuts that open contextual help.
+    pub shell_help: Vec<KeyBinding>,
+    /// Leader suffixes that open the action bar.
+    pub leader_palette: Vec<KeyBinding>,
+    /// Leader suffixes that focus the next screen.
+    pub leader_next_screen: Vec<KeyBinding>,
+    /// Leader suffixes that focus the previous screen.
+    pub leader_previous_screen: Vec<KeyBinding>,
+    /// Leader suffixes that scroll the active screen upward.
+    pub leader_scroll_up: Vec<KeyBinding>,
+    /// Leader suffixes that scroll the active screen downward.
+    pub leader_scroll_down: Vec<KeyBinding>,
+    /// Leader suffixes that close the active screen.
+    pub leader_close: Vec<KeyBinding>,
+    /// Leader suffixes that detach the terminal.
+    pub leader_detach: Vec<KeyBinding>,
+    /// Leader suffixes that open contextual help.
+    pub leader_help: Vec<KeyBinding>,
+    /// Leader-suffix modifiers which, with digits 1 through 9, jump to a screen.
+    pub leader_jump_modifiers: Vec<KeyModifiers>,
+    /// Action-bar shortcuts that focus the next screen.
+    pub action_next_screen: Vec<KeyBinding>,
+    /// Action-bar shortcuts that focus the previous screen.
+    pub action_previous_screen: Vec<KeyBinding>,
+    /// Action-bar shortcuts that scroll the active screen upward.
+    pub action_scroll_up: Vec<KeyBinding>,
+    /// Action-bar shortcuts that scroll the active screen downward.
+    pub action_scroll_down: Vec<KeyBinding>,
+    /// Action-bar shortcuts that close the active screen.
+    pub action_close: Vec<KeyBinding>,
+    /// Action-bar shortcuts that detach the terminal.
+    pub action_detach: Vec<KeyBinding>,
+    /// Action-bar shortcuts that open contextual help.
+    pub action_help: Vec<KeyBinding>,
+    /// Action-bar shortcuts that clear the search query.
+    pub action_clear_query: Vec<KeyBinding>,
+    /// Action-bar modifiers which, with digits 1 through 9, jump to a screen.
+    pub action_jump_modifiers: Vec<KeyModifiers>,
+    /// Session shortcuts that release the driver lease.
+    pub session_release_driver: Vec<KeyBinding>,
+    /// Session shortcuts that take the driver lease.
+    pub session_take_driver: Vec<KeyBinding>,
+    /// Session shortcuts that clear the transcript.
+    pub session_clear: Vec<KeyBinding>,
+    /// Session shortcuts that interrupt a running command.
+    pub session_interrupt: Vec<KeyBinding>,
+    /// Session shortcuts that detach the terminal from an empty prompt.
+    pub session_detach: Vec<KeyBinding>,
+    /// Session shortcuts that delete input before the cursor.
+    pub session_delete_to_start: Vec<KeyBinding>,
+    /// Session shortcuts that move to the previous word.
+    pub session_word_left: Vec<KeyBinding>,
+    /// Session shortcuts that move to the next word.
+    pub session_word_right: Vec<KeyBinding>,
+    /// Session shortcuts that move to the start of the input line.
+    pub session_line_start: Vec<KeyBinding>,
+    /// Session shortcuts that move to the end of the input line.
+    pub session_line_end: Vec<KeyBinding>,
+    /// Session shortcuts that delete the previous word.
+    pub session_delete_word: Vec<KeyBinding>,
+    /// Session shortcuts that complete the current command.
+    pub session_complete: Vec<KeyBinding>,
+    /// Session shortcuts that scroll upward.
+    pub session_scroll_up: Vec<KeyBinding>,
+    /// Session shortcuts that scroll downward.
+    pub session_scroll_down: Vec<KeyBinding>,
+    /// Session shortcuts that jump to the oldest output.
+    pub session_scroll_top: Vec<KeyBinding>,
+    /// Session shortcuts that return to live output.
+    pub session_scroll_bottom: Vec<KeyBinding>,
+    /// Dashboard shortcuts that move selection upward.
+    pub dashboard_up: Vec<KeyBinding>,
+    /// Dashboard shortcuts that move selection downward.
+    pub dashboard_down: Vec<KeyBinding>,
+    /// Dashboard shortcuts that open the selected session in view mode.
+    pub dashboard_view: Vec<KeyBinding>,
+    /// Dashboard shortcuts that take the selected session.
+    pub dashboard_take: Vec<KeyBinding>,
+    /// Dashboard shortcuts that start search.
+    pub dashboard_search: Vec<KeyBinding>,
+    /// Dashboard shortcuts that create a session.
+    pub dashboard_new: Vec<KeyBinding>,
+    /// Dashboard shortcuts that rename the selected session.
+    pub dashboard_rename: Vec<KeyBinding>,
+    /// Dashboard shortcuts that delete the selected session.
+    pub dashboard_delete: Vec<KeyBinding>,
+    /// Dashboard shortcuts that stop the resident leader.
+    pub dashboard_stop: Vec<KeyBinding>,
+    /// Dashboard shortcuts that open the keybinding editor.
+    pub dashboard_keybindings: Vec<KeyBinding>,
+    /// Dashboard shortcuts that close the overview.
+    pub dashboard_close: Vec<KeyBinding>,
 }
 
 impl Default for ShellBindings {
     fn default() -> Self {
         Self {
-            leaders: vec![
+            leaders: vec![KeyBinding::new(KeyCode::Char('g'), KeyModifiers::CONTROL)],
+            palette: vec![
+                KeyBinding::new(KeyCode::Char('`'), KeyModifiers::CONTROL),
+                // Some terminals encode Ctrl-` as the same NUL byte as
+                // Ctrl-Space, so accept both representations.
                 KeyBinding::new(KeyCode::Char(' '), KeyModifiers::CONTROL),
-                KeyBinding::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+                KeyBinding::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
             ],
-            palette: vec![KeyBinding::new(KeyCode::Char('p'), KeyModifiers::CONTROL)],
             redraw: vec![
                 KeyBinding::new(KeyCode::Char('/'), KeyModifiers::CONTROL),
                 KeyBinding::new(KeyCode::Char('_'), KeyModifiers::CONTROL),
             ],
-            next_screen: vec![KeyBinding::new(KeyCode::PageDown, KeyModifiers::CONTROL)],
-            previous_screen: vec![KeyBinding::new(KeyCode::PageUp, KeyModifiers::CONTROL)],
-            jump_modifiers: vec![KeyModifiers::ALT],
+            next_screen: Vec::new(),
+            previous_screen: Vec::new(),
+            jump_modifiers: Vec::new(),
+            shell_detach: vec![ctrl('d')],
+            shell_next_screen: vec![plain(KeyCode::Tab)],
+            shell_previous_screen: vec![plain(KeyCode::BackTab)],
+            shell_help: vec![plain(KeyCode::Char('?'))],
+            leader_palette: vec![plain(KeyCode::Char('s'))],
+            leader_next_screen: vec![
+                plain(KeyCode::Char('n')),
+                plain(KeyCode::Tab),
+                plain(KeyCode::Right),
+            ],
+            leader_previous_screen: vec![
+                plain(KeyCode::Char('p')),
+                plain(KeyCode::BackTab),
+                plain(KeyCode::Left),
+            ],
+            leader_scroll_up: vec![plain(KeyCode::Char('k')), plain(KeyCode::Up)],
+            leader_scroll_down: vec![plain(KeyCode::Char('j')), plain(KeyCode::Down)],
+            leader_close: vec![plain(KeyCode::Char('x'))],
+            leader_detach: vec![plain(KeyCode::Char('d'))],
+            leader_help: vec![plain(KeyCode::Char('?')), plain(KeyCode::Char('h'))],
+            leader_jump_modifiers: vec![KeyModifiers::empty()],
+            action_next_screen: vec![alt(KeyCode::Right)],
+            action_previous_screen: vec![alt(KeyCode::Left)],
+            action_scroll_up: vec![alt(KeyCode::Up)],
+            action_scroll_down: vec![alt(KeyCode::Down)],
+            action_close: vec![alt(KeyCode::Char('x'))],
+            action_detach: vec![alt(KeyCode::Char('d'))],
+            action_help: vec![alt(KeyCode::Char('?'))],
+            action_clear_query: vec![ctrl('u')],
+            action_jump_modifiers: vec![KeyModifiers::ALT],
+            session_release_driver: vec![plain(KeyCode::F(2))],
+            session_take_driver: vec![plain(KeyCode::F(3))],
+            session_clear: vec![
+                KeyBinding::new(KeyCode::Char('k'), KeyModifiers::SUPER),
+                ctrl('l'),
+            ],
+            session_interrupt: vec![ctrl('c')],
+            session_detach: vec![ctrl('d')],
+            session_delete_to_start: vec![
+                ctrl('u'),
+                KeyBinding::new(KeyCode::Backspace, KeyModifiers::SUPER),
+            ],
+            session_word_left: vec![alt(KeyCode::Left), alt(KeyCode::Char('b'))],
+            session_word_right: vec![alt(KeyCode::Right), alt(KeyCode::Char('f'))],
+            session_line_start: vec![KeyBinding::new(KeyCode::Left, KeyModifiers::SUPER)],
+            session_line_end: vec![KeyBinding::new(KeyCode::Right, KeyModifiers::SUPER)],
+            session_delete_word: vec![alt(KeyCode::Backspace)],
+            session_complete: vec![plain(KeyCode::Tab)],
+            session_scroll_up: vec![plain(KeyCode::PageUp)],
+            session_scroll_down: vec![plain(KeyCode::PageDown)],
+            session_scroll_top: vec![KeyBinding::new(KeyCode::Home, KeyModifiers::CONTROL)],
+            session_scroll_bottom: vec![KeyBinding::new(KeyCode::End, KeyModifiers::CONTROL)],
+            dashboard_up: vec![plain(KeyCode::Char('k'))],
+            dashboard_down: vec![plain(KeyCode::Char('j'))],
+            dashboard_view: vec![plain(KeyCode::Char('v'))],
+            dashboard_take: vec![plain(KeyCode::Char('t'))],
+            dashboard_search: vec![plain(KeyCode::Char('/'))],
+            dashboard_new: vec![plain(KeyCode::Char('n'))],
+            dashboard_rename: vec![plain(KeyCode::Char('r'))],
+            dashboard_delete: vec![plain(KeyCode::Char('x'))],
+            dashboard_stop: vec![plain(KeyCode::Char('!'))],
+            dashboard_keybindings: vec![plain(KeyCode::Char('b'))],
+            dashboard_close: vec![plain(KeyCode::Char('q'))],
         }
     }
+}
+
+const fn plain(code: KeyCode) -> KeyBinding {
+    KeyBinding::new(code, KeyModifiers::empty())
+}
+
+const fn ctrl(character: char) -> KeyBinding {
+    KeyBinding::new(KeyCode::Char(character), KeyModifiers::CONTROL)
+}
+
+const fn alt(code: KeyCode) -> KeyBinding {
+    KeyBinding::new(code, KeyModifiers::ALT)
 }
 
 impl ShellBindings {
@@ -156,7 +371,7 @@ impl ShellBindings {
     pub(crate) fn primary_palette_label(&self) -> String {
         self.palette
             .first()
-            .map_or_else(|| "palette".to_owned(), |binding| binding.label())
+            .map_or_else(|| "disabled".to_owned(), |binding| binding.label())
     }
 
     pub(crate) fn primary_redraw_label(&self) -> String {
@@ -166,26 +381,112 @@ impl ShellBindings {
     }
 
     pub(crate) fn primary_next_label(&self) -> String {
-        self.next_screen
-            .first()
-            .map_or_else(|| "next".to_owned(), |binding| binding.label())
+        self.next_screen.first().map_or_else(
+            || self.primary_action_label(&self.action_next_screen),
+            |binding| binding.label(),
+        )
     }
 
     pub(crate) fn primary_previous_label(&self) -> String {
-        self.previous_screen
-            .first()
-            .map_or_else(|| "previous".to_owned(), |binding| binding.label())
+        self.previous_screen.first().map_or_else(
+            || self.primary_action_label(&self.action_previous_screen),
+            |binding| binding.label(),
+        )
     }
 
     pub(crate) fn primary_jump_label(&self) -> String {
         self.jump_modifiers.first().map_or_else(
-            || "1…9".to_owned(),
-            |modifiers| {
-                KeyBinding::new(KeyCode::Char('1'), *modifiers)
-                    .label()
-                    .replace('1', "1…9")
+            || {
+                self.action_jump_modifiers.first().map_or_else(
+                    || "disabled".to_owned(),
+                    |modifiers| {
+                        format!(
+                            "{} {}",
+                            self.primary_palette_label(),
+                            digit_range_label(*modifiers)
+                        )
+                    },
+                )
             },
+            |modifiers| digit_range_label(*modifiers),
         )
+    }
+
+    pub(crate) fn primary_leader_chord_label(&self, suffixes: &[KeyBinding]) -> String {
+        match (self.leaders.first(), suffixes.first()) {
+            (Some(leader), Some(suffix)) => format!("{} {}", leader.label(), suffix.label()),
+            _ => "disabled".to_owned(),
+        }
+    }
+
+    fn primary_action_label(&self, actions: &[KeyBinding]) -> String {
+        match (self.palette.first(), actions.first()) {
+            (Some(palette), Some(action)) => format!("{} {}", palette.label(), action.label()),
+            _ => "disabled".to_owned(),
+        }
+    }
+}
+
+fn digit_range_label(modifiers: KeyModifiers) -> String {
+    KeyBinding::new(KeyCode::Char('1'), modifiers)
+        .label()
+        .replace('1', "1…9")
+}
+
+/// How the shell presents its list of surfaces.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Chrome {
+    /// A horizontal tab strip above the active surface.
+    ///
+    /// Suited to a handful of long-lived surfaces; a growing list outgrows the
+    /// single row it has to share.
+    #[default]
+    Tabs,
+    /// A persistent vertical list beside the active surface (master-detail).
+    ///
+    /// On a terminal too narrow for titles this narrows to a marker-only rail
+    /// rather than reverting to tabs, so the list never changes edges and
+    /// ambient status survives.
+    Rail {
+        /// Columns for the full list.
+        width: u16,
+        /// Columns when only status markers fit.
+        narrow: u16,
+        /// Columns the detail pane must retain for the full list to be shown.
+        min_content: u16,
+    },
+}
+
+impl Chrome {
+    /// A master-detail rail with terminal-friendly defaults.
+    #[must_use]
+    pub const fn rail() -> Self {
+        Self::Rail {
+            width: 24,
+            narrow: 5,
+            min_content: 48,
+        }
+    }
+
+    /// Columns this chrome claims at `total` width, or `None` for tabs.
+    pub(crate) const fn rail_width(self, total: u16) -> Option<u16> {
+        match self {
+            Self::Tabs => None,
+            Self::Rail {
+                width,
+                narrow,
+                min_content,
+            } => {
+                let wide = width.saturating_add(8);
+                if total >= 120 && total.saturating_sub(wide) >= min_content {
+                    Some(wide)
+                } else if total.saturating_sub(width) >= min_content {
+                    Some(width)
+                } else {
+                    Some(narrow)
+                }
+            }
+        }
     }
 }
 
@@ -209,6 +510,8 @@ pub struct ShellConfig {
     pub theme: Theme,
     /// Global navigation key bindings.
     pub bindings: ShellBindings,
+    /// How the surface list is presented.
+    pub chrome: Chrome,
 }
 
 impl ShellConfig {
@@ -221,6 +524,7 @@ impl ShellConfig {
             mouse_capture: false,
             theme: Theme::default(),
             bindings: ShellBindings::default(),
+            chrome: Chrome::default(),
         }
     }
 
@@ -258,6 +562,13 @@ impl ShellConfig {
         self.bindings = bindings;
         self
     }
+
+    /// Chooses how the surface list is presented.
+    #[must_use]
+    pub const fn with_chrome(mut self, chrome: Chrome) -> Self {
+        self.chrome = chrome;
+        self
+    }
 }
 
 struct Entry {
@@ -276,6 +587,8 @@ pub(crate) enum PaletteAction {
     SelectSurface(usize),
     NextSurface,
     PreviousSurface,
+    ScrollUp,
+    ScrollDown,
     CloseSurface,
     Detach,
     Help,
@@ -299,9 +612,12 @@ pub struct Shell {
     dirty: bool,
     pulse_elapsed: Duration,
     pulse_frame: usize,
+    pulse_enabled: bool,
     clear_requested: bool,
+    frame_interval: Duration,
+    background_cursor: usize,
     pub(crate) notice: Option<String>,
-    pub(crate) tab_hits: Vec<(Rect, usize)>,
+    pub(crate) chrome_hits: Vec<(Rect, usize)>,
 }
 
 impl Shell {
@@ -318,10 +634,30 @@ impl Shell {
             dirty: true,
             pulse_elapsed: Duration::ZERO,
             pulse_frame: 0,
+            pulse_enabled: true,
             clear_requested: false,
+            frame_interval: DEFAULT_FRAME_INTERVAL,
+            background_cursor: 0,
             notice: None,
-            tab_hits: Vec::new(),
+            chrome_hits: Vec::new(),
         }
+    }
+
+    /// Replaces the maximum interval used to coalesce dirty frames during
+    /// asynchronous attachment.
+    ///
+    /// A zero duration disables coalescing.
+    #[must_use]
+    pub const fn with_frame_interval(mut self, frame_interval: Duration) -> Self {
+        self.frame_interval = frame_interval;
+        self
+    }
+
+    /// Enables or disables the ambient title pulse.
+    #[must_use]
+    pub const fn with_pulse_enabled(mut self, enabled: bool) -> Self {
+        self.pulse_enabled = enabled;
+        self
     }
 
     /// Adds a surface and focuses it.
@@ -380,6 +716,14 @@ impl Shell {
         true
     }
 
+    fn tick_rate(&self) -> Duration {
+        self.entries
+            .iter()
+            .filter_map(|entry| entry.surface.poll_interval())
+            .fold(self.config.tick_rate, std::cmp::min)
+            .max(Duration::from_millis(1))
+    }
+
     /// Attaches this shell to the current terminal until detach or final close.
     ///
     /// The terminal is restored on success, error, and panic unwinding. Because the
@@ -389,12 +733,13 @@ impl Shell {
             return Ok(ExitReason::NoSurfaces);
         }
 
+        let _lease = AttachLease::acquire()?;
         let mut session = TerminalSession::enter(self.config.mouse_capture)?;
         let mut previous_tick = Instant::now();
-        let tick_rate = self.config.tick_rate.max(Duration::from_millis(1));
         self.dirty = true;
 
         loop {
+            let tick_rate = self.tick_rate();
             if self.clear_requested {
                 session.clear_frame()?;
                 self.clear_requested = false;
@@ -412,6 +757,9 @@ impl Shell {
                 {
                     return Ok(reason);
                 }
+                if let ShellSignal::Exit(reason) = self.poll_background_sync() {
+                    return Ok(reason);
+                }
                 // Show lifecycle-driven changes before waiting for more input.
                 continue;
             }
@@ -422,9 +770,109 @@ impl Shell {
             } else {
                 let elapsed = previous_tick.elapsed();
                 previous_tick = Instant::now();
-                self.dispatch_to_all(SurfaceEvent::Tick(elapsed))
+                let tick = self.dispatch_to_all(SurfaceEvent::Tick(elapsed));
+                if matches!(tick, ShellSignal::Continue) {
+                    self.poll_background_sync()
+                } else {
+                    tick
+                }
             };
 
+            if let ShellSignal::Exit(reason) = signal {
+                return Ok(reason);
+            }
+        }
+    }
+
+    /// Attaches this shell using event-driven terminal, background, redraw, and
+    /// timer multiplexing.
+    ///
+    /// The caller must poll this future inside a Tokio runtime. Dropping the
+    /// future restores the terminal before releasing process-global input
+    /// ownership.
+    #[cfg(feature = "async-shell")]
+    pub async fn attach_async(&mut self) -> io::Result<ExitReason> {
+        if self.entries.is_empty() {
+            return Ok(ExitReason::NoSurfaces);
+        }
+
+        let _lease = AttachLease::acquire()?;
+        let mut session = TerminalSession::enter(self.config.mouse_capture)?;
+        let mut input = EventStream::new();
+        let mut previous_tick = Instant::now();
+        let mut last_draw = None;
+        self.dirty = true;
+
+        loop {
+            let now = Instant::now();
+            let tick_rate = self.tick_rate();
+            let elapsed = now.saturating_duration_since(previous_tick);
+            if elapsed >= tick_rate {
+                previous_tick = now;
+                if let ShellSignal::Exit(reason) = self.dispatch_to_all(SurfaceEvent::Tick(elapsed))
+                {
+                    return Ok(reason);
+                }
+            }
+
+            let draw_due = self.dirty
+                && (self.frame_interval.is_zero()
+                    || last_draw.is_none_or(|drawn: Instant| {
+                        now.saturating_duration_since(drawn) >= self.frame_interval
+                    }));
+            if self.clear_requested && draw_due {
+                session.clear_frame()?;
+                self.clear_requested = false;
+                self.dirty = true;
+            }
+            if draw_due {
+                session.terminal().draw(|frame| render::draw(frame, self))?;
+                self.dirty = false;
+                last_draw = Some(Instant::now());
+                continue;
+            }
+
+            let tick_deadline = previous_tick + tick_rate;
+            let redraw_deadline = self
+                .dirty
+                .then(|| last_draw.map_or(now, |drawn| drawn + self.frame_interval));
+            let redraw = OptionFuture::from(redraw_deadline.map(|deadline| {
+                tokio::time::sleep_until(tokio::time::Instant::from_std(deadline))
+            }));
+            tokio::pin!(redraw);
+
+            enum AsyncEvent {
+                Terminal(Option<io::Result<Event>>),
+                Background(usize, SurfaceAction),
+                Tick,
+                Redraw,
+            }
+
+            let next = {
+                let background =
+                    std::future::poll_fn(|context| self.poll_background_round_robin(context));
+                tokio::select! {
+                    terminal = input.next() => AsyncEvent::Terminal(terminal),
+                    (index, action) = background => AsyncEvent::Background(index, action),
+                    _ = tokio::time::sleep_until(
+                        tokio::time::Instant::from_std(tick_deadline)
+                    ) => AsyncEvent::Tick,
+                    _ = &mut redraw, if redraw_deadline.is_some() => AsyncEvent::Redraw,
+                }
+            };
+
+            let signal = match next {
+                AsyncEvent::Terminal(Some(Ok(event))) => self.handle_event(event),
+                AsyncEvent::Terminal(Some(Err(error))) => return Err(error),
+                AsyncEvent::Terminal(None) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "terminal event stream closed",
+                    ));
+                }
+                AsyncEvent::Background(index, action) => self.apply_surface_action(index, action),
+                AsyncEvent::Tick | AsyncEvent::Redraw => ShellSignal::Continue,
+            };
             if let ShellSignal::Exit(reason) = signal {
                 return Ok(reason);
             }
@@ -492,15 +940,38 @@ impl Shell {
             return self.handle_overlay_key(key);
         }
 
+        let policy = self
+            .active
+            .map(|index| self.entries[index].surface.input_policy())
+            .unwrap_or_default();
+        if policy == InputPolicy::Exclusive {
+            if self.notice.take().is_some() {
+                self.dirty = true;
+            }
+            return self.dispatch_to_active(SurfaceEvent::Key(key));
+        }
+
         if self.leader_armed {
             self.leader_armed = false;
             return self.handle_leader_key(key);
         }
 
+        if key.code == KeyCode::Esc
+            && key.modifiers.is_empty()
+            && self
+                .active
+                .is_some_and(|index| self.entries[index].surface.opens_action_bar_on_escape())
+        {
+            self.open_palette();
+            return ShellSignal::Continue;
+        }
+
         if ShellBindings::matches(&self.config.bindings.leaders, key) {
             self.leader_armed = true;
-            self.notice =
-                Some("Leader: 1-9 jump · n/p switch · d detach · s commands · ? help".to_string());
+            self.notice = Some(format!(
+                "{} armed · press a configured action key · Esc cancel",
+                self.config.bindings.primary_leader_label()
+            ));
             self.dirty = true;
             return ShellSignal::Continue;
         }
@@ -533,30 +1004,24 @@ impl Shell {
             return ShellSignal::Continue;
         }
 
-        let policy = self
-            .active
-            .map(|index| self.entries[index].surface.input_policy())
-            .unwrap_or_default();
-
         if policy == InputPolicy::Shell {
-            if self.config.direct_detach && is_ctrl(key, 'd') {
+            if self.config.direct_detach
+                && ShellBindings::matches(&self.config.bindings.shell_detach, key)
+            {
                 return ShellSignal::Exit(ExitReason::Detached);
             }
-            match key.code {
-                KeyCode::Tab if key.modifiers.is_empty() => {
-                    self.select_relative(1);
-                    return ShellSignal::Continue;
-                }
-                KeyCode::BackTab => {
-                    self.select_relative(-1);
-                    return ShellSignal::Continue;
-                }
-                KeyCode::Char('?') if key.modifiers.is_empty() => {
-                    self.overlay = Some(Overlay::Help);
-                    self.dirty = true;
-                    return ShellSignal::Continue;
-                }
-                _ => {}
+            if ShellBindings::matches(&self.config.bindings.shell_next_screen, key) {
+                self.select_relative(1);
+                return ShellSignal::Continue;
+            }
+            if ShellBindings::matches(&self.config.bindings.shell_previous_screen, key) {
+                self.select_relative(-1);
+                return ShellSignal::Continue;
+            }
+            if ShellBindings::matches(&self.config.bindings.shell_help, key) {
+                self.overlay = Some(Overlay::Help);
+                self.dirty = true;
+                return ShellSignal::Continue;
             }
         }
 
@@ -570,37 +1035,48 @@ impl Shell {
         if self.notice.take().is_some() {
             self.dirty = true;
         }
-        match key.code {
-            KeyCode::Char('d') => ShellSignal::Exit(ExitReason::Detached),
-            KeyCode::Char('s') => {
-                self.open_palette();
-                ShellSignal::Continue
-            }
-            KeyCode::Char('n') | KeyCode::Tab => {
-                self.select_relative(1);
-                ShellSignal::Continue
-            }
-            KeyCode::Char('p') | KeyCode::BackTab => {
-                self.select_relative(-1);
-                ShellSignal::Continue
-            }
-            KeyCode::Char(digit @ '1'..='9') => {
-                self.select_numbered(digit);
-                ShellSignal::Continue
-            }
-            KeyCode::Char('x') => self.close_active(),
-            KeyCode::Char('?') | KeyCode::Char('h') => {
-                self.overlay = Some(Overlay::Help);
-                self.dirty = true;
-                ShellSignal::Continue
-            }
-            KeyCode::Esc => ShellSignal::Continue,
-            _ => {
-                let leader = self.config.bindings.primary_leader_label();
-                self.notice = Some(format!("Unknown {leader} chord; press {leader} ? for help"));
-                self.dirty = true;
-                ShellSignal::Continue
-            }
+        let bindings = self.config.bindings.clone();
+        if ShellBindings::matches(&bindings.leader_detach, key) {
+            ShellSignal::Exit(ExitReason::Detached)
+        } else if ShellBindings::matches(&bindings.leader_palette, key) {
+            self.open_palette();
+            ShellSignal::Continue
+        } else if ShellBindings::matches(&bindings.leader_next_screen, key) {
+            self.select_relative(1);
+            ShellSignal::Continue
+        } else if ShellBindings::matches(&bindings.leader_previous_screen, key) {
+            self.select_relative(-1);
+            ShellSignal::Continue
+        } else if ShellBindings::matches(&bindings.leader_scroll_up, key) {
+            self.dispatch_to_active(SurfaceEvent::ScrollPageUp)
+        } else if ShellBindings::matches(&bindings.leader_scroll_down, key) {
+            self.dispatch_to_active(SurfaceEvent::ScrollPageDown)
+        } else if let KeyCode::Char(digit @ '1'..='9') = key.code
+            && bindings.leader_jump_modifiers.contains(&key.modifiers)
+        {
+            self.select_numbered(digit);
+            ShellSignal::Continue
+        } else if ShellBindings::matches(&bindings.leader_close, key) {
+            self.close_active()
+        } else if ShellBindings::matches(&bindings.leader_help, key) {
+            self.overlay = Some(Overlay::Help);
+            self.dirty = true;
+            ShellSignal::Continue
+        } else if key.code == KeyCode::Esc && key.modifiers.is_empty() {
+            ShellSignal::Continue
+        } else {
+            let leader = self.config.bindings.primary_leader_label();
+            let help = self
+                .config
+                .bindings
+                .leader_help
+                .first()
+                .map_or_else(|| "help".to_owned(), |binding| binding.label());
+            self.notice = Some(format!(
+                "Unknown {leader} chord; press {leader} {help} for help"
+            ));
+            self.dirty = true;
+            ShellSignal::Continue
         }
     }
 
@@ -609,10 +1085,7 @@ impl Shell {
         let mut signal = ShellSignal::Continue;
         match self.overlay.clone() {
             Some(Overlay::Help) => {
-                if matches!(
-                    key.code,
-                    KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q')
-                ) {
+                if key.code == KeyCode::Esc && key.modifiers.is_empty() {
                     self.overlay = None;
                 }
             }
@@ -623,6 +1096,44 @@ impl Shell {
                 let item_count = self.palette_items(&query).len();
                 match key.code {
                     KeyCode::Esc => self.overlay = None,
+                    _ if ShellBindings::matches(&self.config.bindings.action_next_screen, key) => {
+                        signal = self.execute_palette_action(PaletteAction::NextSurface);
+                    }
+                    _ if ShellBindings::matches(
+                        &self.config.bindings.action_previous_screen,
+                        key,
+                    ) =>
+                    {
+                        signal = self.execute_palette_action(PaletteAction::PreviousSurface);
+                    }
+                    _ if ShellBindings::matches(&self.config.bindings.action_scroll_up, key) => {
+                        signal = self.execute_palette_action(PaletteAction::ScrollUp);
+                    }
+                    _ if ShellBindings::matches(&self.config.bindings.action_scroll_down, key) => {
+                        signal = self.execute_palette_action(PaletteAction::ScrollDown);
+                    }
+                    KeyCode::Char(digit @ '1'..='9')
+                        if self
+                            .config
+                            .bindings
+                            .action_jump_modifiers
+                            .contains(&key.modifiers) =>
+                    {
+                        let index = usize::from(digit as u8 - b'1');
+                        if index < self.entries.len() {
+                            signal =
+                                self.execute_palette_action(PaletteAction::SelectSurface(index));
+                        }
+                    }
+                    _ if ShellBindings::matches(&self.config.bindings.action_detach, key) => {
+                        signal = self.execute_palette_action(PaletteAction::Detach);
+                    }
+                    _ if ShellBindings::matches(&self.config.bindings.action_close, key) => {
+                        signal = self.execute_palette_action(PaletteAction::CloseSurface);
+                    }
+                    _ if ShellBindings::matches(&self.config.bindings.action_help, key) => {
+                        signal = self.execute_palette_action(PaletteAction::Help);
+                    }
                     KeyCode::Down | KeyCode::Tab => {
                         selected = wrap_index(selected, 1, item_count);
                         self.overlay = Some(Overlay::Palette { query, selected });
@@ -644,23 +1155,11 @@ impl Shell {
                         query.pop();
                         self.overlay = Some(Overlay::Palette { query, selected: 0 });
                     }
-                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    _ if ShellBindings::matches(&self.config.bindings.action_clear_query, key) => {
                         self.overlay = Some(Overlay::Palette {
                             query: String::new(),
                             selected: 0,
                         });
-                    }
-                    KeyCode::Char(digit @ '1'..='9')
-                        if query.is_empty() && key.modifiers.is_empty() =>
-                    {
-                        let index = usize::from(digit as u8 - b'1');
-                        if index < self.entries.len() {
-                            signal =
-                                self.execute_palette_action(PaletteAction::SelectSurface(index));
-                        } else {
-                            query.push(digit);
-                            self.overlay = Some(Overlay::Palette { query, selected: 0 });
-                        }
                     }
                     KeyCode::Char(character)
                         if !key
@@ -690,7 +1189,7 @@ impl Shell {
 
         if matches!(mouse.kind, MouseEventKind::Down(_))
             && let Some((_, index)) = self
-                .tab_hits
+                .chrome_hits
                 .iter()
                 .find(|(area, _)| contains(*area, mouse.column, mouse.row))
                 .copied()
@@ -701,24 +1200,89 @@ impl Shell {
         self.dispatch_to_active(SurfaceEvent::Mouse(mouse))
     }
 
-    fn dispatch_to_active(&mut self, event: SurfaceEvent) -> ShellSignal {
-        let Some(index) = self.active else {
-            return ShellSignal::Exit(ExitReason::NoSurfaces);
-        };
-        let action = self.entries[index].surface.handle(event);
+    fn poll_background_sync(&mut self) -> ShellSignal {
+        let mut context = Context::from_waker(std::task::Waker::noop());
+        match self.poll_background_round_robin(&mut context) {
+            Poll::Ready((index, action)) => self.apply_surface_action(index, action),
+            Poll::Pending => ShellSignal::Continue,
+        }
+    }
+
+    fn poll_background_round_robin(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<(usize, SurfaceAction)> {
+        let len = self.entries.len();
+        if len == 0 {
+            return Poll::Pending;
+        }
+        let start = self.background_cursor % len;
+        for offset in 0..len {
+            let index = (start + offset) % len;
+            if let Poll::Ready(action) = self.entries[index].surface.poll_background(context) {
+                self.background_cursor = (index + 1) % len;
+                return Poll::Ready((index, action));
+            }
+        }
+        Poll::Pending
+    }
+
+    fn apply_surface_action(&mut self, index: usize, action: SurfaceAction) -> ShellSignal {
+        if index >= self.entries.len() {
+            return ShellSignal::Continue;
+        }
         match action {
             SurfaceAction::Ignored => ShellSignal::Continue,
             SurfaceAction::Consumed => {
                 self.dirty = true;
                 ShellSignal::Continue
             }
-            SurfaceAction::Close => self.close_active(),
+            SurfaceAction::Close => {
+                let _ = self.remove_index(index);
+                if self.entries.is_empty() {
+                    ShellSignal::Exit(ExitReason::NoSurfaces)
+                } else {
+                    ShellSignal::Continue
+                }
+            }
             SurfaceAction::Detach => ShellSignal::Exit(ExitReason::Detached),
             SurfaceAction::Open(surface) => {
+                if let Some(key) = surface.key()
+                    && self
+                        .entries
+                        .iter()
+                        .position(|entry| entry.surface.key().as_deref() == Some(key.as_ref()))
+                        .is_some_and(|existing| {
+                            self.select_index(existing);
+                            true
+                        })
+                {
+                    return ShellSignal::Continue;
+                }
                 self.add_boxed_surface(surface);
                 ShellSignal::Continue
             }
+            SurfaceAction::FocusKey(key) => {
+                self.select_key(&key);
+                ShellSignal::Continue
+            }
+            SurfaceAction::Reconfigure(config) => {
+                self.config = *config;
+                for entry in &mut self.entries {
+                    entry.surface.reconfigure(&self.config);
+                }
+                self.dirty = true;
+                ShellSignal::Continue
+            }
         }
+    }
+
+    fn dispatch_to_active(&mut self, event: SurfaceEvent) -> ShellSignal {
+        let Some(index) = self.active else {
+            return ShellSignal::Exit(ExitReason::NoSurfaces);
+        };
+        let action = self.entries[index].surface.handle(event);
+        self.apply_surface_action(index, action)
     }
 
     fn dispatch_to_all(&mut self, event: SurfaceEvent) -> ShellSignal {
@@ -735,6 +1299,8 @@ impl Shell {
 
         let mut close_indices = Vec::new();
         let mut open_surfaces = Vec::new();
+        let mut focus_keys = Vec::new();
+        let mut reconfigure = None;
         let mut detach = false;
         let mut redraw = animation_changed;
 
@@ -745,6 +1311,8 @@ impl Shell {
                 SurfaceAction::Close => close_indices.push(index),
                 SurfaceAction::Detach => detach = true,
                 SurfaceAction::Open(surface) => open_surfaces.push(surface),
+                SurfaceAction::FocusKey(key) => focus_keys.push(key),
+                SurfaceAction::Reconfigure(config) => reconfigure = Some(config),
             }
         }
 
@@ -754,6 +1322,16 @@ impl Shell {
         }
         for surface in open_surfaces {
             self.add_boxed_surface(surface);
+        }
+        for key in focus_keys {
+            self.select_key(&key);
+        }
+        if let Some(config) = reconfigure {
+            self.config = *config;
+            for entry in &mut self.entries {
+                entry.surface.reconfigure(&self.config);
+            }
+            redraw = true;
         }
         self.dirty |= redraw;
 
@@ -767,6 +1345,9 @@ impl Shell {
     }
 
     fn advance_pulse(&mut self, elapsed: Duration) -> bool {
+        if !self.pulse_enabled {
+            return false;
+        }
         let previous_marker = self.pulse_marker();
         self.pulse_elapsed = self.pulse_elapsed.saturating_add(elapsed);
         while self.pulse_elapsed >= PULSE_FRAME_RATE {
@@ -777,7 +1358,11 @@ impl Shell {
     }
 
     pub(crate) fn pulse_marker(&self) -> &'static str {
-        PULSE_FRAMES[self.pulse_frame]
+        if self.pulse_enabled {
+            PULSE_FRAMES[self.pulse_frame]
+        } else {
+            ""
+        }
     }
 
     fn open_palette(&mut self) {
@@ -819,6 +1404,8 @@ impl Shell {
                 self.select_relative(-1);
                 ShellSignal::Continue
             }
+            PaletteAction::ScrollUp => self.dispatch_to_active(SurfaceEvent::ScrollPageUp),
+            PaletteAction::ScrollDown => self.dispatch_to_active(SurfaceEvent::ScrollPageDown),
             PaletteAction::CloseSurface => self.close_active(),
             PaletteAction::Detach => ShellSignal::Exit(ExitReason::Detached),
             PaletteAction::Help => {
@@ -846,31 +1433,64 @@ impl Shell {
         items.extend([
             PaletteItem {
                 label: "Next surface".to_owned(),
-                detail: format!("shell · {}", self.config.bindings.primary_next_label()),
+                detail: format!(
+                    "action bar · {}",
+                    primary_binding_label(&self.config.bindings.action_next_screen)
+                ),
                 status: None,
                 action: PaletteAction::NextSurface,
             },
             PaletteItem {
                 label: "Previous surface".to_owned(),
-                detail: format!("shell · {}", self.config.bindings.primary_previous_label()),
+                detail: format!(
+                    "action bar · {}",
+                    primary_binding_label(&self.config.bindings.action_previous_screen)
+                ),
                 status: None,
                 action: PaletteAction::PreviousSurface,
             },
             PaletteItem {
+                label: "Scroll active surface up".to_owned(),
+                detail: format!(
+                    "action bar · {}",
+                    primary_binding_label(&self.config.bindings.action_scroll_up)
+                ),
+                status: None,
+                action: PaletteAction::ScrollUp,
+            },
+            PaletteItem {
+                label: "Scroll active surface down".to_owned(),
+                detail: format!(
+                    "action bar · {}",
+                    primary_binding_label(&self.config.bindings.action_scroll_down)
+                ),
+                status: None,
+                action: PaletteAction::ScrollDown,
+            },
+            PaletteItem {
                 label: "Close active surface".to_owned(),
-                detail: format!("shell · {} x", self.config.bindings.primary_leader_label()),
+                detail: format!(
+                    "action bar · {}",
+                    primary_binding_label(&self.config.bindings.action_close)
+                ),
                 status: None,
                 action: PaletteAction::CloseSurface,
             },
             PaletteItem {
                 label: "Detach".to_owned(),
-                detail: format!("shell · {} d", self.config.bindings.primary_leader_label()),
+                detail: format!(
+                    "action bar · {}",
+                    primary_binding_label(&self.config.bindings.action_detach)
+                ),
                 status: None,
                 action: PaletteAction::Detach,
             },
             PaletteItem {
                 label: "Show keyboard help".to_owned(),
-                detail: format!("shell · {} ?", self.config.bindings.primary_leader_label()),
+                detail: format!(
+                    "action bar · {}",
+                    primary_binding_label(&self.config.bindings.action_help)
+                ),
                 status: None,
                 action: PaletteAction::Help,
             },
@@ -953,6 +1573,21 @@ impl Shell {
         self.dirty = true;
     }
 
+    fn select_key(&mut self, key: &str) {
+        let Some(index) = self.entries.iter().position(|entry| {
+            entry
+                .surface
+                .key()
+                .as_deref()
+                .is_some_and(|candidate| candidate == key)
+        }) else {
+            self.notice = Some(format!("Surface '{key}' is not open"));
+            self.dirty = true;
+            return;
+        };
+        self.select_index(index);
+    }
+
     pub(crate) fn entries(&self) -> impl Iterator<Item = (SurfaceId, &dyn Surface)> {
         self.entries
             .iter()
@@ -978,8 +1613,10 @@ impl Shell {
     }
 }
 
-fn is_ctrl(key: KeyEvent, character: char) -> bool {
-    key.code == KeyCode::Char(character) && key.modifiers.contains(KeyModifiers::CONTROL)
+fn primary_binding_label(bindings: &[KeyBinding]) -> String {
+    bindings
+        .first()
+        .map_or_else(|| "disabled".to_owned(), |binding| binding.label())
 }
 
 fn wrap_index(current: usize, delta: isize, len: usize) -> usize {
@@ -1029,6 +1666,7 @@ mod tests {
 
     struct TickSurface {
         redraw: bool,
+        poll_interval: Option<Duration>,
     }
 
     impl Surface for TickSurface {
@@ -1037,6 +1675,10 @@ mod tests {
         }
 
         fn render(&mut self, _frame: &mut Frame<'_>, _area: Rect) {}
+
+        fn poll_interval(&self) -> Option<Duration> {
+            self.poll_interval
+        }
 
         fn handle(&mut self, event: SurfaceEvent) -> SurfaceAction {
             if matches!(event, SurfaceEvent::Tick(_)) && self.redraw {
@@ -1050,7 +1692,10 @@ mod tests {
     #[test]
     fn ignored_ticks_do_not_request_a_redraw() {
         let mut shell = Shell::new(ShellConfig::new("test"));
-        shell.add_surface(TickSurface { redraw: false });
+        shell.add_surface(TickSurface {
+            redraw: false,
+            poll_interval: None,
+        });
         shell.dirty = false;
 
         assert_eq!(
@@ -1063,7 +1708,10 @@ mod tests {
     #[test]
     fn consumed_ticks_request_a_redraw() {
         let mut shell = Shell::new(ShellConfig::new("test"));
-        shell.add_surface(TickSurface { redraw: true });
+        shell.add_surface(TickSurface {
+            redraw: true,
+            poll_interval: None,
+        });
         shell.dirty = false;
 
         assert_eq!(
@@ -1076,7 +1724,10 @@ mod tests {
     #[test]
     fn heartbeat_advances_at_a_low_rate_and_requests_a_redraw() {
         let mut shell = Shell::new(ShellConfig::new("test"));
-        shell.add_surface(TickSurface { redraw: false });
+        shell.add_surface(TickSurface {
+            redraw: false,
+            poll_interval: None,
+        });
         shell.dirty = false;
         let initial = shell.pulse_marker();
 
@@ -1090,9 +1741,52 @@ mod tests {
     }
 
     #[test]
+    fn reduced_motion_disables_the_ambient_pulse() {
+        let mut shell = Shell::new(ShellConfig::new("test")).with_pulse_enabled(false);
+        shell.add_surface(TickSurface {
+            redraw: false,
+            poll_interval: None,
+        });
+        shell.dirty = false;
+
+        shell.dispatch_to_all(SurfaceEvent::Tick(Duration::from_secs(2)));
+
+        assert!(!shell.dirty);
+        assert_eq!(shell.pulse_frame, 0);
+        assert_eq!(shell.pulse_marker(), "");
+    }
+
+    #[test]
+    fn active_surface_can_request_a_faster_tick_rate() {
+        let mut shell =
+            Shell::new(ShellConfig::new("test").with_tick_rate(Duration::from_millis(100)));
+        shell.add_surface(TickSurface {
+            redraw: false,
+            poll_interval: Some(Duration::from_millis(20)),
+        });
+
+        assert_eq!(shell.tick_rate(), Duration::from_millis(20));
+    }
+
+    #[test]
+    fn surface_cannot_slow_the_configured_tick_rate() {
+        let mut shell =
+            Shell::new(ShellConfig::new("test").with_tick_rate(Duration::from_millis(10)));
+        shell.add_surface(TickSurface {
+            redraw: false,
+            poll_interval: Some(Duration::from_millis(20)),
+        });
+
+        assert_eq!(shell.tick_rate(), Duration::from_millis(10));
+    }
+
+    #[test]
     fn redraw_binding_requests_an_explicit_terminal_clear() {
         let mut shell = Shell::new(ShellConfig::new("test"));
-        shell.add_surface(TickSurface { redraw: false });
+        shell.add_surface(TickSurface {
+            redraw: false,
+            poll_interval: None,
+        });
         shell.dirty = false;
 
         assert_eq!(

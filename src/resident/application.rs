@@ -178,6 +178,52 @@ pub struct EffectContext {
     pub attempt: u32,
     /// Cooperative cancellation signal for timeout and shutdown handling.
     pub cancellation: EffectCancellation,
+    pub(crate) wake: EffectWake,
+}
+
+impl EffectContext {
+    /// Returns a coalescing handle that asks the resident actor to poll this
+    /// effect's session as soon as application-owned work becomes readable.
+    #[must_use]
+    pub fn wake_handle(&self) -> EffectWake {
+        self.wake.clone()
+    }
+}
+
+/// Coalescing notification from application-owned work to the resident actor.
+///
+/// Calling [`Self::notify`] is safe from worker threads. Multiple notifications
+/// before the actor handles the first are collapsed into one mailbox entry.
+#[derive(Clone)]
+pub struct EffectWake {
+    state: Arc<EffectWakeState>,
+}
+
+struct EffectWakeState {
+    queued: AtomicBool,
+    notify: Box<dyn Fn(EffectWake) + Send + Sync>,
+}
+
+impl EffectWake {
+    pub(crate) fn new(notify: impl Fn(EffectWake) + Send + Sync + 'static) -> Self {
+        Self {
+            state: Arc::new(EffectWakeState {
+                queued: AtomicBool::new(false),
+                notify: Box::new(notify),
+            }),
+        }
+    }
+
+    /// Requests an immediate poll of the effect's session.
+    pub fn notify(&self) {
+        if !self.state.queued.swap(true, Ordering::AcqRel) {
+            (self.state.notify)(self.clone());
+        }
+    }
+
+    pub(crate) fn acknowledge(&self) {
+        self.state.queued.store(false, Ordering::Release);
+    }
 }
 
 /// Durable application events and follow-on effects produced by one transition.
@@ -309,6 +355,15 @@ pub trait ResidentSession: Send + 'static {
     /// Returns current checkpoint state.
     fn state(&self) -> Self::State;
 
+    /// Optional summary payload published in [`crate::resident::SessionSummary`].
+    ///
+    /// Lets a client render a session list — status, previews, counters —
+    /// without attaching to every session, which would inflate viewer counts
+    /// as a side effect of drawing.
+    fn digest(&self) -> Option<serde_json::Value> {
+        None
+    }
+
     /// Handles an authorized client command.
     fn command(
         &mut self,
@@ -336,9 +391,15 @@ pub trait ResidentSession: Send + 'static {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
 
-    use super::EffectCancellation;
+    use super::{EffectCancellation, EffectWake};
 
     #[tokio::test]
     async fn cancellation_wakes_a_waiting_effect() {
@@ -349,5 +410,22 @@ mod tests {
             .await
             .expect("cancellation should wake its waiter");
         assert!(cancellation.is_cancelled());
+    }
+
+    #[test]
+    fn effect_wakes_coalesce_until_the_actor_acknowledges_them() {
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&notifications);
+        let wake = EffectWake::new(move |_| {
+            observed.fetch_add(1, Ordering::Relaxed);
+        });
+
+        wake.notify();
+        wake.notify();
+        assert_eq!(notifications.load(Ordering::Relaxed), 1);
+
+        wake.acknowledge();
+        wake.notify();
+        assert_eq!(notifications.load(Ordering::Relaxed), 2);
     }
 }

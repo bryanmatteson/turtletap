@@ -68,8 +68,12 @@ impl FrameDecoder {
         self.bytes.extend_from_slice(bytes);
     }
 
-    /// Decodes the next complete value, leaving partial data buffered.
-    pub fn decode_next<T: DeserializeOwned>(&mut self) -> Result<Option<T>, FrameError> {
+    /// Removes the next complete frame's payload, leaving partial data buffered.
+    ///
+    /// Because all decoding state lives in the decoder rather than in a
+    /// suspended future, a reader built on this method stays correct when its
+    /// read is cancelled mid-frame.
+    pub fn next_payload(&mut self) -> Result<Option<Vec<u8>>, FrameError> {
         if self.bytes.len() < 4 {
             return Ok(None);
         }
@@ -81,9 +85,17 @@ impl FrameDecoder {
         if self.bytes.len() < 4 + size {
             return Ok(None);
         }
-        let value = serde_json::from_slice(&self.bytes[4..4 + size])?;
+        let payload = self.bytes[4..4 + size].to_vec();
         self.bytes.drain(..4 + size);
-        Ok(Some(value))
+        Ok(Some(payload))
+    }
+
+    /// Decodes the next complete value, leaving partial data buffered.
+    pub fn decode_next<T: DeserializeOwned>(&mut self) -> Result<Option<T>, FrameError> {
+        match self.next_payload()? {
+            Some(payload) => Ok(Some(serde_json::from_slice(&payload)?)),
+            None => Ok(None),
+        }
     }
 }
 

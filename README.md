@@ -7,11 +7,12 @@ small `Surface` trait.
 
 TurtleTap owns the shell chrome and behavior:
 
-- stable surface identity, focus, tabs, and a searchable command palette;
+- stable surface identity, focus, tabs or a master-detail rail, and a searchable action bar;
 - clean attach/detach terminal lifecycle;
-- direct `Ctrl-D` detach for shell-managed surfaces;
-- direct `Ctrl-PageUp` / `Ctrl-PageDown` screen switching, plus a configurable `Ctrl-Space` leader that
-  remains available when a surface captures input;
+- configurable action shortcuts for navigation, detach, leader sequences,
+  action-bar accelerators, and host-defined actions;
+- an action bar opened by `Esc` on an empty prompt or `Ctrl-\``, whose Alt
+  accelerators never steal shell input;
 - background tick and resize delivery for inactive agents and PTYs;
 - incremental redraws with only a compact liveness pulse while surfaces are idle;
 - contextual help and status without requiring each host to reinvent navigation;
@@ -20,16 +21,30 @@ TurtleTap owns the shell chrome and behavior:
 It does **not** define what an agent, session, or questionnaire is. Those remain
 host-domain objects behind `Surface` implementations.
 
+Installing a ready-to-use shell built on this library is a separate crate,
+[`turtletap-cli`](https://crates.io/crates/turtletap-cli).
+
 ## Add it
 
 ```toml
 [dependencies]
-turtletap = "0.1"
+turtletap = "0.2"
 ```
 
-The package and Rust crate are both `turtletap`.
+The default build depends only on `crossterm` and `ratatui` — just the
+`Shell`/`Surface` half. Reconnectable, durable sessions live behind features:
 
-## Minimal host
+| Feature | Adds | Pulls in |
+| --- | --- | --- |
+| _(default)_ | `Shell`, `Surface`, chrome, terminal lifecycle | crossterm, ratatui |
+| `resident` | runtime-neutral resident core: protocol, journal, host, election | serde, uuid, semver, … |
+| `tokio` | Tokio transport adapters, the blocking client, and the supervisor | tokio |
+
+```toml
+turtletap = { version = "0.2", features = ["tokio"] }
+```
+
+## Host example
 
 ```rust,no_run
 use std::borrow::Cow;
@@ -81,38 +96,45 @@ the host explicitly opts in with `ShellConfig::with_mouse_capture(true)`. Mouse-
 surfaces can enable capture; most terminals then provide an override modifier such
 as Shift or Option for native selection.
 
+## Chrome
+
+`ShellConfig::with_chrome` chooses how the surface list is presented. `Chrome::Tabs`
+(the default) is a horizontal strip above the active surface, suited to a handful of
+long-lived surfaces. `Chrome::rail()` is a persistent vertical list beside the active
+surface — master-detail — that keeps the list scannable as it grows and narrows to a
+marker-only rail on tight terminals rather than reverting to tabs. Surfaces annotate
+their rail row with `Surface::badge`.
+
 ## Navigation contract
+
+These are the built-in defaults. The shell interprets configured global actions and
+delivers everything else to the active
+surface. A captured surface (`InputPolicy::Captured`, for an embedded PTY or editor)
+receives ordinary input while the shell still reserves screen navigation and the
+leader chord as the escape hatch back to chrome.
 
 | Key | Shell-managed surface | Captured surface |
 | --- | --- | --- |
-| `Alt-Left` / `Alt-Right` | Move by word in command input | Delivered to the surface |
-| `Cmd-Left` / `Cmd-Right` | Beginning / end of command input | Delivered to the surface |
-| `Alt-Backspace` | Delete previous word in command input | Delivered to the surface |
-| `Cmd-Backspace` | Delete to beginning of command input | Delivered to the surface |
-| `Cmd-K` / `Ctrl-L` | Clear command transcript | Delivered to the surface |
-| `Alt-1` … `Alt-9` | Jump to numbered surface | Jump to numbered surface |
-| `Ctrl-PageUp` / `Ctrl-PageDown` | Previous / next surface | Previous / next surface |
-| `PageUp` / `PageDown` | Surface scrollback | Surface scrollback |
-| `Ctrl-Home` / `Ctrl-End` | Oldest output / live tail | Oldest output / live tail |
 | `Ctrl-D` | Detach | Delivered to the surface |
 | `Tab` / `Shift-Tab` | Next / previous surface | Delivered to the surface |
-| `Ctrl-P` | Open command palette | Open command palette |
+| `Esc` on an empty prompt | Open TurtleTap action bar | Surface-controlled |
+| `Ctrl-\`` | Open TurtleTap action bar | Open TurtleTap action bar |
 | `Ctrl-/` | Clear and redraw terminal frame | Clear and redraw terminal frame |
 | `?` | Contextual help | Delivered to the surface |
-| `Ctrl-Space d` | Detach | Detach |
-| `Ctrl-Space s` | Open command palette | Open command palette |
-| `Ctrl-Space n` / `Ctrl-Space p` | Next / previous | Next / previous |
-| `Ctrl-Space 1` … `Ctrl-Space 9` | Jump to numbered surface | Jump to numbered surface |
-| `Ctrl-Space x` | Close active surface | Close active surface |
-| `Ctrl-Space ?` | Contextual help | Contextual help |
+| Action bar `Alt-→` / `Alt-←` | Next / previous | Next / previous |
+| Action bar `Alt-↓` / `Alt-↑` | Scroll down / up | Scroll down / up |
+| Action bar `Alt-1` … `Alt-9` | Jump to numbered surface | Jump to numbered surface |
+| Action bar `Alt-X` / `Alt-D` | Close surface / detach | Close surface / detach |
+| `Ctrl-G ?` | Contextual help | Contextual help |
 
-Use `InputPolicy::Captured` for an embedded PTY or editor. TurtleTap never steals
-`Ctrl-D` from a captured child; the leader chord is the escape hatch back to shell
-chrome.
+TurtleTap never steals the default `Ctrl-D` from a captured child. Command surfaces
+explicitly opt into the fixed empty-prompt `Esc` action-bar fallback.
 
-Navigation is configurable. `Ctrl-G` remains a secondary leader by default for
-backward compatibility, but the footer and contextual help teach the first active
-binding rather than hardcoding either chord.
+Every action binding in `ShellBindings` is configurable, and an empty list disables
+that action. The footer, action bar, and contextual help show the resolved bindings.
+Text entry, Enter, Backspace, arrow-key editing/navigation, Esc cancellation and
+empty-prompt action-bar entry, and Y/N confirmations remain stable interaction
+grammar rather than remappable actions.
 
 Run the included demo with:
 
@@ -120,181 +142,13 @@ Run the included demo with:
 cargo run --example demo
 ```
 
-## Command shell
-
-Installing the crate also installs a ready-to-use TurtleTap shell:
-
-```console
-cargo install turtletap
-turtletap
-```
-
-Enter any command to run it through your login shell. Output is streamed into the
-surface, command history is available with `Up` and `Down`, and additional lines
-entered while a command is running are queued in order. Child commands are
-non-interactive so TurtleTap remains the sole owner of terminal input; embed a PTY
-as its own captured `Surface` when a program needs interactive input.
-
-The standalone shell is resident on Unix. `Ctrl-D` restores the terminal and leaves
-the session running; `turtletap attach` later restores its transcript, history,
-working directory, added commands, and any output produced while detached. Sessions
-are journaled and checkpointed, so they also recover after a resident restart.
-
-```console
-turtletap                 # open the searchable resident dashboard
-turtletap new build       # create and attach to a named session
-turtletap rename build ci # rename durable state without recreating it
-turtletap attach build    # attach as driver when available
-turtletap view build      # observe without mutation authority
-turtletap take build      # explicitly take the fenced driver lease
-turtletap list            # list sessions and attached clients
-turtletap status          # inspect the resident
-turtletap stop build      # stop and delete one session
-turtletap stop            # stop the leader; durable sessions remain
-```
-
-`list` and `status` default to human-readable output. Pass `--format json` for a
-stable machine-readable report suitable for scripts and other tools.
-
-One terminal holds a session's driver lease while any number of terminals may view
-it. A forced takeover increments the lease epoch, so buffered input from the former
-driver cannot execute afterward. `turtletap start` starts the resident without
-attaching. Set `TURTLETAP_SOCKET` to use an explicit local socket path and
-`TURTLETAP_STATE_DIR` to override durable storage.
-
-The dashboard is itself screen 1. Use `/` to filter, `Enter` to open the selected
-session, `v` to view, `t` to take its driver lease, and `n`, `r`, or `x` to create,
-rename, or delete. Each opened session becomes another numbered screen; use
-`Ctrl-PageUp` / `Ctrl-PageDown` to cycle or `Alt-1` … `Alt-9` to jump directly. Named
-`attach`, `view`, `take`, and `new` commands open the dashboard alongside the
-requested session, so another session is always one switch away. In a session tab,
-`F2` releases the driver and `F3` takes it. Background output adds a `+N` unread
-count to that screen until it is focused. When the tab row is too narrow, `‹` and
-`›` mark hidden screens while the active screen stays visible. `q` closes only the
-dashboard tab, `Ctrl-D` detaches the terminal, `x` deletes only the selected session
-after confirmation, and `!` stops only the leader while preserving all sessions.
-Open tabs reconcile resident metadata in the background: renames update their title,
-deleted sessions close, and a forced driver takeover immediately moves the old
-driver into view-only mode.
-
-## Settings and keybindings
-
-TurtleTap reads both KDL and TOML. `TURTLETAP_CONFIG` has highest priority and its
-path must end in `.kdl` or `.toml`. Without that override,
-`~/.config/turtletap/config.kdl` wins when present, then `config.toml`; missing
-files are fine and built-in defaults remain active.
-
-```console
-turtletap config          # show resolved settings in the active format
-turtletap config show toml # translate the resolved model to canonical TOML
-turtletap config path     # print the active file path
-turtletap config init     # create a commented KDL starter file
-turtletap config init toml # create a commented TOML starter file
-turtletap config check    # validate syntax, key names, and conflicts
-```
-
-Every top-level command and config action accepts `--help`; `turtletap help
-<command>` is the equivalent discoverable form. Usage mistakes exit with status 2,
-while runtime failures exit with status 1.
-
-The canonical KDL shape uses properties for shell behavior and child nodes with
-repeated arguments for binding lists:
-
-```kdl
-shell mouse-capture=false direct-detach=true tick-rate-ms=100
-
-theme {
-    chrome "white"
-    muted "dark-gray"
-    selected foreground="black" background="cyan"
-    accent "cyan"
-    working "blue"
-    attention "yellow"
-    failed "red"
-    complete "green"
-}
-
-bindings {
-    leaders "ctrl-space" "ctrl-g"
-    palette "ctrl-p"
-    redraw "ctrl-/" "ctrl-_"
-    next-screen "ctrl-pagedown"
-    previous-screen "ctrl-pageup"
-    jump-modifiers "alt"
-}
-```
-
-The equivalent TOML is:
-
-```toml
-[shell]
-mouse_capture = false
-direct_detach = true
-tick_rate_ms = 100
-
-[theme]
-chrome = "white"
-muted = "dark-gray"
-accent = "cyan"
-working = "blue"
-attention = "yellow"
-failed = "red"
-complete = "green"
-
-[theme.selected]
-foreground = "black"
-background = "cyan"
-
-[bindings]
-leaders = ["ctrl-space", "ctrl-g"]
-palette = ["ctrl-p"]
-redraw = ["ctrl-/", "ctrl-_"]
-next_screen = ["ctrl-pagedown"]
-previous_screen = ["ctrl-pageup"]
-jump_modifiers = ["alt"]
-```
-
-Binding lists accept `ctrl`, `alt`/`option`, `shift`, and `super`/`cmd` modifiers;
-named arrows, navigation keys, `space`, `tab`, `escape`, and `F1` through `F24`
-are supported. An empty list disables that action. Conflicting bindings fail fast
-with the two setting names involved, and the shell footer, palette, and help overlay
-always show the resolved primary chords.
-
-The built-in command inputs reserve `Alt-Left` / `Alt-Right` for word movement and
-`Cmd-Left` / `Cmd-Right` for line boundaries. `Alt-Backspace` deletes the previous
-word; `Cmd-Backspace` deletes to the beginning of the line. Configuring either
-navigation chord as a global screen binding intentionally gives the shell binding
-precedence. Terminal fallbacks are normalized too: `Alt-B` / `Alt-F` move by word,
-and `Ctrl-U` deletes to the beginning of the line instead of inserting text.
-`Ctrl-L` clears the transcript and returns scrollback to the live tail. `Cmd-K`
-does the same when the terminal forwards it. If the terminal consumes Cmd-K and
-clears its own display, press `Ctrl-/` to clear and reconstruct TurtleTap's complete
-frame. The `Ctrl-_` fallback handles terminals that encode the same control byte
-under that key name. The small pulse beside the shell title is the only ambient
-animation.
-
-Theme colors accept the named 16-color terminal palette, `default`, `#rrggbb`,
-and `indexed-0` through `indexed-255`. Status meaning remains visible through text
-and symbols even when colors are customized. Settings are loaded when the shell
-attaches; detach and reopen it after editing the file.
-
-## Transcript scrollback
-
-Command screens follow live output at the bottom by default. `PageUp` and
-`PageDown` move by a viewport, while `Ctrl-Home` and `Ctrl-End` jump to the oldest
-output and live tail. While history is visible, new output increments the
-"newer lines" counter without moving the text being read; returning to the bottom
-resumes follow mode. Mouse-wheel scrolling uses the same model when
-`shell.mouse_capture` is enabled. Scroll position is per screen and intentionally
-ephemeral, while the transcript itself remains durable.
-
 ## Resident applications
 
-The public `turtletap::resident` module is independent of terminal rendering. It
-provides stable client, session, request, event, and lease identities; deterministic
-driver and deduplication state; bounded length-prefixed framing; versioned handshake
-types; checksummed journals; leader locking; a reusable `ResidentHost`; and runtime
-transport contracts.
+The `turtletap::resident` module (feature `resident`) is independent of terminal
+rendering. It provides stable client, session, request, event, and lease identities;
+deterministic driver and deduplication state; bounded length-prefixed framing;
+versioned handshake types; checksummed journals; leader locking; a reusable
+`ResidentHost`; and runtime transport contracts.
 
 Applications implement `ResidentApplication` and `ResidentSession`. A transition
 returns durable events plus follow-on effects: the host journals events and writes a
@@ -312,6 +166,7 @@ signal that fires when its deadline expires, its session is deleted, or the lead
 shuts down. Effects inherit the host deadline unless an `EffectRequest` overrides it.
 This ordering makes accepted requests and their effect outbox recoverable across
 disconnects and process death.
+
 Storage carries independent host and application versions, replays journal records
 newer than the checkpoint, and can reconstruct a corrupt checkpoint from the session
 manifest plus replayable transitions. The fixture corpus under `tests/fixtures/`
@@ -320,8 +175,9 @@ freezes protocol v1 and host storage v0/v1/v2 for compatibility review.
 `ResidentHost` owns election, registration, request routing, bounded client queues,
 driver fencing, deduplication, persistence, reconnect cursors, and graceful shutdown.
 The application owns only its command, event, snapshot, checkpoint state, and effect
-types. Koda's `koda-console::resident` module is the first external implementation of
-this public boundary.
+types.
+
+### Transport, blocking client, and supervision (feature `tokio`)
 
 Tokio is the default production adapter under `resident::runtime::tokio`. Tokio
 sockets, channels, timers, and task handles do not appear in the protocol or leader
@@ -329,15 +185,20 @@ core, so another runtime can implement the `Transport`, `Connection`, `Listener`
 `Clock`, `Spawner`, and `ProcessSpawner` contracts without changing application or
 wire types.
 
-Commands added with `:add` live until the resident session is stopped:
+`ResidentClient` is asynchronous. It retains stable identity plus every attachment's
+authority and highest received event cursor, so reconnecting restores all subscribed
+session IDs without replaying already received events. `resident::blocking::Client`
+wraps that behavior in a current-thread runtime for terminal-driven callers and
+adds timeouts, leader relaunch, and retry of an ambiguous request under its original
+`RequestId` for the leader to deduplicate.
+`resident::supervisor` owns the endpoint conventions and the start-up election —
+`ensure_leader` reuses a running leader, replaces one older than the caller, or wins
+the lock and spawns a new one, while the caller keeps only the product-specific detail
+of how its resident process is launched.
 
-```text
-:add greet printf 'hello %s\n'
-greet turtle
-:commands
-:remove greet
+A complete, runnable application is in
+[`examples/resident.rs`](examples/resident.rs):
+
+```console
+cargo run --example resident --features tokio
 ```
-
-Use `:help` for the command list, `Tab` to complete built-ins and added commands,
-`Ctrl-C` to interrupt a running process, and `Ctrl-D` on an empty prompt to detach
-without stopping the session.

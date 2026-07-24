@@ -74,5 +74,5 @@ pub trait Listener: Send {
 }
 
 /// Tokio-based production adapters.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "tokio"))]
 pub mod tokio;

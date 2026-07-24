@@ -38,3 +38,19 @@ impl Default for Theme {
         }
     }
 }
+
+impl Theme {
+    /// Removes color while retaining emphasis and color-independent markers.
+    #[must_use]
+    pub fn without_color(mut self) -> Self {
+        self.chrome = Style::default();
+        self.muted = Style::default().add_modifier(Modifier::DIM);
+        self.selected = Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED);
+        self.accent = Style::default().add_modifier(Modifier::BOLD);
+        self.working = Style::default();
+        self.attention = Style::default().add_modifier(Modifier::BOLD);
+        self.failed = Style::default().add_modifier(Modifier::BOLD);
+        self.complete = Style::default();
+        self
+    }
+}

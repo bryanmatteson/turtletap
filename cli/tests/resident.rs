@@ -4,11 +4,14 @@
 
 use std::{
     fs,
-    io::{Read, Write},
+    io::{BufRead, BufReader, Read, Write},
     os::unix::{fs::PermissionsExt, net::UnixStream},
     path::PathBuf,
     process::{Child, Command, Output},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Mutex, MutexGuard,
+        atomic::{AtomicU64, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -21,25 +24,160 @@ use turtletap::resident::{
 };
 
 struct ResidentSession {
+    _test_guard: MutexGuard<'static, ()>,
     directory: PathBuf,
     socket: PathBuf,
     state: PathBuf,
 }
 
 static NEXT_TEST: AtomicU64 = AtomicU64::new(1);
+static RESIDENT_TEST: Mutex<()> = Mutex::new(());
+
+fn resident_test_guard() -> MutexGuard<'static, ()> {
+    RESIDENT_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn worker_events(stream: UnixStream) -> Vec<serde_json::Value> {
+    let mut events = Vec::new();
+    for line in BufReader::new(stream).lines() {
+        let line = line.expect("worker event should be readable");
+        let event: serde_json::Value =
+            serde_json::from_str(&line).expect("worker event should be JSON");
+        let completed = event["type"] == "completed";
+        events.push(event);
+        if completed {
+            break;
+        }
+    }
+    events
+}
+
+#[test]
+fn persistent_worker_reuses_its_shell_after_interrupt() {
+    let _test_guard = resident_test_guard();
+    let nonce = NEXT_TEST.fetch_add(1, Ordering::Relaxed);
+    let directory = PathBuf::from("/tmp").join(format!("tt-worker-{}-{nonce}", std::process::id()));
+    fs::create_dir(&directory).expect("worker test directory should be created");
+    let socket = directory.join("worker.sock");
+    let state = directory.join("state");
+    let mut worker = Command::new(env!("CARGO_BIN_EXE_turtletap"))
+        .args([
+            "__shell-worker",
+            "test",
+            socket.to_str().expect("socket path should be UTF-8"),
+            state.to_str().expect("state path should be UTF-8"),
+        ])
+        .spawn()
+        .expect("worker should spawn");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !socket.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(socket.exists(), "worker socket did not appear");
+
+    let mut interrupted =
+        UnixStream::connect(&socket).expect("worker should accept the first command");
+    writeln!(
+        interrupted,
+        "{}",
+        serde_json::json!({
+            "type": "run",
+            "command_id": "interrupt",
+            "command": "sleep 5; printf should-not-print",
+            "cwd": "/tmp",
+        })
+    )
+    .expect("run request should be written");
+    thread::sleep(Duration::from_millis(100));
+    writeln!(
+        interrupted,
+        "{}",
+        serde_json::json!({ "type": "interrupt" })
+    )
+    .expect("interrupt should be written");
+    let interrupted = worker_events(interrupted);
+    assert!(
+        interrupted
+            .iter()
+            .all(|event| event["text"] != "should-not-print")
+    );
+    assert_eq!(
+        interrupted.last().and_then(|event| event["code"].as_i64()),
+        Some(130)
+    );
+
+    let mut reused = UnixStream::connect(&socket).expect("warmed worker should remain available");
+    writeln!(
+        reused,
+        "{}",
+        serde_json::json!({
+            "type": "run",
+            "command_id": "reuse",
+            "command": "printf reusable",
+            "cwd": "/tmp",
+        })
+    )
+    .expect("reuse request should be written");
+    let reused = worker_events(reused);
+    assert!(reused.iter().any(|event| event["text"] == "reusable"));
+    assert_eq!(
+        reused.last().and_then(|event| event["code"].as_i64()),
+        Some(0)
+    );
+
+    let mut multiline =
+        UnixStream::connect(&socket).expect("worker should accept multiline output");
+    writeln!(
+        multiline,
+        "{}",
+        serde_json::json!({
+            "type": "run",
+            "command_id": "multiline",
+            "command": "printf 'one\\ntwo\\n'",
+            "cwd": "/tmp",
+        })
+    )
+    .expect("multiline request should be written");
+    let multiline = worker_events(multiline);
+    let lines: Vec<_> = multiline
+        .iter()
+        .filter_map(|event| event["text"].as_str())
+        .collect();
+    assert_eq!(lines, ["one", "two"]);
+    assert!(
+        multiline.iter().all(|event| {
+            event["text"]
+                .as_str()
+                .is_none_or(|text| !text.contains("TT_DONE_") && !text.contains("TT_PID_"))
+        }),
+        "worker markers must not reach the transcript: {multiline:?}"
+    );
+
+    let _ = worker.kill();
+    let _ = worker.wait();
+    let _ = fs::remove_dir_all(directory);
+}
 
 impl ResidentSession {
-    fn start() -> Self {
+    fn stopped() -> Self {
+        let test_guard = resident_test_guard();
         let nonce = NEXT_TEST.fetch_add(1, Ordering::Relaxed);
         let directory = PathBuf::from("/tmp").join(format!("tt-{}-{nonce}", std::process::id()));
         fs::create_dir(&directory).expect("test socket directory should be created");
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o755))
             .expect("test directory permissions should be set");
-        let session = Self {
+        Self {
+            _test_guard: test_guard,
             socket: directory.join("resident.sock"),
             state: directory.join("state"),
             directory,
-        };
+        }
+    }
+
+    fn start() -> Self {
+        let session = Self::stopped();
         assert_success(&session.command(&["start"]), "start");
         session
     }
@@ -75,13 +213,12 @@ impl ResidentSession {
     fn pid(&self) -> u32 {
         let status = self.command(&["status"]);
         assert_success(&status, "status");
-        String::from_utf8(status.stdout)
-            .expect("status output should be UTF-8")
-            .lines()
-            .find_map(|line| line.strip_prefix("PID: "))
-            .expect("status should contain a PID")
-            .parse()
-            .expect("PID should be numeric")
+        let status: serde_json::Value =
+            serde_json::from_slice(&status.stdout).expect("captured status should be JSON");
+        status["pid"]
+            .as_u64()
+            .and_then(|pid| u32::try_from(pid).ok())
+            .expect("status should contain a numeric PID")
     }
 
     fn wait_stopped(&self) {
@@ -344,6 +481,146 @@ fn submit_can_be_retried_after_arriving_during_leader_failure() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn bare_command_starts_and_opens_the_dashboard() {
+    let resident = ResidentSession::stopped();
+    let script = format!(
+        "log_user 0\n\
+         set timeout 10\n\
+         spawn env SHELL=/bin/sh TURTLETAP_SOCKET={} TURTLETAP_STATE_DIR={} {}\n\
+         after 500\n\
+         send -- \"\\r\"\n\
+         after 200\n\
+         send -- \"printf bare-started\\r\"\n\
+         after 1000\n\
+         send -- \"\\007\"\n\
+         after 100\n\
+         send -- \"d\"\n\
+         expect {{\n\
+           eof {{}}\n\
+           timeout {{ exit 124 }}\n\
+         }}\n",
+        resident.socket.display(),
+        resident.state.display(),
+        env!("CARGO_BIN_EXE_turtletap"),
+    );
+    let status = Command::new("/usr/bin/expect")
+        .args(["-c", &script])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("expect should drive the bare command");
+    assert!(status.success(), "bare command failed with {status}",);
+
+    let _pid = resident.pid();
+    let mut observer = resident.client();
+    let (session, _) = observer.attach(AttachmentMode::View, false);
+    let snapshot = observer.snapshot(session);
+    assert!(
+        snapshot["history"]
+            .as_array()
+            .is_some_and(|history| history.iter().any(|line| line == "printf bare-started")),
+        "the session opened from the bare-command dashboard did not accept driver input: {snapshot}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn ctrl_backtick_terminal_encoding_enters_the_action_bar() {
+    let resident = ResidentSession::stopped();
+    let script = format!(
+        "log_user 0\n\
+         set timeout 10\n\
+         spawn env SHELL=/bin/sh TURTLETAP_SOCKET={} TURTLETAP_STATE_DIR={} {}\n\
+         after 500\n\
+         send -null\n\
+         after 100\n\
+         send -- \"\\033d\"\n\
+         expect {{\n\
+           eof {{}}\n\
+           timeout {{ exit 124 }}\n\
+         }}\n",
+        resident.socket.display(),
+        resident.state.display(),
+        env!("CARGO_BIN_EXE_turtletap"),
+    );
+    let status = Command::new("/usr/bin/expect")
+        .args(["-c", &script])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("expect should drive Ctrl-backtick");
+    assert!(
+        status.success(),
+        "Ctrl-backtick did not enter the action bar, where Alt-D detaches: {status}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn ctrl_backtick_enhanced_terminal_encoding_enters_the_action_bar() {
+    let resident = ResidentSession::stopped();
+    let script = format!(
+        "log_user 0\n\
+         set timeout 10\n\
+         spawn env SHELL=/bin/sh TURTLETAP_SOCKET={} TURTLETAP_STATE_DIR={} {}\n\
+         after 500\n\
+         send -- \"\\033\\[96;5u\"\n\
+         after 100\n\
+         send -- \"\\033d\"\n\
+         expect {{\n\
+           eof {{}}\n\
+           timeout {{ exit 124 }}\n\
+         }}\n",
+        resident.socket.display(),
+        resident.state.display(),
+        env!("CARGO_BIN_EXE_turtletap"),
+    );
+    let status = Command::new("/usr/bin/expect")
+        .args(["-c", &script])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("expect should drive enhanced Ctrl-backtick");
+    assert!(
+        status.success(),
+        "enhanced Ctrl-backtick did not enter the action bar, where Alt-D detaches: {status}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn escape_on_an_empty_prompt_enters_the_action_bar() {
+    let resident = ResidentSession::stopped();
+    let script = format!(
+        "log_user 0\n\
+         set timeout 10\n\
+         spawn env SHELL=/bin/sh TURTLETAP_SOCKET={} TURTLETAP_STATE_DIR={} {} attach default\n\
+         after 500\n\
+         send -- \"\\033\"\n\
+         after 100\n\
+         send -- \"\\033d\"\n\
+         expect {{\n\
+           eof {{}}\n\
+           timeout {{ exit 124 }}\n\
+         }}\n",
+        resident.socket.display(),
+        resident.state.display(),
+        env!("CARGO_BIN_EXE_turtletap"),
+    );
+    let status = Command::new("/usr/bin/expect")
+        .args(["-c", &script])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("expect should drive empty-prompt Escape");
+    assert!(
+        status.success(),
+        "empty-prompt Escape did not enter the action bar, where Alt-D detaches: {status}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn attached_tui_reconnects_and_accepts_input_after_leader_crash() {
     let resident = ResidentSession::start();
     let pid = resident.pid();
@@ -426,6 +703,141 @@ fn attached_tui_reconnects_and_accepts_input_after_leader_crash() {
             .as_array()
             .is_some_and(|history| history.iter().any(|line| line == "printf after")),
         "post-reconnect input was not accepted: {snapshot}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn command_latency_stays_within_the_responsiveness_budgets() {
+    if std::env::var_os("TURTLETAP_LATENCY_TEST_CHILD").is_none() {
+        let _test_guard = resident_test_guard();
+        let output = Command::new(std::env::current_exe().expect("test executable should resolve"))
+            .args([
+                "--exact",
+                "command_latency_stays_within_the_responsiveness_budgets",
+                "--nocapture",
+            ])
+            .env("TURTLETAP_LATENCY_TEST_CHILD", "1")
+            .output()
+            .expect("isolated latency test should start");
+        assert!(
+            output.status.success(),
+            "isolated latency test failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+
+    const SAMPLES: usize = 5;
+    const ENTER_TO_OUTPUT_P95_BUDGET_MS: u64 = 100;
+    const OUTPUT_TO_SCREEN_P95_BUDGET_MS: u64 = 16;
+
+    let resident = ResidentSession::start();
+    let script = format!(
+        "set stty_init \"rows 30 columns 120\"\n\
+         log_user 0\n\
+         set timeout 5\n\
+         spawn env SHELL=/bin/sh TURTLETAP_SOCKET={} TURTLETAP_STATE_DIR={} {} attach default\n\
+         after 400\n\
+         for {{set i 0}} {{$i <= {SAMPLES}}} {{incr i}} {{\n\
+           set suffix [format \"%03d\" $i]\n\
+           set command \"printf Q%s $suffix\"\n\
+           send -- $command\n\
+           after 100\n\
+           set started [clock milliseconds]\n\
+           send -- \"\\r\"\n\
+           expect {{\n\
+             -exact \"$ $command\" {{}}\n\
+             timeout {{ exit 124 }}\n\
+           }}\n\
+           expect {{\n\
+             -exact \"Q$suffix\" {{\n\
+               if {{$i > 0}} {{\n\
+                 puts \"enter:[expr {{[clock milliseconds] - $started}}]\"\n\
+               }}\n\
+             }}\n\
+             timeout {{ exit 125 }}\n\
+           }}\n\
+           after 50\n\
+         }}\n\
+         for {{set i 0}} {{$i < {SAMPLES}}} {{incr i}} {{\n\
+           set suffix [format \"%03d\" $i]\n\
+           set command \"'{}' __latency_probe $suffix\"\n\
+           send -- $command\n\
+           after 100\n\
+           send -- \"\\r\"\n\
+           expect {{\n\
+             -exact \"$ $command\" {{}}\n\
+             timeout {{ exit 127 }}\n\
+           }}\n\
+           expect {{\n\
+             -exact \"TT_PROBE\" {{}}\n\
+             timeout {{ exit 128 }}\n\
+           }}\n\
+           expect {{\n\
+             -exact \"$suffix\" {{}}\n\
+             timeout {{ exit 130 }}\n\
+           }}\n\
+           expect {{\n\
+             -re {{([0-9]{{13}})}} {{\n\
+               puts \"screen:[expr {{[clock milliseconds] - $expect_out(1,string)}}]\"\n\
+             }}\n\
+             timeout {{ exit 129 }}\n\
+           }}\n\
+           after 50\n\
+         }}\n\
+         send -- \"\\007\"\n\
+         after 50\n\
+         send -- \"d\"\n\
+         expect {{\n\
+           eof {{}}\n\
+           timeout {{ exit 126 }}\n\
+         }}\n",
+        resident.socket.display(),
+        resident.state.display(),
+        env!("CARGO_BIN_EXE_turtletap"),
+        env!("CARGO_BIN_EXE_turtletap"),
+    );
+    let output = Command::new("/usr/bin/expect")
+        .args(["-c", &script])
+        .output()
+        .expect("expect should measure the attached TUI");
+    assert!(
+        output.status.success(),
+        "latency probe failed with {}: {}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout),
+    );
+    let output = String::from_utf8(output.stdout).expect("latency samples should be UTF-8");
+    let mut enter_samples: Vec<u64> = output
+        .lines()
+        .filter_map(|line| line.strip_prefix("enter:"))
+        .map(|line| line.parse().expect("enter latency should be numeric"))
+        .collect();
+    let mut screen_samples: Vec<u64> = output
+        .lines()
+        .filter_map(|line| line.strip_prefix("screen:"))
+        .map(|line| line.parse().expect("screen latency should be numeric"))
+        .collect();
+    assert_eq!(enter_samples.len(), SAMPLES);
+    assert_eq!(screen_samples.len(), SAMPLES);
+    enter_samples.sort_unstable();
+    screen_samples.sort_unstable();
+    let enter_p95 = *enter_samples
+        .last()
+        .expect("enter latency samples should not be empty");
+    let screen_p95 = *screen_samples
+        .last()
+        .expect("screen latency samples should not be empty");
+    assert!(
+        enter_p95 <= ENTER_TO_OUTPUT_P95_BUDGET_MS,
+        "enter-to-output p95 {enter_p95} ms exceeded {ENTER_TO_OUTPUT_P95_BUDGET_MS} ms; samples={enter_samples:?}"
+    );
+    assert!(
+        screen_p95 <= OUTPUT_TO_SCREEN_P95_BUDGET_MS,
+        "output-to-screen p95 {screen_p95} ms exceeded {OUTPUT_TO_SCREEN_P95_BUDGET_MS} ms; samples={screen_samples:?}"
     );
 }
 
@@ -800,7 +1212,7 @@ fn root_only_legacy_session_is_imported_into_per_session_storage() {
     );
 
     assert_success(
-        &resident.command(&["stop", "legacy-only"]),
+        &resident.command(&["delete", "legacy-only", "--yes"]),
         "delete imported session",
     );
     assert_success(&resident.command(&["stop"]), "stop after delete");

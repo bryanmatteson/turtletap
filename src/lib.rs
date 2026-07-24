@@ -1,16 +1,19 @@
 #![doc = include_str!("../README.md")]
 
 mod render;
+#[cfg(feature = "resident")]
 pub mod resident;
 mod shell;
 mod surface;
 mod terminal;
 mod theme;
 
-pub use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent};
+pub use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 pub use ratatui::{Frame, layout::Rect};
 pub use shell::{
-    ExitReason, KeyBinding, Shell, ShellBindings, ShellConfig, ShellSignal, SurfaceId,
+    Chrome, ExitReason, KeyBinding, Shell, ShellBindings, ShellConfig, ShellSignal, SurfaceId,
 };
 pub use surface::{InputPolicy, Shortcut, Surface, SurfaceAction, SurfaceEvent, SurfaceStatus};
 pub use theme::Theme;

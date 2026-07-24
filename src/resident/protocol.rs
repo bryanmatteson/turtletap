@@ -226,10 +226,23 @@ pub struct SessionSummary {
     pub name: String,
     /// Current driver, if any.
     pub driver: Option<DriverLease>,
-    /// Number of attached clients.
-    pub viewers: usize,
+    /// Number of attached clients, including the driver.
+    #[serde(rename = "viewers", alias = "attached_clients")]
+    pub attached_clients: usize,
     /// Latest committed event.
     pub sequence: EventSequence,
+    /// Milliseconds since the Unix epoch when the latest event was committed.
+    ///
+    /// `None` before the session commits anything, and on payloads from hosts
+    /// predating this field.
+    #[serde(default)]
+    pub last_event_at: Option<u64>,
+    /// Application-supplied summary payload for list and overview rendering.
+    ///
+    /// The resident layer never interprets this; it carries whatever
+    /// [`crate::resident::ResidentSession::digest`] returned.
+    #[serde(default)]
+    pub digest: Option<serde_json::Value>,
 }
 
 /// A request envelope with an idempotency key.
@@ -459,4 +472,21 @@ pub enum ServerMessage {
         /// Completed shutdown reason.
         reason: ShutdownReason,
     },
+}
+
+/// Whether a `requested` binary version should displace a leader running
+/// `current`.
+///
+/// Versions that do not parse as semver fall back to string ordering, so a
+/// product using its own versioning scheme still gets a total order rather
+/// than silently refusing every replacement.
+#[must_use]
+pub fn replacement_is_newer(current: &str, requested: &str) -> bool {
+    match (
+        semver::Version::parse(current),
+        semver::Version::parse(requested),
+    ) {
+        (Ok(current), Ok(requested)) => requested > current,
+        _ => requested > current,
+    }
 }

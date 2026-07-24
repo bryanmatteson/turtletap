@@ -3,7 +3,7 @@
 use serde::Deserialize;
 use turtletap::resident::{
     ClientEnvelope, ClientHello, EffectId, EventSequence, JournalRecord, PROTOCOL_VERSION,
-    ServerHandshake, ServerHello, SessionControlSnapshot,
+    ServerHandshake, ServerHello, SessionControlSnapshot, SessionSummary,
 };
 
 #[derive(Deserialize)]
@@ -48,6 +48,20 @@ fn protocol_v1_fixtures_remain_readable() {
 
     let envelope: ClientEnvelope = fixture("protocol/command-envelope-v1.json");
     assert_eq!(envelope.request.sequence, 7);
+}
+
+/// `last_event_at` and `digest` were added to `SessionSummary` after v1. A
+/// payload written before they existed must still load, with both absent —
+/// otherwise every older leader becomes unreadable to a newer client.
+#[test]
+fn session_summary_v1_loads_without_the_added_fields() {
+    let summary: SessionSummary = fixture("protocol/session-summary-v1.json");
+
+    assert_eq!(summary.name, "default");
+    assert_eq!(summary.attached_clients, 2);
+    assert_eq!(summary.sequence.0, 7);
+    assert_eq!(summary.last_event_at, None);
+    assert_eq!(summary.digest, None);
 }
 
 #[test]
@@ -97,6 +111,9 @@ fn fixture<T: serde::de::DeserializeOwned>(path: &str) -> T {
         }
         "protocol/command-envelope-v1.json" => {
             include_str!("fixtures/protocol/command-envelope-v1.json")
+        }
+        "protocol/session-summary-v1.json" => {
+            include_str!("fixtures/protocol/session-summary-v1.json")
         }
         "storage/checkpoint-host-v0.json" => {
             include_str!("fixtures/storage/checkpoint-host-v0.json")

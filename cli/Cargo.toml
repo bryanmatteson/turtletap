@@ -1,0 +1,33 @@
+[package]
+    authors.workspace      = true
+    categories             = ["command-line-interface"]
+    description            = "The TurtleTap terminal shell — persistent, reconnectable command sessions"
+    edition.workspace      = true
+    homepage.workspace     = true
+    keywords               = ["terminal", "tui", "shell", "session", "multiplexer"]
+license.workspace      = true
+name                   = "turtletap-cli"
+readme                 = "README.md"
+repository.workspace   = true
+rust-version.workspace = true
+version                = "0.2.0"
+
+[[bin]]
+    name = "turtletap"
+    path = "src/main.rs"
+
+[dependencies]
+    clap       = { version = "4.5", features = ["derive"] }
+    clap_complete = "4.5"
+    clap_mangen = "0.2"
+    kdl        = "4.7"
+    serde      = { version = "1", features = ["derive"] }
+    serde_json = "1"
+    shell-words = "1.1"
+    tokio      = { version = "1", features = ["net", "process", "rt", "rt-multi-thread", "sync", "time"] }
+    toml       = "1.1"
+    toml_edit  = "0.24"
+    turtletap  = { version = "0.2", path = "..", features = ["tokio"] }
+
+[lints]
+    workspace = true

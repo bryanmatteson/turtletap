@@ -1,47 +1,90 @@
-[workspace.package]
-    authors    = ["Bryan Matteson <7145232+bryanmatteson@users.noreply.github.com>"]
-    homepage   = "https://github.com/bryanmatteson/termosaic"
-    license    = "MIT"
-    repository = "https://github.com/bryanmatteson/termosaic"
+[workspace]
+    members = ["cli"]
 
-[package]
+[workspace.package]
     authors      = ["Bryan Matteson <7145232+bryanmatteson@users.noreply.github.com>"]
-    autobins     = false
-    categories   = ["command-line-interface"]
-    description  = "Tap into persistent, session-like surfaces from any terminal"
     edition      = "2024"
-    exclude      = [".github/**", ".gitignore", "mise.toml"]
-    keywords     = ["terminal", "tui", "shell", "session", "ratatui"]
+    homepage     = "https://github.com/bryanmatteson/turtletap"
     license      = "MIT"
-    name         = "turtletap"
-    readme       = "README.md"
     repository   = "https://github.com/bryanmatteson/turtletap"
     rust-version = "1.88"
-    version      = "0.1.0"
 
-[dependencies]
-    async-channel = "2"
-    crc32fast     = "1"
-    crossterm     = "0.29"
-    fs2           = "0.4"
-    kdl           = "4.7"
-    ratatui       = { version = "0.30.2", default-features = false, features = ["crossterm_0_29"] }
-    semver        = "1"
-    serde         = { version = "1", features = ["derive"] }
-    serde_json    = { version = "1", features = ["raw_value"] }
-    tokio         = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
-    toml          = "1.1"
-    uuid          = { version = "1", features = ["serde", "v4"] }
-
-[lints.rust]
+[workspace.lints.rust]
     missing_docs = "warn"
     unsafe_code  = "forbid"
 
-[lints.clippy]
+[workspace.lints.clippy]
     dbg_macro   = "deny"
     todo        = "deny"
     unwrap_used = "deny"
 
-[[bin]]
-    name = "turtletap"
-    path = "src/bin/main.rs"
+[package]
+    authors.workspace      = true
+    categories             = ["command-line-interface"]
+    description            = "A reusable terminal shell for hosting persistent, reconnectable surfaces"
+    edition.workspace      = true
+    exclude                = [".github/**", ".gitignore", "mise.toml", "design/**", "cli/**"]
+    homepage.workspace     = true
+    keywords               = ["terminal", "tui", "shell", "session", "ratatui"]
+    license.workspace      = true
+    name                   = "turtletap"
+    readme                 = "README.md"
+    repository.workspace   = true
+    rust-version.workspace = true
+    version                = "0.2.0"
+
+[features]
+    # The Shell/Surface half compiles against crossterm and ratatui alone.
+    default = []
+    # Runtime-neutral resident building blocks: protocol, journal, host, election.
+    resident = [
+        "dep:async-channel",
+        "dep:crc32fast",
+        "dep:fs2",
+        "dep:semver",
+        "dep:serde",
+        "dep:serde_json",
+        "dep:uuid",
+    ]
+    # Tokio adapters for the resident traits, plus the blocking client and supervisor.
+    tokio = ["async-shell", "resident"]
+    # Event-driven terminal and surface multiplexing without resident coupling.
+    async-shell = [
+        "crossterm/event-stream",
+        "dep:futures-util",
+        "dep:tokio",
+    ]
+
+[dependencies]
+    async-channel = { version = "2", optional = true }
+    crc32fast     = { version = "1", optional = true }
+    crossterm     = "0.29"
+    fs2           = { version = "0.4", optional = true }
+    futures-util  = { version = "0.3", default-features = false, features = ["std"], optional = true }
+    ratatui       = { version = "0.30.2", default-features = false, features = ["crossterm_0_29"] }
+    semver        = { version = "1", optional = true }
+    serde         = { version = "1", features = ["derive"], optional = true }
+    serde_json    = { version = "1", features = ["raw_value"], optional = true }
+    tokio         = { version = "1", features = ["io-util", "macros", "net", "process", "rt", "rt-multi-thread", "sync", "time"], optional = true }
+    uuid          = { version = "1", features = ["serde", "v4"], optional = true }
+
+[dev-dependencies]
+    tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+
+[[test]]
+    name              = "compatibility"
+    required-features = ["resident"]
+
+[[test]]
+    name              = "resident_api"
+    required-features = ["tokio"]
+
+[[example]]
+    name              = "resident"
+    required-features = ["tokio"]
+
+[package.metadata.docs.rs]
+    all-features = true
+
+[lints]
+    workspace = true

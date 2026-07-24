@@ -2,4 +2,4 @@
     rust = "latest"
 
 [tasks.install]
-    run = "cargo install --path ."
+    run = "cargo install --path cli"

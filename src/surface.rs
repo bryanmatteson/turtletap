@@ -1,7 +1,13 @@
-use std::{borrow::Cow, time::Duration};
+use std::{
+    borrow::Cow,
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::{Frame, layout::Rect};
+
+use crate::ShellConfig;
 
 /// Whether the shell may interpret convenient single-key navigation.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -12,6 +18,12 @@ pub enum InputPolicy {
     /// Turtle forwards ordinary input while reserving screen navigation and the
     /// configured leader chords.
     Captured,
+    /// Turtle forwards every key directly to the surface.
+    ///
+    /// This is intended for short-lived key capture flows. The surface is
+    /// responsible for providing and handling its own cancel key while this
+    /// policy is active.
+    Exclusive,
 }
 
 /// A surface's current user-visible state.
@@ -83,6 +95,10 @@ impl Shortcut {
 pub enum SurfaceEvent {
     /// A keyboard event not consumed by shell navigation.
     Key(KeyEvent),
+    /// Scroll the active surface upward by one viewport.
+    ScrollPageUp,
+    /// Scroll the active surface downward by one viewport.
+    ScrollPageDown,
     /// Bracketed-paste content.
     Paste(String),
     /// A mouse event inside the shell.
@@ -112,12 +128,21 @@ pub enum SurfaceAction {
     Detach,
     /// Add and focus another surface.
     Open(Box<dyn Surface>),
+    /// Focus an already-open surface with the matching stable key.
+    FocusKey(Cow<'static, str>),
+    /// Replace shell presentation settings and notify every surface.
+    Reconfigure(Box<ShellConfig>),
 }
 
 impl SurfaceAction {
     /// Opens and focuses a new surface.
     pub fn open(surface: impl Surface + 'static) -> Self {
         Self::Open(Box::new(surface))
+    }
+
+    /// Focuses an already-open surface by its stable key.
+    pub fn focus_key(key: impl Into<Cow<'static, str>>) -> Self {
+        Self::FocusKey(key.into())
     }
 }
 
@@ -127,12 +152,38 @@ impl SurfaceAction {
 /// log streams, or any other terminal-native interaction. The trait is object-safe
 /// so a shell can host heterogeneous surfaces together.
 pub trait Surface: Send {
-    /// The short title shown in tabs and the command palette.
+    /// The short title shown in tabs and the action bar.
     fn title(&self) -> Cow<'_, str>;
+
+    /// Stable shell-local lookup key used by another surface to focus this one.
+    ///
+    /// Most surfaces do not need a key. Products that expose a master surface
+    /// alongside dynamically named detail surfaces can use an immutable domain
+    /// identity here so renames do not break navigation.
+    fn key(&self) -> Option<Cow<'_, str>> {
+        None
+    }
 
     /// Current state shown beside the title.
     fn status(&self) -> SurfaceStatus {
         SurfaceStatus::Ready
+    }
+
+    /// A short annotation shown after the title — an unread count, a role, an
+    /// elapsed time.
+    ///
+    /// Chrome renders this in its own column rather than as part of
+    /// [`Surface::title`], so titles stay truncatable and badges stay aligned.
+    fn badge(&self) -> Option<Cow<'_, str>> {
+        None
+    }
+
+    /// A richer annotation used when a vertical rail has extra width.
+    ///
+    /// The default preserves [`Surface::badge`], so existing implementations
+    /// require no changes.
+    fn wide_badge(&self) -> Option<Cow<'_, str>> {
+        self.badge()
     }
 
     /// Determines whether ordinary shell shortcuts may intercept input.
@@ -140,11 +191,47 @@ pub trait Surface: Send {
         InputPolicy::Shell
     }
 
+    /// Applies settings reloaded by the host while the shell remains attached.
+    fn reconfigure(&mut self, _config: &ShellConfig) {}
+
+    /// Whether an unmodified Escape should open the action bar right now.
+    ///
+    /// Input surfaces can use this for an empty-prompt escape hatch while
+    /// preserving Escape as ordinary input whenever they have text or an
+    /// interactive terminal state that needs it.
+    fn opens_action_bar_on_escape(&self) -> bool {
+        false
+    }
+
+    /// Requests a shorter interval between background ticks while this surface
+    /// has latency-sensitive work in progress.
+    ///
+    /// The shell uses the shortest requested interval, capped by its configured
+    /// idle tick rate. Returning `None` keeps the configured rate.
+    fn poll_interval(&self) -> Option<Duration> {
+        None
+    }
+
     /// Draws this surface inside the content area owned by TurtleTap.
     fn render(&mut self, frame: &mut Frame<'_>, area: Rect);
 
     /// Handles an input or lifecycle event.
     fn handle(&mut self, event: SurfaceEvent) -> SurfaceAction;
+
+    /// Polls application-owned background readiness.
+    ///
+    /// Implementations must register `context.waker()` before returning
+    /// [`Poll::Pending`]. A ready result must represent bounded forward
+    /// progress; continuously returning `Ready(Ignored)` would spin an async
+    /// attach loop.
+    ///
+    /// The asynchronous shell polls this when the registered source wakes. The
+    /// synchronous shell polls it on ordinary ticks as a compatibility
+    /// fallback.
+    fn poll_background(&mut self, context: &mut Context<'_>) -> Poll<SurfaceAction> {
+        let _ = context;
+        Poll::Pending
+    }
 
     /// Returns surface-specific shortcuts for contextual help.
     fn shortcuts(&self) -> Vec<Shortcut> {

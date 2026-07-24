@@ -18,6 +18,9 @@ pub struct SessionControlSnapshot {
     pub name: String,
     /// Latest committed event sequence.
     pub sequence: EventSequence,
+    /// Milliseconds since the Unix epoch when the latest event was committed.
+    #[serde(default)]
+    pub last_event_at: Option<u64>,
     /// Current lease epoch. The owner is intentionally not restored after restart.
     pub lease_epoch: LeaseEpoch,
     /// Recently committed requests used for reconnect deduplication.
@@ -38,6 +41,7 @@ struct SessionState {
     driver: Option<DriverLease>,
     lease_epoch: LeaseEpoch,
     sequence: EventSequence,
+    last_event_at: Option<u64>,
     committed: HashMap<RequestId, EventSequence>,
     commit_order: VecDeque<RequestId>,
 }
@@ -48,8 +52,10 @@ impl SessionState {
             id: self.id,
             name: self.name.clone(),
             driver: self.driver,
-            viewers: self.subscribers.len(),
+            attached_clients: self.subscribers.len(),
             sequence: self.sequence,
+            last_event_at: self.last_event_at,
+            digest: None,
         }
     }
 
@@ -58,6 +64,7 @@ impl SessionState {
             id: self.id,
             name: self.name.clone(),
             sequence: self.sequence,
+            last_event_at: self.last_event_at,
             lease_epoch: self.lease_epoch,
             committed: self
                 .commit_order
@@ -82,7 +89,7 @@ pub enum CoreError {
     UnknownSession,
     /// A session already uses the requested name.
     DuplicateName,
-    /// A session name is empty after trimming.
+    /// A session name violates the public display-name contract.
     InvalidName,
     /// The client is not subscribed to the session.
     NotAttached,
@@ -103,7 +110,9 @@ impl std::fmt::Display for CoreError {
             Self::UnknownConnection => formatter.write_str("unknown resident connection"),
             Self::UnknownSession => formatter.write_str("unknown resident session"),
             Self::DuplicateName => formatter.write_str("a session already has that name"),
-            Self::InvalidName => formatter.write_str("session name cannot be empty"),
+            Self::InvalidName => formatter.write_str(
+                "session names must be 1-64 printable characters without control characters",
+            ),
             Self::NotAttached => formatter.write_str("client is not attached to this session"),
             Self::NotDriver => formatter.write_str("client does not hold the driver lease"),
             Self::StaleLease { current } => {
@@ -261,7 +270,7 @@ impl LeaderCore {
         name: impl Into<String>,
     ) -> Result<SessionSummary, CoreError> {
         let name = normalize_name(name.into());
-        if name.is_empty() {
+        if !valid_name(&name) {
             return Err(CoreError::InvalidName);
         }
         if self.names.contains_key(&name) {
@@ -274,6 +283,7 @@ impl LeaderCore {
             driver: None,
             lease_epoch: LeaseEpoch(0),
             sequence: EventSequence(0),
+            last_event_at: None,
             committed: HashMap::new(),
             commit_order: VecDeque::new(),
         };
@@ -305,11 +315,26 @@ impl LeaderCore {
                 driver: None,
                 lease_epoch: LeaseEpoch(snapshot.lease_epoch.0.saturating_add(1)),
                 sequence: snapshot.sequence,
+                last_event_at: snapshot.last_event_at,
                 committed,
                 commit_order,
             },
         );
         Ok(())
+    }
+
+    /// Records when a session last committed an event.
+    ///
+    /// The timestamp is supplied by the caller rather than read from a clock,
+    /// so the core stays deterministic and replayable.
+    pub fn stamp_activity(&mut self, session_id: SessionId, millis: u64) {
+        if let Some(session) = self.sessions.get_mut(&session_id) {
+            session.last_event_at = Some(
+                session
+                    .last_event_at
+                    .map_or(millis, |current| current.max(millis)),
+            );
+        }
     }
 
     /// Lists sessions in stable name order.
@@ -333,7 +358,7 @@ impl LeaderCore {
         name: impl Into<String>,
     ) -> Result<SessionSummary, CoreError> {
         let name = normalize_name(name.into());
-        if name.is_empty() {
+        if !valid_name(&name) {
             return Err(CoreError::InvalidName);
         }
         if self
@@ -611,6 +636,12 @@ fn normalize_name(name: String) -> String {
     name.trim().to_owned()
 }
 
+fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().count() <= 64
+        && name.chars().all(|character| !character.is_control())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -673,5 +704,32 @@ mod tests {
             core.authorize(connection, session, lease, request),
             Ok(Authorization::Duplicate(committed))
         );
+    }
+
+    #[test]
+    fn replayed_activity_never_moves_backwards() {
+        let mut core = LeaderCore::new();
+        let session = SessionId::new();
+        core.create_session(session, "build").expect("create");
+
+        core.stamp_activity(session, 200);
+        core.stamp_activity(session, 100);
+
+        assert_eq!(
+            core.snapshot(session).expect("snapshot").last_event_at,
+            Some(200)
+        );
+    }
+
+    #[test]
+    fn session_names_reject_controls_and_excessive_length() {
+        let mut core = LeaderCore::new();
+        assert!(core.create_session(SessionId::new(), "bad\nname").is_err());
+        assert!(
+            core.create_session(SessionId::new(), "x".repeat(65))
+                .is_err()
+        );
+        core.create_session(SessionId::new(), "build output")
+            .expect("printable names should remain supported");
     }
 }

@@ -7,7 +7,7 @@ use ratatui::{
 };
 
 use crate::{
-    Shell, SurfaceStatus,
+    KeyBinding, KeyCode, Shell, Surface, SurfaceStatus,
     shell::{Overlay, PaletteAction},
 };
 
@@ -22,8 +22,21 @@ pub(crate) fn draw(frame: &mut Frame<'_>, shell: &mut Shell) {
         ])
         .split(area);
 
-    draw_tabs(frame, sections[0], shell);
-    draw_active(frame, sections[1], shell);
+    match shell.config.chrome.rail_width(area.width) {
+        None => {
+            draw_tabs(frame, sections[0], shell);
+            draw_active(frame, sections[1], shell);
+        }
+        Some(width) => {
+            draw_host_title(frame, sections[0], shell);
+            let columns = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Length(width), Constraint::Min(0)])
+                .split(sections[1]);
+            draw_rail(frame, columns[0], shell);
+            draw_active(frame, columns[1], shell);
+        }
+    }
     draw_status(frame, sections[2], shell);
 
     match shell.overlay.clone() {
@@ -36,8 +49,8 @@ pub(crate) fn draw(frame: &mut Frame<'_>, shell: &mut Shell) {
 }
 
 fn draw_tabs(frame: &mut Frame<'_>, area: Rect, shell: &mut Shell) {
-    shell.tab_hits.clear();
-    let mut tab_hits = Vec::with_capacity(shell.entries().count());
+    shell.chrome_hits.clear();
+    let mut chrome_hits = Vec::with_capacity(shell.entries().count());
     let host_title = format!(" {}{}", shell.config.title, shell.pulse_marker());
     let host_width = cell_width(&host_title);
     let mut spans = vec![
@@ -54,11 +67,18 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, shell: &mut Shell) {
         .entries()
         .enumerate()
         .map(|(index, (_, surface))| {
+            let badge = surface.badge().unwrap_or_default();
+            let badge = if badge.is_empty() {
+                String::new()
+            } else {
+                format!(" {badge}")
+            };
             let text = format!(
-                " {}:{} {} ",
+                " {}:{} {}{} ",
                 index + 1,
                 surface.status().marker(),
-                surface.title()
+                surface.title(),
+                badge,
             );
             let width = cell_width(&text);
             let style = if active == index {
@@ -79,7 +99,7 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, shell: &mut Shell) {
     }
     for (visible_index, (index, text, width, style)) in tabs[visible.clone()].iter().enumerate() {
         spans.push(Span::styled(text.clone(), *style));
-        tab_hits.push((Rect::new(x, area.y, *width, 1), *index));
+        chrome_hits.push((Rect::new(x, area.y, *width, 1), *index));
         x = x.saturating_add(*width);
         if visible_index + 1 < visible.len() {
             spans.push(Span::raw(" "));
@@ -89,9 +109,121 @@ fn draw_tabs(frame: &mut Frame<'_>, area: Rect, shell: &mut Shell) {
     if visible.end < tabs.len() {
         spans.push(Span::styled(" ›", shell.config.theme.muted));
     }
-    shell.tab_hits = tab_hits;
+    shell.chrome_hits = chrome_hits;
 
     frame.render_widget(Line::from(spans), area);
+}
+
+/// Renders the product name in rail mode, where the top row is not a tab strip.
+fn draw_host_title(frame: &mut Frame<'_>, area: Rect, shell: &mut Shell) {
+    shell.chrome_hits.clear();
+    let title = format!(" {}{}", shell.config.title, shell.pulse_marker());
+    frame.render_widget(
+        Line::styled(
+            title,
+            shell.config.theme.accent.add_modifier(Modifier::BOLD),
+        ),
+        area,
+    );
+}
+
+/// Renders the vertical surface list.
+///
+/// Each surface gets a full row, so the status markers line up as a column that
+/// can be scanned at a glance — the property a shared single-row tab strip
+/// cannot offer once the list grows.
+fn draw_rail(frame: &mut Frame<'_>, area: Rect, shell: &mut Shell) {
+    let active = shell.active_index();
+    // Under roughly ten columns only the number and marker fit; titles would be
+    // truncated to noise, so they are dropped rather than shown misleadingly.
+    let markers_only = area.width < 10;
+
+    let mut hits = Vec::with_capacity(shell.entries().count());
+    let rows: Vec<ListItem<'_>> = shell
+        .entries()
+        .enumerate()
+        .map(|(index, (_, surface))| {
+            let status = surface.status();
+            let marker_style = status_style(shell, status);
+            let number = index + 1;
+            if markers_only {
+                return ListItem::new(Line::from(vec![
+                    Span::styled(
+                        if number < 10 {
+                            format!("{number}")
+                        } else {
+                            "·".to_owned()
+                        },
+                        shell.config.theme.muted,
+                    ),
+                    Span::styled(format!(" {}", status.marker()), marker_style),
+                ]));
+            }
+
+            let badge = if area.width >= 32 {
+                surface.wide_badge()
+            } else {
+                surface.badge()
+            }
+            .unwrap_or_default()
+            .into_owned();
+            let prefix = format!("{number} ");
+            let marker = format!("{} ", status.marker());
+            // Every cell is spoken for: prefix, marker, title, at least one
+            // separating space, then the right-aligned badge.
+            let fixed = usize::from(cell_width(&prefix))
+                + usize::from(cell_width(&marker))
+                + usize::from(cell_width(&badge))
+                + 1;
+            let room = usize::from(area.width).saturating_sub(fixed).max(1);
+            let title = truncate(&surface.title(), room);
+            let padding = room.saturating_sub(usize::from(cell_width(&title))) + 1;
+            ListItem::new(Line::from(vec![
+                Span::styled(prefix, shell.config.theme.muted),
+                Span::styled(marker, marker_style),
+                Span::raw(title),
+                Span::raw(" ".repeat(padding)),
+                Span::styled(badge, shell.config.theme.muted),
+            ]))
+        })
+        .collect();
+
+    let list = List::new(rows).highlight_style(shell.config.theme.selected);
+    let mut state = ListState::default().with_selected(active);
+    frame.render_stateful_widget(list, area, &mut state);
+    for (row, index) in (state.offset()..shell.entries().count())
+        .take(usize::from(area.height))
+        .enumerate()
+    {
+        let Ok(row) = u16::try_from(row) else {
+            break;
+        };
+        hits.push((Rect::new(area.x, area.y + row, area.width, 1), index));
+    }
+    shell.chrome_hits = hits;
+}
+
+/// Shortens `text` to `limit` cells, marking the cut with an ellipsis.
+fn truncate(text: &str, limit: usize) -> String {
+    if usize::from(cell_width(text)) <= limit {
+        return text.to_owned();
+    }
+    if limit == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut width = 0_usize;
+    for character in text.chars() {
+        let mut encoded = [0_u8; 4];
+        let character_width = usize::from(cell_width(character.encode_utf8(&mut encoded)));
+        if width.saturating_add(character_width).saturating_add(1) > limit {
+            break;
+        }
+        out.push(character);
+        width = width.saturating_add(character_width);
+    }
+    out.push('…');
+    out
 }
 
 fn visible_tab_range(widths: &[u16], active: usize, available: u16) -> std::ops::Range<usize> {
@@ -173,12 +305,22 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, shell: &Shell) {
     let next = shell.config.bindings.primary_next_label();
     let jump = shell.config.bindings.primary_jump_label();
     let palette = shell.config.bindings.primary_palette_label();
+    let palette = if shell
+        .active_surface()
+        .is_some_and(Surface::opens_action_bar_on_escape)
+    {
+        format!("{palette}/Esc")
+    } else {
+        palette
+    };
     let content = if let Some(notice) = &shell.notice {
         Line::styled(format!(" {notice}"), shell.config.theme.attention)
-    } else if shell
-        .active_surface()
-        .is_some_and(|surface| surface.input_policy() == crate::InputPolicy::Captured)
-    {
+    } else if shell.active_surface().is_some_and(|surface| {
+        matches!(
+            surface.input_policy(),
+            crate::InputPolicy::Captured | crate::InputPolicy::Exclusive
+        )
+    }) {
         Line::from(vec![
             Span::styled(format!(" {previous}/{next}"), shell.config.theme.accent),
             Span::styled(" switch · ", shell.config.theme.muted),
@@ -188,14 +330,21 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, shell: &Shell) {
             Span::styled(" commands", shell.config.theme.muted),
         ])
     } else {
+        let switch = format!(
+            "{} / {}",
+            binding_labels(&shell.config.bindings.shell_previous_screen),
+            binding_labels(&shell.config.bindings.shell_next_screen)
+        );
+        let detach = binding_labels(&shell.config.bindings.shell_detach);
+        let help = binding_labels(&shell.config.bindings.shell_help);
         Line::from(vec![
-            Span::styled(" Tab", shell.config.theme.accent),
+            Span::styled(format!(" {switch}"), shell.config.theme.accent),
             Span::styled(" switch · ", shell.config.theme.muted),
             Span::styled(jump, shell.config.theme.accent),
             Span::styled(" jump · ", shell.config.theme.muted),
-            Span::styled("Ctrl-D", shell.config.theme.accent),
+            Span::styled(detach, shell.config.theme.accent),
             Span::styled(" detach · ", shell.config.theme.muted),
-            Span::styled("?", shell.config.theme.accent),
+            Span::styled(help, shell.config.theme.accent),
             Span::styled(" help", shell.config.theme.muted),
         ])
     };
@@ -234,11 +383,14 @@ fn draw_palette(
         .min(viewport.height.saturating_sub(2))
         .max(6);
     let area = centered(viewport, width, height);
+    let clear_query = binding_labels(&shell.config.bindings.action_clear_query);
     let block = Block::bordered()
-        .title(" Command palette ")
+        .title(" Action bar ")
         .title_bottom(
             Line::styled(
-                " ↑↓ move · Enter run · Esc close ",
+                format!(
+                    " type to search · {clear_query} clear · shortcuts · Enter run · Esc close "
+                ),
                 shell.config.theme.muted,
             )
             .centered(),
@@ -256,13 +408,36 @@ fn draw_palette(
     ]);
     let items = palette_items.into_iter().map(|item| {
         let prefix = match item.action {
-            PaletteAction::SelectSurface(index) if query.is_empty() && index < 9 => {
-                format!(" {} ", index + 1)
-            }
+            PaletteAction::SelectSurface(index) if query.is_empty() && index < 9 => shell
+                .config
+                .bindings
+                .action_jump_modifiers
+                .first()
+                .map_or_else(
+                    || format!(" {} ", item.status.unwrap_or(SurfaceStatus::Ready).marker()),
+                    |modifiers| {
+                        format!(
+                            " {} ",
+                            KeyBinding::new(
+                                KeyCode::Char(char::from(b'1' + index as u8)),
+                                *modifiers,
+                            )
+                            .label()
+                        )
+                    },
+                ),
             PaletteAction::SelectSurface(_) => {
                 format!(" {} ", item.status.unwrap_or(SurfaceStatus::Ready).marker())
             }
-            _ => " › ".to_owned(),
+            PaletteAction::NextSurface => binding_prefix(&shell.config.bindings.action_next_screen),
+            PaletteAction::PreviousSurface => {
+                binding_prefix(&shell.config.bindings.action_previous_screen)
+            }
+            PaletteAction::ScrollUp => binding_prefix(&shell.config.bindings.action_scroll_up),
+            PaletteAction::ScrollDown => binding_prefix(&shell.config.bindings.action_scroll_down),
+            PaletteAction::CloseSurface => binding_prefix(&shell.config.bindings.action_close),
+            PaletteAction::Detach => binding_prefix(&shell.config.bindings.action_detach),
+            PaletteAction::Help => binding_prefix(&shell.config.bindings.action_help),
         };
         let marker_style = item.status.map_or(shell.config.theme.accent, |status| {
             status_style(shell, status)
@@ -291,13 +466,50 @@ fn draw_palette(
     }
 }
 
+fn binding_prefix(bindings: &[KeyBinding]) -> String {
+    bindings.first().map_or_else(
+        || " · ".to_owned(),
+        |binding| format!(" {} ", binding.label()),
+    )
+}
+
+fn binding_labels(bindings: &[KeyBinding]) -> String {
+    if bindings.is_empty() {
+        return "disabled".to_owned();
+    }
+    bindings
+        .iter()
+        .map(|binding| binding.label())
+        .collect::<Vec<_>>()
+        .join(" / ")
+}
+
 fn draw_help(frame: &mut Frame<'_>, viewport: Rect, shell: &Shell) {
     let previous = shell.config.bindings.primary_previous_label();
     let next = shell.config.bindings.primary_next_label();
     let jump = shell.config.bindings.primary_jump_label();
     let palette = shell.config.bindings.primary_palette_label();
+    let palette = if shell
+        .active_surface()
+        .is_some_and(Surface::opens_action_bar_on_escape)
+    {
+        format!("{palette} / Esc")
+    } else {
+        palette
+    };
     let redraw = shell.config.bindings.primary_redraw_label();
-    let leader = shell.config.bindings.primary_leader_label();
+    let leader_detach = shell
+        .config
+        .bindings
+        .primary_leader_chord_label(&shell.config.bindings.leader_detach);
+    let leader_close = shell
+        .config
+        .bindings
+        .primary_leader_chord_label(&shell.config.bindings.leader_close);
+    let leader_help = shell
+        .config
+        .bindings
+        .primary_leader_chord_label(&shell.config.bindings.leader_help);
     let mut lines = vec![
         help_line(
             &format!("{previous} / {next}"),
@@ -305,19 +517,19 @@ fn draw_help(frame: &mut Frame<'_>, viewport: Rect, shell: &Shell) {
             shell,
         ),
         help_line(&jump, "Jump directly to a numbered screen", shell),
-        help_line(&palette, "Open the command palette", shell),
+        help_line(
+            &palette,
+            "Open the TurtleTap action bar; Esc requires an empty prompt",
+            shell,
+        ),
         help_line(&redraw, "Clear and redraw the terminal frame", shell),
         help_line(
-            &format!("{leader} d"),
+            &leader_detach,
             "Detach and return to the host terminal",
             shell,
         ),
-        help_line(
-            &format!("{leader} x"),
-            "Close only the active surface",
-            shell,
-        ),
-        help_line(&format!("{leader} ?"), "Show keyboard help", shell),
+        help_line(&leader_close, "Close only the active surface", shell),
+        help_line(&leader_help, "Show keyboard help", shell),
     ];
 
     if let Some(surface) = shell.active_surface() {
