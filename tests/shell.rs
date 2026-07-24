@@ -159,16 +159,27 @@ fn ctrl_space_is_the_primary_leader() {
 }
 
 #[test]
-fn direct_alt_bindings_switch_and_jump_across_captured_surfaces() {
+fn direct_screen_bindings_switch_and_jump_across_captured_surfaces() {
     let (first, _) = Probe::new("first", InputPolicy::Captured);
     let (second, _) = Probe::new("second", InputPolicy::Captured);
-    let (third, _) = Probe::new("third", InputPolicy::Captured);
+    let (third, third_events) = Probe::new("third", InputPolicy::Captured);
     let mut shell = Shell::new(ShellConfig::new("Koda"));
     let first_id = shell.add_surface(first);
     let second_id = shell.add_surface(second);
-    shell.add_surface(third);
+    let third_id = shell.add_surface(third);
 
     shell.handle_event(key(KeyCode::Left, KeyModifiers::ALT));
+    assert_eq!(shell.active_id(), Some(third_id));
+    assert!(matches!(
+        third_events
+            .lock()
+            .expect("probe lock should be healthy")
+            .last(),
+        Some(SurfaceEvent::Key(key))
+            if key.code == KeyCode::Left && key.modifiers == KeyModifiers::ALT
+    ));
+
+    shell.handle_event(key(KeyCode::PageUp, KeyModifiers::CONTROL));
     assert_eq!(shell.active_id(), Some(second_id));
 
     shell.handle_event(key(KeyCode::Char('1'), KeyModifiers::ALT));
@@ -305,7 +316,7 @@ fn rendered_chrome_follows_the_active_surface() {
     assert!(rendered.contains("Koda"));
     assert!(rendered.contains("agent"));
     assert!(rendered.contains("terminal body"));
-    assert!(rendered.contains("Alt-Left/Alt-Right"));
+    assert!(rendered.contains("Ctrl-PageUp/Ctrl-PageDown"));
     assert!(rendered.contains("screen 2/2"));
 }
 

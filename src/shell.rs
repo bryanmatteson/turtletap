@@ -12,6 +12,9 @@ use crate::{
     InputPolicy, Surface, SurfaceAction, SurfaceEvent, Theme, render, terminal::TerminalSession,
 };
 
+const PULSE_FRAME_RATE: Duration = Duration::from_millis(250);
+const PULSE_FRAMES: [&str; 8] = ["·", "·", "•", "●", "•", "·", "·", "·"];
+
 /// Stable identity assigned to a surface by its shell.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct SurfaceId(u64);
@@ -110,6 +113,8 @@ pub struct ShellBindings {
     pub leaders: Vec<KeyBinding>,
     /// Chords that open the command palette.
     pub palette: Vec<KeyBinding>,
+    /// Chords that clear and fully redraw the terminal frame.
+    pub redraw: Vec<KeyBinding>,
     /// Chords that focus the next screen.
     pub next_screen: Vec<KeyBinding>,
     /// Chords that focus the previous screen.
@@ -126,14 +131,12 @@ impl Default for ShellBindings {
                 KeyBinding::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
             ],
             palette: vec![KeyBinding::new(KeyCode::Char('p'), KeyModifiers::CONTROL)],
-            next_screen: vec![
-                KeyBinding::new(KeyCode::Right, KeyModifiers::ALT),
-                KeyBinding::new(KeyCode::PageDown, KeyModifiers::CONTROL),
+            redraw: vec![
+                KeyBinding::new(KeyCode::Char('/'), KeyModifiers::CONTROL),
+                KeyBinding::new(KeyCode::Char('_'), KeyModifiers::CONTROL),
             ],
-            previous_screen: vec![
-                KeyBinding::new(KeyCode::Left, KeyModifiers::ALT),
-                KeyBinding::new(KeyCode::PageUp, KeyModifiers::CONTROL),
-            ],
+            next_screen: vec![KeyBinding::new(KeyCode::PageDown, KeyModifiers::CONTROL)],
+            previous_screen: vec![KeyBinding::new(KeyCode::PageUp, KeyModifiers::CONTROL)],
             jump_modifiers: vec![KeyModifiers::ALT],
         }
     }
@@ -154,6 +157,12 @@ impl ShellBindings {
         self.palette
             .first()
             .map_or_else(|| "palette".to_owned(), |binding| binding.label())
+    }
+
+    pub(crate) fn primary_redraw_label(&self) -> String {
+        self.redraw
+            .first()
+            .map_or_else(|| "redraw".to_owned(), |binding| binding.label())
     }
 
     pub(crate) fn primary_next_label(&self) -> String {
@@ -288,6 +297,9 @@ pub struct Shell {
     pub(crate) overlay: Option<Overlay>,
     leader_armed: bool,
     dirty: bool,
+    pulse_elapsed: Duration,
+    pulse_frame: usize,
+    clear_requested: bool,
     pub(crate) notice: Option<String>,
     pub(crate) tab_hits: Vec<(Rect, usize)>,
 }
@@ -304,6 +316,9 @@ impl Shell {
             overlay: None,
             leader_armed: false,
             dirty: true,
+            pulse_elapsed: Duration::ZERO,
+            pulse_frame: 0,
+            clear_requested: false,
             notice: None,
             tab_hits: Vec::new(),
         }
@@ -380,6 +395,11 @@ impl Shell {
         self.dirty = true;
 
         loop {
+            if self.clear_requested {
+                session.clear_frame()?;
+                self.clear_requested = false;
+                self.dirty = true;
+            }
             if self.dirty {
                 session.terminal().draw(|frame| render::draw(frame, self))?;
                 self.dirty = false;
@@ -487,6 +507,12 @@ impl Shell {
 
         if ShellBindings::matches(&self.config.bindings.palette, key) {
             self.open_palette();
+            return ShellSignal::Continue;
+        }
+
+        if ShellBindings::matches(&self.config.bindings.redraw, key) {
+            self.clear_requested = true;
+            self.dirty = true;
             return ShellSignal::Continue;
         }
 
@@ -696,6 +722,10 @@ impl Shell {
     }
 
     fn dispatch_to_all(&mut self, event: SurfaceEvent) -> ShellSignal {
+        let animation_changed = match &event {
+            SurfaceEvent::Tick(elapsed) => self.advance_pulse(*elapsed),
+            _ => false,
+        };
         let actions: Vec<(usize, SurfaceAction)> = self
             .entries
             .iter_mut()
@@ -706,7 +736,7 @@ impl Shell {
         let mut close_indices = Vec::new();
         let mut open_surfaces = Vec::new();
         let mut detach = false;
-        let mut redraw = false;
+        let mut redraw = animation_changed;
 
         for (index, action) in actions {
             match action {
@@ -734,6 +764,20 @@ impl Shell {
         } else {
             ShellSignal::Continue
         }
+    }
+
+    fn advance_pulse(&mut self, elapsed: Duration) -> bool {
+        let previous_marker = self.pulse_marker();
+        self.pulse_elapsed = self.pulse_elapsed.saturating_add(elapsed);
+        while self.pulse_elapsed >= PULSE_FRAME_RATE {
+            self.pulse_elapsed = self.pulse_elapsed.saturating_sub(PULSE_FRAME_RATE);
+            self.pulse_frame = (self.pulse_frame + 1) % PULSE_FRAMES.len();
+        }
+        self.pulse_marker() != previous_marker
+    }
+
+    pub(crate) fn pulse_marker(&self) -> &'static str {
+        PULSE_FRAMES[self.pulse_frame]
     }
 
     fn open_palette(&mut self) {
@@ -1026,6 +1070,39 @@ mod tests {
             shell.dispatch_to_all(SurfaceEvent::Tick(Duration::from_millis(100))),
             ShellSignal::Continue
         );
+        assert!(shell.dirty);
+    }
+
+    #[test]
+    fn heartbeat_advances_at_a_low_rate_and_requests_a_redraw() {
+        let mut shell = Shell::new(ShellConfig::new("test"));
+        shell.add_surface(TickSurface { redraw: false });
+        shell.dirty = false;
+        let initial = shell.pulse_marker();
+
+        shell.dispatch_to_all(SurfaceEvent::Tick(Duration::from_millis(499)));
+        assert!(!shell.dirty);
+        assert_eq!(shell.pulse_marker(), initial);
+
+        shell.dispatch_to_all(SurfaceEvent::Tick(Duration::from_millis(1)));
+        assert!(shell.dirty);
+        assert_eq!(shell.pulse_frame, 2);
+    }
+
+    #[test]
+    fn redraw_binding_requests_an_explicit_terminal_clear() {
+        let mut shell = Shell::new(ShellConfig::new("test"));
+        shell.add_surface(TickSurface { redraw: false });
+        shell.dirty = false;
+
+        assert_eq!(
+            shell.handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('/'),
+                KeyModifiers::CONTROL,
+            ))),
+            ShellSignal::Continue
+        );
+        assert!(shell.clear_requested);
         assert!(shell.dirty);
     }
 }

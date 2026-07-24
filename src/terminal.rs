@@ -6,7 +6,10 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui::{
+    Terminal,
+    backend::{Backend, CrosstermBackend},
+};
 
 pub(crate) type TuiTerminal = Terminal<CrosstermBackend<Stdout>>;
 
@@ -52,6 +55,16 @@ impl TerminalSession {
     pub(crate) fn terminal(&mut self) -> &mut TuiTerminal {
         &mut self.terminal
     }
+
+    /// Clears the visible viewport and invalidates Ratatui's previous frame.
+    pub(crate) fn clear_frame(&mut self) -> io::Result<()> {
+        clear_frame(&mut self.terminal)
+    }
+}
+
+fn clear_frame<B: Backend>(terminal: &mut Terminal<B>) -> Result<(), B::Error> {
+    let area = terminal.size()?.into();
+    terminal.resize(area)
 }
 
 impl Drop for TerminalSession {
@@ -76,6 +89,8 @@ fn restore_terminal(writer: &mut impl Write, mouse_capture: bool) {
 
 #[cfg(test)]
 mod tests {
+    use ratatui::backend::TestBackend;
+
     use super::*;
 
     #[derive(Default)]
@@ -107,5 +122,23 @@ mod tests {
 
         assert!(writer.writes >= 3);
         assert!(!writer.output.is_empty());
+    }
+
+    #[test]
+    fn explicit_clear_invalidates_and_restores_the_complete_frame() {
+        let backend = TestBackend::new(5, 1);
+        let mut terminal = Terminal::new(backend).expect("test terminal should initialize");
+        terminal
+            .draw(|frame| frame.render_widget("live", frame.area()))
+            .expect("initial frame should draw");
+
+        clear_frame(&mut terminal).expect("terminal should clear without querying input");
+        terminal.backend().assert_buffer_lines(["     "]);
+
+        terminal
+            .draw(|frame| frame.render_widget("live", frame.area()))
+            .expect("cleared frame should redraw");
+
+        terminal.backend().assert_buffer_lines(["live "]);
     }
 }

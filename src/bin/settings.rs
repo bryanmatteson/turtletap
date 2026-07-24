@@ -8,7 +8,10 @@ use std::{
 };
 
 use serde::Deserialize;
-use turtletap::{KeyBinding, KeyCode, KeyModifiers, ShellBindings, ShellConfig};
+use turtletap::{
+    KeyBinding, KeyCode, KeyModifiers, ShellBindings, ShellConfig, Theme,
+    tui::style::{Color, Style},
+};
 
 const TOML_TEMPLATE: &str = r#"# TurtleTap settings
 
@@ -17,12 +20,26 @@ mouse_capture = false
 direct_detach = true
 tick_rate_ms = 100
 
+[theme]
+chrome = "white"
+muted = "dark-gray"
+accent = "cyan"
+working = "blue"
+attention = "yellow"
+failed = "red"
+complete = "green"
+
+[theme.selected]
+foreground = "black"
+background = "cyan"
+
 [bindings]
 # The first entry is shown in the footer and help. Additional entries are fallbacks.
 leaders = ["ctrl-space", "ctrl-g"]
 palette = ["ctrl-p"]
-next_screen = ["alt-right", "ctrl-pagedown"]
-previous_screen = ["alt-left", "ctrl-pageup"]
+redraw = ["ctrl-/", "ctrl-_"]
+next_screen = ["ctrl-pagedown"]
+previous_screen = ["ctrl-pageup"]
 jump_modifiers = ["alt"]
 "#;
 
@@ -30,12 +47,24 @@ const KDL_TEMPLATE: &str = r#"// TurtleTap settings
 
 shell mouse-capture=false direct-detach=true tick-rate-ms=100
 
+theme {
+    chrome "white"
+    muted "dark-gray"
+    selected foreground="black" background="cyan"
+    accent "cyan"
+    working "blue"
+    attention "yellow"
+    failed "red"
+    complete "green"
+}
+
 bindings {
     // The first entry is shown in the footer and help. Others are fallbacks.
     leaders "ctrl-space" "ctrl-g"
     palette "ctrl-p"
-    next-screen "alt-right" "ctrl-pagedown"
-    previous-screen "alt-left" "ctrl-pageup"
+    redraw "ctrl-/" "ctrl-_"
+    next-screen "ctrl-pagedown"
+    previous-screen "ctrl-pageup"
     jump-modifiers "alt"
 }
 "#;
@@ -82,6 +111,7 @@ struct ConfigLocation {
 #[serde(default, deny_unknown_fields)]
 struct SettingsFile {
     shell: ShellSettings,
+    theme: ThemeSettings,
     bindings: BindingSettings,
 }
 
@@ -95,9 +125,30 @@ struct ShellSettings {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+struct ThemeSettings {
+    chrome: Option<String>,
+    muted: Option<String>,
+    selected: SelectedThemeSettings,
+    accent: Option<String>,
+    working: Option<String>,
+    attention: Option<String>,
+    failed: Option<String>,
+    complete: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct SelectedThemeSettings {
+    foreground: Option<String>,
+    background: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 struct BindingSettings {
     leaders: Option<Vec<String>>,
     palette: Option<Vec<String>>,
+    redraw: Option<Vec<String>>,
     next_screen: Option<Vec<String>>,
     previous_screen: Option<Vec<String>>,
     jump_modifiers: Option<Vec<String>>,
@@ -336,6 +387,7 @@ fn parse_kdl(source: &str, path: &Path) -> io::Result<SettingsFile> {
     })?;
     let mut settings = SettingsFile::default();
     let mut saw_shell = false;
+    let mut saw_theme = false;
     let mut saw_bindings = false;
     for node in document.nodes() {
         match node.name().value() {
@@ -357,7 +409,16 @@ fn parse_kdl(source: &str, path: &Path) -> io::Result<SettingsFile> {
                     ))
                 })?;
             }
-            "shell" | "bindings" => {
+            "theme" if !saw_theme => {
+                saw_theme = true;
+                parse_kdl_theme(node, &mut settings.theme).map_err(|message| {
+                    invalid(format!(
+                        "invalid configuration at {}: {message}",
+                        path.display()
+                    ))
+                })?;
+            }
+            "shell" | "theme" | "bindings" => {
                 return Err(invalid(format!(
                     "invalid configuration at {}: duplicate '{}' node",
                     path.display(),
@@ -415,6 +476,101 @@ fn parse_kdl_shell(node: &kdl::KdlNode, shell: &mut ShellSettings) -> Result<(),
     Ok(())
 }
 
+fn parse_kdl_theme(node: &kdl::KdlNode, theme: &mut ThemeSettings) -> Result<(), String> {
+    if !node.entries().is_empty() {
+        return Err("theme accepts child nodes, not inline entries".to_owned());
+    }
+    let Some(children) = node.children() else {
+        return Ok(());
+    };
+    let mut seen = Vec::new();
+    for child in children.nodes() {
+        let name = child.name().value();
+        if seen.contains(&name) {
+            return Err(format!("theme child '{name}' appears more than once"));
+        }
+        seen.push(name);
+        match name {
+            "selected" => parse_kdl_selected_theme(child, &mut theme.selected)?,
+            "chrome" => theme.chrome = Some(kdl_theme_color(child)?),
+            "muted" => theme.muted = Some(kdl_theme_color(child)?),
+            "accent" => theme.accent = Some(kdl_theme_color(child)?),
+            "working" => theme.working = Some(kdl_theme_color(child)?),
+            "attention" => theme.attention = Some(kdl_theme_color(child)?),
+            "failed" => theme.failed = Some(kdl_theme_color(child)?),
+            "complete" => theme.complete = Some(kdl_theme_color(child)?),
+            unknown => return Err(format!("unknown theme child '{unknown}'")),
+        }
+    }
+    Ok(())
+}
+
+fn kdl_theme_color(node: &kdl::KdlNode) -> Result<String, String> {
+    if node
+        .children()
+        .is_some_and(|children| !children.nodes().is_empty())
+    {
+        return Err(format!(
+            "theme child '{}' cannot have children",
+            node.name().value()
+        ));
+    }
+    let [entry] = node.entries() else {
+        return Err(format!(
+            "theme child '{}' requires exactly one color argument",
+            node.name().value()
+        ));
+    };
+    if entry.name().is_some() {
+        return Err(format!(
+            "theme child '{}' accepts a color argument, not a property",
+            node.name().value()
+        ));
+    }
+    entry.value().as_string().map(str::to_owned).ok_or_else(|| {
+        format!(
+            "theme child '{}' color must be a string",
+            node.name().value()
+        )
+    })
+}
+
+fn parse_kdl_selected_theme(
+    node: &kdl::KdlNode,
+    selected: &mut SelectedThemeSettings,
+) -> Result<(), String> {
+    if node
+        .children()
+        .is_some_and(|children| !children.nodes().is_empty())
+    {
+        return Err("theme selected cannot have children".to_owned());
+    }
+    let mut seen = Vec::new();
+    for entry in node.entries() {
+        let name = entry
+            .name()
+            .map(|name| name.value())
+            .ok_or_else(|| "theme selected accepts properties, not arguments".to_owned())?;
+        if seen.contains(&name) {
+            return Err(format!(
+                "theme selected property '{name}' appears more than once"
+            ));
+        }
+        seen.push(name);
+        let value = entry
+            .value()
+            .as_string()
+            .map(str::to_owned)
+            .ok_or_else(|| format!("theme selected {name} must be a color string"))?;
+        match name {
+            "foreground" => selected.foreground = Some(value),
+            "background" => selected.background = Some(value),
+            unknown => return Err(format!("unknown theme selected property '{unknown}'")),
+        }
+    }
+    Ok(())
+}
+
 fn parse_kdl_bindings(node: &kdl::KdlNode, bindings: &mut BindingSettings) -> Result<(), String> {
     if !node.entries().is_empty() {
         return Err("bindings accepts child nodes, not inline entries".to_owned());
@@ -454,6 +610,7 @@ fn parse_kdl_bindings(node: &kdl::KdlNode, bindings: &mut BindingSettings) -> Re
         match name {
             "leaders" => bindings.leaders = Some(values),
             "palette" => bindings.palette = Some(values),
+            "redraw" => bindings.redraw = Some(values),
             "next-screen" => bindings.next_screen = Some(values),
             "previous-screen" => bindings.previous_screen = Some(values),
             "jump-modifiers" => bindings.jump_modifiers = Some(values),
@@ -470,39 +627,117 @@ fn kdl_bool(value: &kdl::KdlValue, field: &str) -> Result<bool, String> {
 }
 
 fn resolve(title: &str, settings: SettingsFile) -> io::Result<ShellConfig> {
+    let SettingsFile {
+        shell,
+        theme,
+        bindings,
+    } = settings;
     let mut config = ShellConfig::new(title);
-    if let Some(enabled) = settings.shell.mouse_capture {
+    if let Some(enabled) = shell.mouse_capture {
         config.mouse_capture = enabled;
     }
-    if let Some(enabled) = settings.shell.direct_detach {
+    if let Some(enabled) = shell.direct_detach {
         config.direct_detach = enabled;
     }
-    if let Some(milliseconds) = settings.shell.tick_rate_ms {
+    if let Some(milliseconds) = shell.tick_rate_ms {
         if milliseconds == 0 {
             return Err(invalid("shell.tick_rate_ms must be greater than zero"));
         }
         config.tick_rate = Duration::from_millis(milliseconds);
     }
+    resolve_theme(&mut config.theme, theme)?;
 
     let defaults = ShellBindings::default();
     let bindings = ShellBindings {
-        leaders: parse_bindings(settings.bindings.leaders, defaults.leaders, "leaders")?,
-        palette: parse_bindings(settings.bindings.palette, defaults.palette, "palette")?,
-        next_screen: parse_bindings(
-            settings.bindings.next_screen,
-            defaults.next_screen,
-            "next_screen",
-        )?,
+        leaders: parse_bindings(bindings.leaders, defaults.leaders, "leaders")?,
+        palette: parse_bindings(bindings.palette, defaults.palette, "palette")?,
+        redraw: parse_bindings(bindings.redraw, defaults.redraw, "redraw")?,
+        next_screen: parse_bindings(bindings.next_screen, defaults.next_screen, "next_screen")?,
         previous_screen: parse_bindings(
-            settings.bindings.previous_screen,
+            bindings.previous_screen,
             defaults.previous_screen,
             "previous_screen",
         )?,
-        jump_modifiers: parse_modifiers(settings.bindings.jump_modifiers, defaults.jump_modifiers)?,
+        jump_modifiers: parse_modifiers(bindings.jump_modifiers, defaults.jump_modifiers)?,
     };
     validate_bindings(&bindings)?;
     config.bindings = bindings;
     Ok(config)
+}
+
+fn resolve_theme(theme: &mut Theme, settings: ThemeSettings) -> io::Result<()> {
+    apply_foreground(&mut theme.chrome, settings.chrome, "theme.chrome")?;
+    apply_foreground(&mut theme.muted, settings.muted, "theme.muted")?;
+    apply_foreground(&mut theme.accent, settings.accent, "theme.accent")?;
+    apply_foreground(&mut theme.working, settings.working, "theme.working")?;
+    apply_foreground(&mut theme.attention, settings.attention, "theme.attention")?;
+    apply_foreground(&mut theme.failed, settings.failed, "theme.failed")?;
+    apply_foreground(&mut theme.complete, settings.complete, "theme.complete")?;
+    apply_foreground(
+        &mut theme.selected,
+        settings.selected.foreground,
+        "theme.selected.foreground",
+    )?;
+    if let Some(value) = settings.selected.background {
+        theme.selected = theme.selected.bg(parse_color(&value)
+            .map_err(|message| invalid(format!("theme.selected.background: {message}")))?);
+    }
+    Ok(())
+}
+
+fn apply_foreground(style: &mut Style, value: Option<String>, field: &str) -> io::Result<()> {
+    if let Some(value) = value {
+        *style = style
+            .fg(parse_color(&value).map_err(|message| invalid(format!("{field}: {message}")))?);
+    }
+    Ok(())
+}
+
+fn parse_color(value: &str) -> Result<Color, String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    let color = match normalized.as_str() {
+        "default" | "reset" => Color::Reset,
+        "black" => Color::Black,
+        "red" => Color::Red,
+        "green" => Color::Green,
+        "yellow" => Color::Yellow,
+        "blue" => Color::Blue,
+        "magenta" => Color::Magenta,
+        "cyan" => Color::Cyan,
+        "gray" | "grey" => Color::Gray,
+        "dark-gray" | "dark-grey" | "bright-black" => Color::DarkGray,
+        "light-red" | "bright-red" => Color::LightRed,
+        "light-green" | "bright-green" => Color::LightGreen,
+        "light-yellow" | "bright-yellow" => Color::LightYellow,
+        "light-blue" | "bright-blue" => Color::LightBlue,
+        "light-magenta" | "bright-magenta" => Color::LightMagenta,
+        "light-cyan" | "bright-cyan" => Color::LightCyan,
+        "white" | "bright-white" => Color::White,
+        _ => return parse_extended_color(&normalized),
+    };
+    Ok(color)
+}
+
+fn parse_extended_color(value: &str) -> Result<Color, String> {
+    if let Some(hex) = value.strip_prefix('#')
+        && hex.len() == 6
+        && hex.is_ascii()
+        && let (Ok(red), Ok(green), Ok(blue)) = (
+            u8::from_str_radix(&hex[0..2], 16),
+            u8::from_str_radix(&hex[2..4], 16),
+            u8::from_str_radix(&hex[4..6], 16),
+        )
+    {
+        return Ok(Color::Rgb(red, green, blue));
+    }
+    if let Some(index) = value.strip_prefix("indexed-")
+        && let Ok(index) = index.parse::<u8>()
+    {
+        return Ok(Color::Indexed(index));
+    }
+    Err(format!(
+        "unknown color '{value}'; expected a named color, #rrggbb, or indexed-0 through indexed-255"
+    ))
 }
 
 fn parse_bindings(
@@ -570,6 +805,7 @@ fn validate_bindings(bindings: &ShellBindings) -> io::Result<()> {
     let groups = [
         ("leaders", &bindings.leaders),
         ("palette", &bindings.palette),
+        ("redraw", &bindings.redraw),
         ("next_screen", &bindings.next_screen),
         ("previous_screen", &bindings.previous_screen),
     ];
@@ -688,9 +924,29 @@ fn print_resolved_toml(config: &ShellConfig) {
     println!("direct_detach = {}", config.direct_detach);
     println!("tick_rate_ms = {}", config.tick_rate.as_millis());
     println!();
+    println!("[theme]");
+    println!("chrome = \"{}\"", style_foreground(config.theme.chrome));
+    println!("muted = \"{}\"", style_foreground(config.theme.muted));
+    println!("accent = \"{}\"", style_foreground(config.theme.accent));
+    println!("working = \"{}\"", style_foreground(config.theme.working));
+    println!(
+        "attention = \"{}\"",
+        style_foreground(config.theme.attention)
+    );
+    println!("failed = \"{}\"", style_foreground(config.theme.failed));
+    println!("complete = \"{}\"", style_foreground(config.theme.complete));
+    println!();
+    println!("[theme.selected]");
+    println!(
+        "foreground = \"{}\"",
+        style_foreground(config.theme.selected)
+    );
+    println!("background = \"{}\"", color_name(config.theme.selected.bg));
+    println!();
     println!("[bindings]");
     print_binding_list("leaders", &config.bindings.leaders);
     print_binding_list("palette", &config.bindings.palette);
+    print_binding_list("redraw", &config.bindings.redraw);
     print_binding_list("next_screen", &config.bindings.next_screen);
     print_binding_list("previous_screen", &config.bindings.previous_screen);
     let modifiers = config
@@ -717,9 +973,31 @@ fn print_resolved_kdl(config: &ShellConfig) {
         config.tick_rate.as_millis()
     );
     println!();
+    println!("theme {{");
+    println!("    chrome \"{}\"", style_foreground(config.theme.chrome));
+    println!("    muted \"{}\"", style_foreground(config.theme.muted));
+    println!(
+        "    selected foreground=\"{}\" background=\"{}\"",
+        style_foreground(config.theme.selected),
+        color_name(config.theme.selected.bg)
+    );
+    println!("    accent \"{}\"", style_foreground(config.theme.accent));
+    println!("    working \"{}\"", style_foreground(config.theme.working));
+    println!(
+        "    attention \"{}\"",
+        style_foreground(config.theme.attention)
+    );
+    println!("    failed \"{}\"", style_foreground(config.theme.failed));
+    println!(
+        "    complete \"{}\"",
+        style_foreground(config.theme.complete)
+    );
+    println!("}}");
+    println!();
     println!("bindings {{");
     print_kdl_binding_node("leaders", &config.bindings.leaders);
     print_kdl_binding_node("palette", &config.bindings.palette);
+    print_kdl_binding_node("redraw", &config.bindings.redraw);
     print_kdl_binding_node("next-screen", &config.bindings.next_screen);
     print_kdl_binding_node("previous-screen", &config.bindings.previous_screen);
     let values = config
@@ -736,6 +1014,34 @@ fn print_resolved_kdl(config: &ShellConfig) {
         .collect::<String>();
     println!("    jump-modifiers{values}");
     println!("}}");
+}
+
+fn style_foreground(style: Style) -> String {
+    color_name(style.fg)
+}
+
+fn color_name(color: Option<Color>) -> String {
+    match color.unwrap_or(Color::Reset) {
+        Color::Reset => "default".to_owned(),
+        Color::Black => "black".to_owned(),
+        Color::Red => "red".to_owned(),
+        Color::Green => "green".to_owned(),
+        Color::Yellow => "yellow".to_owned(),
+        Color::Blue => "blue".to_owned(),
+        Color::Magenta => "magenta".to_owned(),
+        Color::Cyan => "cyan".to_owned(),
+        Color::Gray => "gray".to_owned(),
+        Color::DarkGray => "dark-gray".to_owned(),
+        Color::LightRed => "light-red".to_owned(),
+        Color::LightGreen => "light-green".to_owned(),
+        Color::LightYellow => "light-yellow".to_owned(),
+        Color::LightBlue => "light-blue".to_owned(),
+        Color::LightMagenta => "light-magenta".to_owned(),
+        Color::LightCyan => "light-cyan".to_owned(),
+        Color::White => "white".to_owned(),
+        Color::Indexed(index) => format!("indexed-{index}"),
+        Color::Rgb(red, green, blue) => format!("#{red:02x}{green:02x}{blue:02x}"),
+    }
 }
 
 fn print_kdl_binding_node(name: &str, bindings: &[KeyBinding]) {
@@ -777,6 +1083,10 @@ mod tests {
             parse_key_binding("Ctrl-PgDown"),
             Ok(KeyBinding::new(KeyCode::PageDown, KeyModifiers::CONTROL))
         );
+        assert_eq!(
+            parse_key_binding("ctrl-/"),
+            Ok(KeyBinding::new(KeyCode::Char('/'), KeyModifiers::CONTROL))
+        );
     }
 
     #[test]
@@ -811,8 +1121,66 @@ mod tests {
         );
         assert_eq!(
             config.bindings.next_screen[0],
-            KeyBinding::new(KeyCode::Right, KeyModifiers::ALT)
+            KeyBinding::new(KeyCode::PageDown, KeyModifiers::CONTROL)
         );
+        assert_eq!(
+            config.bindings.redraw[0],
+            KeyBinding::new(KeyCode::Char('/'), KeyModifiers::CONTROL)
+        );
+        assert_eq!(config.theme.selected.bg, Some(Color::Cyan));
+    }
+
+    #[test]
+    fn kdl_and_toml_theme_colors_resolve_equivalently() {
+        let kdl = r##"theme {
+    chrome "default"
+    selected foreground="white" background="#123456"
+    working "indexed-42"
+}
+"##;
+        let toml = r##"[theme]
+chrome = "default"
+working = "indexed-42"
+
+[theme.selected]
+foreground = "white"
+background = "#123456"
+"##;
+        let kdl = resolve(
+            "test",
+            parse_kdl(kdl, Path::new("config.kdl")).expect("KDL theme should parse"),
+        )
+        .expect("KDL theme should resolve");
+        let toml = resolve(
+            "test",
+            toml::from_str(toml).expect("TOML theme should parse"),
+        )
+        .expect("TOML theme should resolve");
+
+        assert_eq!(kdl.theme.chrome.fg, Some(Color::Reset));
+        assert_eq!(kdl.theme.working.fg, Some(Color::Indexed(42)));
+        assert_eq!(kdl.theme.selected.fg, Some(Color::White));
+        assert_eq!(kdl.theme.selected.bg, Some(Color::Rgb(0x12, 0x34, 0x56)));
+        assert_eq!(kdl.theme.chrome, toml.theme.chrome);
+        assert_eq!(kdl.theme.working, toml.theme.working);
+        assert_eq!(kdl.theme.selected, toml.theme.selected);
+    }
+
+    #[test]
+    fn theme_rejects_unknown_colors_and_children() {
+        let settings: SettingsFile =
+            toml::from_str("[theme]\naccent = \"ultraviolet\"\n").expect("TOML should parse");
+        let error = resolve("test", settings).expect_err("unknown color should fail");
+        assert!(error.to_string().contains("theme.accent"));
+
+        assert!(parse_color("#aébc?").is_err());
+
+        let error = parse_kdl(
+            "theme {\n    surprise \"cyan\"\n}\n",
+            Path::new("config.kdl"),
+        )
+        .expect_err("unknown theme child should fail");
+        assert!(error.to_string().contains("unknown theme child"));
     }
 
     #[test]

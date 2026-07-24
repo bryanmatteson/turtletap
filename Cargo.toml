@@ -1,3 +1,9 @@
+[workspace.package]
+    authors    = ["Bryan Matteson <7145232+bryanmatteson@users.noreply.github.com>"]
+    homepage   = "https://github.com/bryanmatteson/termosaic"
+    license    = "MIT"
+    repository = "https://github.com/bryanmatteson/termosaic"
+
 [package]
     authors      = ["Bryan Matteson <7145232+bryanmatteson@users.noreply.github.com>"]
     autobins     = false

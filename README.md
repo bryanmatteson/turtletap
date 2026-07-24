@@ -10,10 +10,10 @@ TurtleTap owns the shell chrome and behavior:
 - stable surface identity, focus, tabs, and a searchable command palette;
 - clean attach/detach terminal lifecycle;
 - direct `Ctrl-D` detach for shell-managed surfaces;
-- direct `Alt` screen switching, plus a configurable `Ctrl-Space` leader that
+- direct `Ctrl-PageUp` / `Ctrl-PageDown` screen switching, plus a configurable `Ctrl-Space` leader that
   remains available when a surface captures input;
 - background tick and resize delivery for inactive agents and PTYs;
-- change-driven redraws that stay quiet while surfaces are idle;
+- incremental redraws with only a compact liveness pulse while surfaces are idle;
 - contextual help and status without requiring each host to reinvent navigation;
 - deterministic off-screen rendering for tests.
 
@@ -85,7 +85,11 @@ as Shift or Option for native selection.
 
 | Key | Shell-managed surface | Captured surface |
 | --- | --- | --- |
-| `Alt-Left` / `Alt-Right` | Previous / next surface | Previous / next surface |
+| `Alt-Left` / `Alt-Right` | Move by word in command input | Delivered to the surface |
+| `Cmd-Left` / `Cmd-Right` | Beginning / end of command input | Delivered to the surface |
+| `Alt-Backspace` | Delete previous word in command input | Delivered to the surface |
+| `Cmd-Backspace` | Delete to beginning of command input | Delivered to the surface |
+| `Cmd-K` / `Ctrl-L` | Clear command transcript | Delivered to the surface |
 | `Alt-1` … `Alt-9` | Jump to numbered surface | Jump to numbered surface |
 | `Ctrl-PageUp` / `Ctrl-PageDown` | Previous / next surface | Previous / next surface |
 | `PageUp` / `PageDown` | Surface scrollback | Surface scrollback |
@@ -93,6 +97,7 @@ as Shift or Option for native selection.
 | `Ctrl-D` | Detach | Delivered to the surface |
 | `Tab` / `Shift-Tab` | Next / previous surface | Delivered to the surface |
 | `Ctrl-P` | Open command palette | Open command palette |
+| `Ctrl-/` | Clear and redraw terminal frame | Clear and redraw terminal frame |
 | `?` | Contextual help | Delivered to the surface |
 | `Ctrl-Space d` | Detach | Detach |
 | `Ctrl-Space s` | Open command palette | Open command palette |
@@ -160,7 +165,7 @@ attaching. Set `TURTLETAP_SOCKET` to use an explicit local socket path and
 The dashboard is itself screen 1. Use `/` to filter, `Enter` to open the selected
 session, `v` to view, `t` to take its driver lease, and `n`, `r`, or `x` to create,
 rename, or delete. Each opened session becomes another numbered screen; use
-`Alt-Left` / `Alt-Right` to cycle or `Alt-1` … `Alt-9` to jump directly. Named
+`Ctrl-PageUp` / `Ctrl-PageDown` to cycle or `Alt-1` … `Alt-9` to jump directly. Named
 `attach`, `view`, `take`, and `new` commands open the dashboard alongside the
 requested session, so another session is always one switch away. In a session tab,
 `F2` releases the driver and `F3` takes it. Background output adds a `+N` unread
@@ -168,6 +173,9 @@ count to that screen until it is focused. When the tab row is too narrow, `‹` 
 `›` mark hidden screens while the active screen stays visible. `q` closes only the
 dashboard tab, `Ctrl-D` detaches the terminal, `x` deletes only the selected session
 after confirmation, and `!` stops only the leader while preserving all sessions.
+Open tabs reconcile resident metadata in the background: renames update their title,
+deleted sessions close, and a forced driver takeover immediately moves the old
+driver into view-only mode.
 
 ## Settings and keybindings
 
@@ -195,11 +203,23 @@ repeated arguments for binding lists:
 ```kdl
 shell mouse-capture=false direct-detach=true tick-rate-ms=100
 
+theme {
+    chrome "white"
+    muted "dark-gray"
+    selected foreground="black" background="cyan"
+    accent "cyan"
+    working "blue"
+    attention "yellow"
+    failed "red"
+    complete "green"
+}
+
 bindings {
     leaders "ctrl-space" "ctrl-g"
     palette "ctrl-p"
-    next-screen "alt-right" "ctrl-pagedown"
-    previous-screen "alt-left" "ctrl-pageup"
+    redraw "ctrl-/" "ctrl-_"
+    next-screen "ctrl-pagedown"
+    previous-screen "ctrl-pageup"
     jump-modifiers "alt"
 }
 ```
@@ -212,11 +232,25 @@ mouse_capture = false
 direct_detach = true
 tick_rate_ms = 100
 
+[theme]
+chrome = "white"
+muted = "dark-gray"
+accent = "cyan"
+working = "blue"
+attention = "yellow"
+failed = "red"
+complete = "green"
+
+[theme.selected]
+foreground = "black"
+background = "cyan"
+
 [bindings]
 leaders = ["ctrl-space", "ctrl-g"]
 palette = ["ctrl-p"]
-next_screen = ["alt-right", "ctrl-pagedown"]
-previous_screen = ["alt-left", "ctrl-pageup"]
+redraw = ["ctrl-/", "ctrl-_"]
+next_screen = ["ctrl-pagedown"]
+previous_screen = ["ctrl-pageup"]
 jump_modifiers = ["alt"]
 ```
 
@@ -225,6 +259,24 @@ named arrows, navigation keys, `space`, `tab`, `escape`, and `F1` through `F24`
 are supported. An empty list disables that action. Conflicting bindings fail fast
 with the two setting names involved, and the shell footer, palette, and help overlay
 always show the resolved primary chords.
+
+The built-in command inputs reserve `Alt-Left` / `Alt-Right` for word movement and
+`Cmd-Left` / `Cmd-Right` for line boundaries. `Alt-Backspace` deletes the previous
+word; `Cmd-Backspace` deletes to the beginning of the line. Configuring either
+navigation chord as a global screen binding intentionally gives the shell binding
+precedence. Terminal fallbacks are normalized too: `Alt-B` / `Alt-F` move by word,
+and `Ctrl-U` deletes to the beginning of the line instead of inserting text.
+`Ctrl-L` clears the transcript and returns scrollback to the live tail. `Cmd-K`
+does the same when the terminal forwards it. If the terminal consumes Cmd-K and
+clears its own display, press `Ctrl-/` to clear and reconstruct TurtleTap's complete
+frame. The `Ctrl-_` fallback handles terminals that encode the same control byte
+under that key name. The small pulse beside the shell title is the only ambient
+animation.
+
+Theme colors accept the named 16-color terminal palette, `default`, `#rrggbb`,
+and `indexed-0` through `indexed-255`. Status meaning remains visible through text
+and symbols even when colors are customized. Settings are loaded when the shell
+attaches; detach and reopen it after editing the file.
 
 ## Transcript scrollback
 

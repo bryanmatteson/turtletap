@@ -38,7 +38,7 @@ pub(crate) fn draw(frame: &mut Frame<'_>, shell: &mut Shell) {
 fn draw_tabs(frame: &mut Frame<'_>, area: Rect, shell: &mut Shell) {
     shell.tab_hits.clear();
     let mut tab_hits = Vec::with_capacity(shell.entries().count());
-    let host_title = format!(" {} ", shell.config.title);
+    let host_title = format!(" {}{}", shell.config.title, shell.pulse_marker());
     let host_width = cell_width(&host_title);
     let mut spans = vec![
         Span::styled(
@@ -296,6 +296,7 @@ fn draw_help(frame: &mut Frame<'_>, viewport: Rect, shell: &Shell) {
     let next = shell.config.bindings.primary_next_label();
     let jump = shell.config.bindings.primary_jump_label();
     let palette = shell.config.bindings.primary_palette_label();
+    let redraw = shell.config.bindings.primary_redraw_label();
     let leader = shell.config.bindings.primary_leader_label();
     let mut lines = vec![
         help_line(
@@ -305,6 +306,7 @@ fn draw_help(frame: &mut Frame<'_>, viewport: Rect, shell: &Shell) {
         ),
         help_line(&jump, "Jump directly to a numbered screen", shell),
         help_line(&palette, "Open the command palette", shell),
+        help_line(&redraw, "Clear and redraw the terminal frame", shell),
         help_line(
             &format!("{leader} d"),
             "Detach and return to the host terminal",

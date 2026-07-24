@@ -1027,6 +1027,25 @@ impl Surface for CommandSurface {
                 SurfaceAction::Consumed
             }
             SurfaceEvent::Key(key) => {
+                if is_clear_shortcut(&key.code, key.modifiers) {
+                    self.transcript.clear();
+                    self.scrollback.follow();
+                    self.touch();
+                    return SurfaceAction::Consumed;
+                }
+                if let Some(start) =
+                    writing_delete_start(&self.input, self.cursor, &key.code, key.modifiers)
+                {
+                    self.input.drain(start..self.cursor);
+                    self.cursor = start;
+                    return SurfaceAction::Consumed;
+                }
+                if let Some(cursor) =
+                    writing_cursor_target(&self.input, self.cursor, &key.code, key.modifiers)
+                {
+                    self.cursor = cursor;
+                    return SurfaceAction::Consumed;
+                }
                 if key.modifiers.contains(KeyModifiers::CONTROL) {
                     return match key.code {
                         KeyCode::Char('c') => self.interrupt(),
@@ -1041,6 +1060,11 @@ impl Surface for CommandSurface {
                             self.transcript.clear();
                             self.scrollback.follow();
                             self.touch();
+                            SurfaceAction::Consumed
+                        }
+                        KeyCode::Char('u') => {
+                            self.input.drain(..self.cursor);
+                            self.cursor = 0;
                             SurfaceAction::Consumed
                         }
                         KeyCode::Home => {
@@ -1139,6 +1163,11 @@ impl Surface for CommandSurface {
         vec![
             Shortcut::new("Enter", "Run command"),
             Shortcut::new("↑ / ↓", "Command history"),
+            Shortcut::new("Alt-Left / Alt-Right", "Move by word"),
+            Shortcut::new("Cmd-Left / Cmd-Right", "Beginning or end of line"),
+            Shortcut::new("Alt-Backspace", "Delete previous word"),
+            Shortcut::new("Cmd-Backspace", "Delete to beginning of line"),
+            Shortcut::new("Cmd-K / Ctrl-L", "Clear transcript"),
             Shortcut::new("Tab", "Complete added command"),
             Shortcut::new("PgUp / PgDn", "Scroll transcript history"),
             Shortcut::new("Ctrl-Home / Ctrl-End", "Oldest output or live tail"),
@@ -1302,9 +1331,82 @@ fn char_slice_width(characters: &[char]) -> usize {
     Line::from(text).width()
 }
 
+fn writing_cursor_target(
+    input: &[char],
+    cursor: usize,
+    code: &KeyCode,
+    modifiers: KeyModifiers,
+) -> Option<usize> {
+    let cursor = cursor.min(input.len());
+    if modifiers.contains(KeyModifiers::SUPER) {
+        return match code {
+            KeyCode::Left => Some(0),
+            KeyCode::Right => Some(input.len()),
+            _ => None,
+        };
+    }
+    if !modifiers.contains(KeyModifiers::ALT) {
+        return None;
+    }
+    match code {
+        KeyCode::Left | KeyCode::Char('b' | 'B') => Some(previous_word_boundary(input, cursor)),
+        KeyCode::Right | KeyCode::Char('f' | 'F') => Some(next_word_boundary(input, cursor)),
+        _ => None,
+    }
+}
+
+fn is_clear_shortcut(code: &KeyCode, modifiers: KeyModifiers) -> bool {
+    modifiers.contains(KeyModifiers::SUPER) && matches!(code, KeyCode::Char('k' | 'K'))
+}
+
+fn writing_delete_start(
+    input: &[char],
+    cursor: usize,
+    code: &KeyCode,
+    modifiers: KeyModifiers,
+) -> Option<usize> {
+    if *code != KeyCode::Backspace {
+        return None;
+    }
+    let cursor = cursor.min(input.len());
+    if modifiers.contains(KeyModifiers::SUPER) {
+        return Some(0);
+    }
+    modifiers
+        .contains(KeyModifiers::ALT)
+        .then(|| previous_word_boundary(input, cursor))
+}
+
+fn previous_word_boundary(input: &[char], cursor: usize) -> usize {
+    let mut cursor = cursor.min(input.len());
+    while cursor > 0 && !is_word_character(input[cursor - 1]) {
+        cursor -= 1;
+    }
+    while cursor > 0 && is_word_character(input[cursor - 1]) {
+        cursor -= 1;
+    }
+    cursor
+}
+
+fn next_word_boundary(input: &[char], cursor: usize) -> usize {
+    let mut cursor = cursor.min(input.len());
+    while cursor < input.len() && is_word_character(input[cursor]) {
+        cursor += 1;
+    }
+    while cursor < input.len() && !is_word_character(input[cursor]) {
+        cursor += 1;
+    }
+    cursor
+}
+
+fn is_word_character(character: char) -> bool {
+    character.is_alphanumeric() || character == '_'
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use turtletap::KeyEvent;
 
     #[test]
     fn split_command_preserves_the_argument_tail() {
@@ -1409,5 +1511,112 @@ mod tests {
 
         scrollback.follow();
         assert_eq!(scrollback.window(103, 10), (93, 103));
+    }
+
+    #[test]
+    fn natural_writing_keys_move_by_word_and_line() {
+        let input: Vec<_> = "echo alpha-beta gamma".chars().collect();
+        let gamma = input
+            .iter()
+            .position(|character| *character == 'g')
+            .expect("gamma should be present");
+
+        assert_eq!(
+            writing_cursor_target(&input, input.len(), &KeyCode::Left, KeyModifiers::ALT,),
+            Some(gamma)
+        );
+        assert_eq!(
+            writing_cursor_target(&input, 0, &KeyCode::Right, KeyModifiers::ALT),
+            Some(5)
+        );
+        assert_eq!(
+            writing_cursor_target(&input, gamma, &KeyCode::Left, KeyModifiers::SUPER,),
+            Some(0)
+        );
+        assert_eq!(
+            writing_cursor_target(&input, 0, &KeyCode::Right, KeyModifiers::SUPER),
+            Some(input.len())
+        );
+
+        let mut surface = CommandSurface::new().expect("surface should initialize");
+        surface.input = input;
+        surface.cursor = surface.input.len();
+        assert!(matches!(
+            surface.handle(SurfaceEvent::Key(KeyEvent::new(
+                KeyCode::Left,
+                KeyModifiers::ALT,
+            ))),
+            SurfaceAction::Consumed
+        ));
+        assert_eq!(surface.cursor, gamma);
+        surface.handle(SurfaceEvent::Key(KeyEvent::new(
+            KeyCode::Left,
+            KeyModifiers::SUPER,
+        )));
+        assert_eq!(surface.cursor, 0);
+        surface.handle(SurfaceEvent::Key(KeyEvent::new(
+            KeyCode::Right,
+            KeyModifiers::SUPER,
+        )));
+        assert_eq!(surface.cursor, surface.input.len());
+    }
+
+    #[test]
+    fn terminal_fallbacks_navigate_and_delete_naturally() {
+        let mut surface = CommandSurface::new().expect("surface should initialize");
+        surface.input = "echo alpha beta".chars().collect();
+        surface.cursor = surface.input.len();
+
+        surface.handle(SurfaceEvent::Key(KeyEvent::new(
+            KeyCode::Char('b'),
+            KeyModifiers::ALT,
+        )));
+        assert_eq!(surface.input.iter().collect::<String>(), "echo alpha beta");
+        assert_eq!(surface.cursor, 11);
+
+        surface.handle(SurfaceEvent::Key(KeyEvent::new(
+            KeyCode::Char('f'),
+            KeyModifiers::ALT,
+        )));
+        assert_eq!(surface.cursor, surface.input.len());
+
+        surface.handle(SurfaceEvent::Key(KeyEvent::new(
+            KeyCode::Backspace,
+            KeyModifiers::ALT,
+        )));
+        assert_eq!(surface.input.iter().collect::<String>(), "echo alpha ");
+
+        surface.handle(SurfaceEvent::Key(KeyEvent::new(
+            KeyCode::Backspace,
+            KeyModifiers::SUPER,
+        )));
+        assert!(surface.input.is_empty());
+        assert_eq!(surface.cursor, 0);
+
+        surface.input = "fallback".chars().collect();
+        surface.cursor = surface.input.len();
+        surface.handle(SurfaceEvent::Key(KeyEvent::new(
+            KeyCode::Char('u'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(surface.input.is_empty());
+        assert_eq!(surface.cursor, 0);
+    }
+
+    #[test]
+    fn cmd_k_clears_the_transcript_and_returns_to_live_output() {
+        let mut surface = CommandSurface::new().expect("surface should initialize");
+        surface.scrollback.lines_from_bottom = 4;
+        assert!(!surface.transcript.is_empty());
+
+        assert!(matches!(
+            surface.handle(SurfaceEvent::Key(KeyEvent::new(
+                KeyCode::Char('k'),
+                KeyModifiers::SUPER,
+            ))),
+            SurfaceAction::Consumed
+        ));
+        assert!(surface.transcript.is_empty());
+        assert_eq!(surface.scrollback.lines_from_bottom, 0);
     }
 }

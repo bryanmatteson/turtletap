@@ -12,7 +12,7 @@ pub(crate) enum OutputFormat {
 #[cfg(unix)]
 mod unix {
     use std::{
-        collections::{VecDeque, hash_map::DefaultHasher},
+        collections::{BTreeMap, VecDeque, hash_map::DefaultHasher},
         env, fs,
         hash::{Hash, Hasher},
         io::{self, Read, Write},
@@ -31,11 +31,12 @@ mod unix {
         SurfaceEvent, SurfaceStatus,
         resident::{
             ApplicationError, AttachmentMode, ClientCapabilities, ClientEnvelope, ClientHello,
-            ClientInstanceId, ClientRequest, ControlResult, Durability, EffectContext, EffectId,
-            EffectRequest, EventSequence, LeaderLock, LeaseEpoch, MAX_FRAME_SIZE, PROTOCOL_VERSION,
-            RequestId, ResidentApplication, ResidentHost, ResidentHostConfig, ResidentSession,
-            ServerHandshake, ServerMessage, SessionId, SessionSelector, SessionSummary,
-            SessionTransition, ShutdownReason, VersionRange, WireError, encode_frame,
+            ClientInstanceId, ClientRequest, ControlResult, DriverLease, Durability, EffectContext,
+            EffectId, EffectRequest, EventSequence, LeaderLock, LeaseEpoch, MAX_FRAME_SIZE,
+            PROTOCOL_VERSION, RequestId, ResidentApplication, ResidentHost, ResidentHostConfig,
+            ResidentSession, ServerHandshake, ServerMessage, SessionId, SessionSelector,
+            SessionSummary, SessionTransition, ShutdownReason, VersionRange, WireError,
+            encode_frame,
             runtime::tokio::{TokioRuntime, TokioUnixTransport},
         },
         tui::{
@@ -48,7 +49,8 @@ mod unix {
 
     use super::super::{
         CommandSurface, PersistedCommandSurface, RunningCommand, Scrollback, TranscriptEntry,
-        TranscriptKind, char_slice_width, spawn_command, split_command,
+        TranscriptKind, char_slice_width, is_clear_shortcut, spawn_command, split_command,
+        writing_cursor_target, writing_delete_start,
     };
     use super::OutputFormat;
 
@@ -96,6 +98,44 @@ mod unix {
     }
 
     #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    pub(crate) struct ShellRecoveryState {
+        history: Vec<String>,
+        commands: BTreeMap<String, String>,
+        pending: VecDeque<String>,
+        cwd: PathBuf,
+        running_command: Option<String>,
+        last_failed: bool,
+        revision: u64,
+    }
+
+    impl ShellRecoveryState {
+        fn from_surface(surface: &CommandSurface) -> Self {
+            Self {
+                history: surface.history.clone(),
+                commands: surface.commands.clone(),
+                pending: surface.pending.clone(),
+                cwd: surface.cwd.clone(),
+                running_command: surface.started_command.clone(),
+                last_failed: surface.last_failed,
+                revision: surface.revision,
+            }
+        }
+
+        fn apply(&self, surface: &mut CommandSurface) {
+            surface.history.clone_from(&self.history);
+            surface.history_cursor = None;
+            surface.history_draft.clear();
+            surface.commands.clone_from(&self.commands);
+            surface.pending.clone_from(&self.pending);
+            surface.cwd.clone_from(&self.cwd);
+            surface.started_command.clone_from(&self.running_command);
+            surface.running = None;
+            surface.last_failed = self.last_failed;
+            surface.revision = self.revision;
+        }
+    }
+
+    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
     #[serde(tag = "type", rename_all = "snake_case")]
     pub(crate) enum ShellEvent {
         Appended {
@@ -109,11 +149,15 @@ mod unix {
             commands: Vec<String>,
             #[serde(default, skip_serializing_if = "Option::is_none")]
             state: Option<PersistedCommandSurface>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            recovery: Option<ShellRecoveryState>,
         },
         Reset {
             snapshot: SessionSnapshot,
             #[serde(default, skip_serializing_if = "Option::is_none")]
             state: Option<PersistedCommandSurface>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            recovery: Option<ShellRecoveryState>,
         },
     }
 
@@ -131,18 +175,20 @@ mod unix {
                     history: current.history.clone(),
                     commands: current.commands.clone(),
                     state: None,
+                    recovery: None,
                 }
             } else {
                 Self::Reset {
                     snapshot: current.clone(),
                     state: None,
+                    recovery: None,
                 }
             }
         }
 
         fn from_surface(previous: &SessionSnapshot, surface: &CommandSurface) -> Self {
             let current = SessionSnapshot::from_session(surface);
-            let state = surface.persisted();
+            let recovery = ShellRecoveryState::from_surface(surface);
             match Self::between(previous, &current) {
                 Self::Appended {
                     revision,
@@ -163,19 +209,55 @@ mod unix {
                     cwd_label,
                     history,
                     commands,
-                    state: Some(state),
+                    state: None,
+                    recovery: Some(recovery),
                 },
                 Self::Reset { snapshot, .. } => Self::Reset {
                     snapshot,
-                    state: Some(state),
+                    state: None,
+                    recovery: Some(recovery),
                 },
             }
         }
 
-        fn persisted_state(&self) -> Option<&PersistedCommandSurface> {
+        fn replay_into(&self, surface: &mut CommandSurface) -> Result<(), ApplicationError> {
             match self {
-                Self::Appended { state, .. } | Self::Reset { state, .. } => state.as_ref(),
+                Self::Appended {
+                    entries,
+                    state,
+                    recovery,
+                    ..
+                } => {
+                    if let Some(state) = state {
+                        *surface = CommandSurface::restore(state.clone());
+                        return Ok(());
+                    }
+                    let recovery = recovery.as_ref().ok_or_else(missing_recovery_state)?;
+                    surface.transcript.extend(entries.iter().cloned());
+                    let excess = surface
+                        .transcript
+                        .len()
+                        .saturating_sub(super::super::MAX_TRANSCRIPT_LINES);
+                    if excess > 0 {
+                        surface.transcript.drain(..excess);
+                    }
+                    recovery.apply(surface);
+                }
+                Self::Reset {
+                    snapshot,
+                    state,
+                    recovery,
+                } => {
+                    if let Some(state) = state {
+                        *surface = CommandSurface::restore(state.clone());
+                        return Ok(());
+                    }
+                    let recovery = recovery.as_ref().ok_or_else(missing_recovery_state)?;
+                    surface.transcript.clone_from(&snapshot.transcript);
+                    recovery.apply(surface);
+                }
             }
+            Ok(())
         }
 
         fn appended_count(&self, previous: &SessionSnapshot) -> usize {
@@ -363,15 +445,15 @@ mod unix {
         }
 
         fn replay(&mut self, event: &Self::Event) -> Result<(), ApplicationError> {
-            let state = event.persisted_state().ok_or_else(|| {
-                ApplicationError::new(
-                    "legacy_journal_event",
-                    "journal event does not contain replayable application state",
-                )
-            })?;
-            *self = CommandSurface::restore(state.clone());
-            Ok(())
+            event.replay_into(self)
         }
+    }
+
+    fn missing_recovery_state() -> ApplicationError {
+        ApplicationError::new(
+            "legacy_journal_event",
+            "journal event does not contain replayable application state",
+        )
     }
 
     fn shell_transition(
@@ -1252,6 +1334,21 @@ mod unix {
         }
     }
 
+    fn driver_role(
+        lease: Option<DriverLease>,
+        client: ClientInstanceId,
+    ) -> (Option<LeaseEpoch>, AttachmentMode) {
+        let owned = lease
+            .filter(|lease| lease.owner == client)
+            .map(|lease| lease.epoch);
+        let mode = if owned.is_some() {
+            AttachmentMode::Drive
+        } else {
+            AttachmentMode::View
+        };
+        (owned, mode)
+    }
+
     struct RemoteSurface {
         client: SessionClient,
         name: String,
@@ -1266,6 +1363,7 @@ mod unix {
         banner: Option<String>,
         scrollback: Scrollback,
         activity: ScreenActivity,
+        metadata_elapsed: Duration,
     }
 
     impl RemoteSurface {
@@ -1290,7 +1388,55 @@ mod unix {
                 banner: None,
                 scrollback: Scrollback::default(),
                 activity: ScreenActivity::default(),
+                metadata_elapsed: Duration::ZERO,
             })
+        }
+
+        fn refresh_metadata(&mut self) -> SurfaceAction {
+            self.metadata_elapsed = Duration::ZERO;
+            let session = match self.client.session() {
+                Ok(session) => session,
+                Err(error) => return self.fail(error),
+            };
+            let sessions = match self.client.request(ClientRequest::ListSessions) {
+                Ok(ControlResult::Sessions { sessions }) => sessions,
+                Ok(_) => return self.fail("resident returned the wrong list response"),
+                Err(error) => return self.fail(error),
+            };
+            let Some(summary) = sessions.into_iter().find(|summary| summary.id == session) else {
+                return SurfaceAction::Close;
+            };
+            let mut changed = false;
+            if self.name != summary.name {
+                let previous = std::mem::replace(&mut self.name, summary.name);
+                self.banner = Some(format!("Session renamed from '{previous}'."));
+                changed = true;
+            }
+            changed |= self.apply_driver(summary.driver);
+            if changed {
+                SurfaceAction::Consumed
+            } else {
+                SurfaceAction::Ignored
+            }
+        }
+
+        fn apply_driver(&mut self, lease: Option<DriverLease>) -> bool {
+            let (owned, mode) = driver_role(lease, self.client.instance);
+            let Some(attachment) = self.client.attachment.as_mut() else {
+                return false;
+            };
+            let changed = attachment.lease != owned || self.mode != mode;
+            attachment.lease = owned;
+            attachment.mode = mode;
+            self.mode = mode;
+            if changed {
+                self.banner = Some(if mode == AttachmentMode::Drive {
+                    "Driver acquired · input is live.".to_owned()
+                } else {
+                    "Driver changed · viewing only. Press F3 to take over.".to_owned()
+                });
+            }
+            changed
         }
 
         fn take_driver(&mut self) -> SurfaceAction {
@@ -1432,13 +1578,10 @@ mod unix {
                             Err(error) => return self.fail(error),
                         }
                     }
-                    ServerMessage::DriverChanged { lease, .. } => {
-                        if let Some(attachment) = self.client.attachment.as_mut() {
-                            attachment.lease = lease
-                                .filter(|lease| lease.owner == self.client.instance)
-                                .map(|lease| lease.epoch);
-                        }
-                        changed = true;
+                    ServerMessage::DriverChanged { session, lease }
+                        if self.client.session().ok() == Some(session) =>
+                    {
+                        changed |= self.apply_driver(lease);
                     }
                     ServerMessage::ResyncRequired { .. } => {
                         if let Err(error) = self.client.reconnect() {
@@ -1469,7 +1612,9 @@ mod unix {
                         }
                     }
                     ServerMessage::Response { .. } => {}
-                    ServerMessage::Snapshot { .. } | ServerMessage::Event { .. } => {}
+                    ServerMessage::Snapshot { .. }
+                    | ServerMessage::Event { .. }
+                    | ServerMessage::DriverChanged { .. } => {}
                 }
             }
             if changed {
@@ -1716,7 +1861,23 @@ mod unix {
 
         fn handle(&mut self, event: SurfaceEvent) -> SurfaceAction {
             match event {
-                SurfaceEvent::Tick(_) => self.drain_updates(),
+                SurfaceEvent::Tick(elapsed) => {
+                    let updates = self.drain_updates();
+                    if matches!(
+                        &updates,
+                        SurfaceAction::Close | SurfaceAction::Detach | SurfaceAction::Open(_)
+                    ) {
+                        return updates;
+                    }
+                    self.metadata_elapsed += elapsed;
+                    if self.metadata_elapsed < Duration::from_secs(1) {
+                        return updates;
+                    }
+                    match self.refresh_metadata() {
+                        SurfaceAction::Ignored => updates,
+                        metadata => metadata,
+                    }
+                }
                 SurfaceEvent::Paste(text) if self.mode == AttachmentMode::Drive => {
                     let normalized = text.replace(['\r', '\n'], " ");
                     let inserted: Vec<_> = normalized.chars().collect();
@@ -1732,6 +1893,23 @@ mod unix {
                     }
                     if key.code == KeyCode::F(3) {
                         return self.take_driver();
+                    }
+                    if is_clear_shortcut(&key.code, key.modifiers) {
+                        return self.command(ShellCommand::Clear);
+                    }
+                    if self.mode == AttachmentMode::Drive
+                        && let Some(start) =
+                            writing_delete_start(&self.input, self.cursor, &key.code, key.modifiers)
+                    {
+                        self.input.drain(start..self.cursor);
+                        self.cursor = start;
+                        return SurfaceAction::Consumed;
+                    }
+                    if let Some(cursor) =
+                        writing_cursor_target(&self.input, self.cursor, &key.code, key.modifiers)
+                    {
+                        self.cursor = cursor;
+                        return SurfaceAction::Consumed;
                     }
                     if key.modifiers.contains(KeyModifiers::CONTROL) {
                         return match key.code {
@@ -1750,6 +1928,11 @@ mod unix {
                                 SurfaceAction::Consumed
                             }
                             KeyCode::Char('l') => self.command(ShellCommand::Clear),
+                            KeyCode::Char('u') if self.mode == AttachmentMode::Drive => {
+                                self.input.drain(..self.cursor);
+                                self.cursor = 0;
+                                SurfaceAction::Consumed
+                            }
                             KeyCode::Home => {
                                 self.scrollback.top(self.snapshot.transcript.len());
                                 SurfaceAction::Consumed
@@ -1846,6 +2029,11 @@ mod unix {
             vec![
                 Shortcut::new("Enter", "Run command"),
                 Shortcut::new("↑ / ↓", "Command history"),
+                Shortcut::new("Alt-Left / Alt-Right", "Move by word"),
+                Shortcut::new("Cmd-Left / Cmd-Right", "Beginning or end of line"),
+                Shortcut::new("Alt-Backspace", "Delete previous word"),
+                Shortcut::new("Cmd-Backspace", "Delete to beginning of line"),
+                Shortcut::new("Cmd-K / Ctrl-L", "Clear transcript"),
                 Shortcut::new("Tab", "Complete added command"),
                 Shortcut::new("PgUp / PgDn", "Scroll transcript history"),
                 Shortcut::new("Ctrl-Home / Ctrl-End", "Oldest output or live tail"),
@@ -2354,6 +2542,40 @@ mod unix {
         }
 
         #[test]
+        fn recovery_event_size_does_not_scale_with_existing_transcript() {
+            let mut surface = CommandSurface::new().expect("surface should initialize");
+            for index in 0..1_000 {
+                surface.push(
+                    TranscriptKind::Stdout,
+                    format!("{index:04} {}", "x".repeat(200)),
+                );
+            }
+            let previous = SessionSnapshot::from_session(&surface);
+            let baseline = surface.persisted();
+
+            let _ = surface.accept_line(":add greet printf hello".to_owned());
+            assert!(resident_effects(&mut surface).is_empty());
+            let event = ShellEvent::from_surface(&previous, &surface);
+
+            let event_size = serde_json::to_vec(&event)
+                .expect("recovery event should serialize")
+                .len();
+            let checkpoint_size = serde_json::to_vec(&surface.persisted())
+                .expect("checkpoint should serialize")
+                .len();
+            assert!(
+                event_size * 20 < checkpoint_size,
+                "event was {event_size} bytes for a {checkpoint_size}-byte checkpoint"
+            );
+
+            let mut recovered = CommandSurface::restore(baseline);
+            event
+                .replay_into(&mut recovered)
+                .expect("compact event should replay");
+            assert_eq!(recovered.persisted(), surface.persisted());
+        }
+
+        #[test]
         fn transcript_append_count_handles_a_pruned_front() {
             let entry = |text: &str| TranscriptEntry {
                 kind: TranscriptKind::Stdout,
@@ -2381,6 +2603,34 @@ mod unix {
 
             activity.focus();
             assert_eq!(activity.unread_lines, 0);
+        }
+
+        #[test]
+        fn driver_role_tracks_forced_takeover_immediately() {
+            let current = ClientInstanceId::new();
+            let other = ClientInstanceId::new();
+            let epoch = LeaseEpoch(7);
+
+            assert_eq!(
+                driver_role(
+                    Some(DriverLease {
+                        owner: current,
+                        epoch,
+                    }),
+                    current,
+                ),
+                (Some(epoch), AttachmentMode::Drive)
+            );
+            assert_eq!(
+                driver_role(
+                    Some(DriverLease {
+                        owner: other,
+                        epoch: LeaseEpoch(8),
+                    }),
+                    current,
+                ),
+                (None, AttachmentMode::View)
+            );
         }
     }
 }

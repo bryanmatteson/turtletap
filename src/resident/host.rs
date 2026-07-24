@@ -592,7 +592,7 @@ where
                     envelope,
                 } => {
                     if let Some(reason) = self.handle_request(connection, envelope)? {
-                        self.shutdown(reason).await;
+                        self.shutdown(reason).await?;
                         return Ok(());
                     }
                 }
@@ -629,6 +629,7 @@ where
                         .core
                         .rename_session(session, name)
                         .map_err(wire_state)?;
+                    self.persist_manifest(session).map_err(wire_io)?;
                     self.persist_checkpoint(session).map_err(wire_io)?;
                     Ok(ControlResult::Renamed { session: summary })
                 }
@@ -719,6 +720,7 @@ where
                 log_sequence: EventSequence(0),
             },
         );
+        self.persist_manifest(id).map_err(wire_io)?;
         self.persist_checkpoint(id).map_err(wire_io)?;
         Ok(ControlResult::Created { session: summary })
     }
@@ -859,7 +861,10 @@ where
             }
             hosted.pending_effects.extend(pending);
         }
-        self.persist_checkpoint(session)?;
+        // The transition journal is the synchronous durability boundary. A
+        // checkpoint is refreshed when the host starts and at session identity
+        // changes; rewriting the complete application state here makes command
+        // acknowledgement scale with the size of an existing session.
         for event in emitted {
             self.record_and_broadcast(session, event.sequence, event.event)?;
         }
@@ -992,7 +997,6 @@ where
                 attempt,
             },
         )?;
-        self.persist_checkpoint(session)?;
         let cancellation = EffectCancellation::new();
         self.sessions
             .get_mut(&session)
@@ -1141,7 +1145,6 @@ where
             .ok_or_else(|| io::Error::other("unknown resident session"))?;
         let directory = self.session_directory(session);
         prepare_private_directory(&directory)?;
-        self.persist_manifest(session)?;
         let stored = StoredSession {
             host_version: HOST_STORAGE_VERSION,
             application_version: A::STORAGE_VERSION,
@@ -1275,11 +1278,14 @@ where
         }
     }
 
-    async fn shutdown(&mut self, reason: ShutdownReason) {
+    async fn shutdown(&mut self, reason: ShutdownReason) -> io::Result<()> {
         for hosted in self.sessions.values() {
             if let Some(active) = &hosted.active_effect {
                 active.cancellation.cancel();
             }
+        }
+        for session in self.sessions.keys().copied().collect::<Vec<_>>() {
+            self.persist_checkpoint(session)?;
         }
         let clients: Vec<_> = self.clients.values().cloned().collect();
         for client in &clients {
@@ -1288,6 +1294,7 @@ where
         for client in &clients {
             let _ = client.send(ServerMessage::Shutdown { reason }).await;
         }
+        Ok(())
     }
 }
 
