@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.1 — 2026-07-25
+
+- Updated the optional Termosaic integration to 0.2.2 and its Laidout 0.3
+  layout backend.
+
 ## 0.2.0 — 2026-07-24
 
 - Added the installable `turtletap` command and durable resident sessions.

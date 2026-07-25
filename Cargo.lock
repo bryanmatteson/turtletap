@@ -575,9 +575,9 @@ dependencies = [
 
 [[package]]
 name = "laidout"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3390c84581479b42f6070714281452861266b06fe92f6218cf41b3efae1adecb"
+checksum = "8d9753fd4e88ad53d426fd50d2373a3df330a742a9a5785be471ed163ff08ead"
 dependencies = [
  "thiserror 2.0.19",
  "unicode-width 0.2.2",
@@ -1123,9 +1123,9 @@ dependencies = [
 
 [[package]]
 name = "termosaic"
-version = "0.2.1"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6da991189dd14543fdd97904daeb6c2cfb2cd6720e3831e32ce110a16931deba"
+checksum = "fe7be39a65a8e40f0a69b0726e59d5ecf6f19d34fa7f61f8c77e4e1c7ffc8e41"
 dependencies = [
  "console",
  "laidout",
@@ -1295,7 +1295,7 @@ checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
 
 [[package]]
 name = "turtletap"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-channel",
  "crc32fast",
@@ -1314,7 +1314,7 @@ dependencies = [
 
 [[package]]
 name = "turtletap-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "clap",
  "clap_complete",

@@ -31,7 +31,7 @@ off-screen rendering. It depends on `crossterm` and `ratatui`.
 turtletap = { version = "0.2", features = ["tokio"] }
 ```
 
-Termosaic 0.2.1 integrates at the surface boundary:
+Termosaic 0.2.2 integrates at the surface boundary:
 
 ```toml
 turtletap = { version = "0.2", features = ["termosaic"] }
