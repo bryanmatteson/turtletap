@@ -31,7 +31,7 @@
     readme                 = "README.md"
     repository.workspace   = true
     rust-version.workspace = true
-    version                = "0.2.2"
+    version                = "0.3.0"
 
 [features]
     # The Shell/Surface half compiles against crossterm and ratatui alone.
