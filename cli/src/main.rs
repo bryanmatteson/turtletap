@@ -115,8 +115,12 @@ fn dispatch(
         Command::Take { name, yes } => {
             finish(commands::take(&name, yes, no_input, interactive), format)
         }
-        Command::New { name, no_attach } => finish(
-            commands::create(&name, no_attach, interactive, format),
+        Command::New {
+            name,
+            path,
+            no_attach,
+        } => finish(
+            commands::create(&name, path.as_deref(), no_attach, interactive, format),
             format,
         ),
         Command::Rename { old, new } => finish(commands::rename(&old, &new, format), format),

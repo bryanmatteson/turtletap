@@ -10,6 +10,8 @@ mod surface;
 mod terminal;
 #[cfg(feature = "termosaic")]
 pub mod termosaic;
+#[cfg(feature = "termosaic")]
+pub use ::termosaic::laidout as layout;
 mod theme;
 
 pub use crossterm::event::{

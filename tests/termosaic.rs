@@ -67,6 +67,15 @@ impl Surface for ReportSurface {
 }
 
 #[test]
+fn termosaic_and_layout_are_public_version_aligned_reexports() {
+    let semantic: ::termosaic::Doc = turtletap::termosaic::Doc::empty();
+    let generic: ::termosaic::laidout::Doc<()> = turtletap::layout::Doc::empty();
+
+    assert_eq!(semantic, ::termosaic::Doc::empty());
+    assert_eq!(generic, ::termosaic::laidout::Doc::empty());
+}
+
+#[test]
 fn semantic_document_renders_through_a_turtletap_surface() {
     let mut shell = Shell::new(ShellConfig::new("Termosaic"));
     shell.add_surface(ReportSurface::new());

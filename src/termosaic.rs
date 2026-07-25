@@ -1,6 +1,6 @@
 //! Termosaic semantic-document integration.
 //!
-//! This module re-exports the matching Termosaic crates and provides
+//! This module re-exports the complete Termosaic API and provides
 //! [`SurfaceRenderer`], the retained path from a prepared semantic document to
 //! a TurtleTap surface's frame.
 

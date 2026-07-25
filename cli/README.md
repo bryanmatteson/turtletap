@@ -22,8 +22,8 @@ same state after resident replacement.
 | Command | Result |
 | --- | --- |
 | `turtletap` or `turtletap open` | Start the resident when absent; open the dashboard |
-| `turtletap new NAME` | Create and attach as driver |
-| `turtletap new NAME --no-attach` | Create without a TUI |
+| `turtletap new NAME [PATH]` | Create and attach as driver; start in PATH or the current directory |
+| `turtletap new NAME [PATH] --no-attach` | Create without a TUI |
 | `turtletap rename OLD NEW` | Rename durable session state |
 | `turtletap attach NAME` | Attach as driver |
 | `turtletap view NAME` | Attach without mutation authority |

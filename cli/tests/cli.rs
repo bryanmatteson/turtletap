@@ -413,6 +413,135 @@ fn noninteractive_create_delete_and_stop_have_safe_machine_contracts() {
 
 #[test]
 #[cfg(unix)]
+fn new_uses_an_explicit_path_or_the_callers_current_directory() {
+    let isolated = std::path::PathBuf::from("/tmp").join(format!(
+        "turtletap-cli-new-path-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should follow the Unix epoch")
+            .as_nanos()
+    ));
+    let explicit = isolated.join("explicit workspace");
+    let implicit = isolated.join("implicit-workspace");
+    std::fs::create_dir_all(&explicit).expect("explicit workspace should be created");
+    std::fs::create_dir_all(&implicit).expect("implicit workspace should be created");
+    let explicit = std::fs::canonicalize(explicit).expect("explicit workspace should canonicalize");
+    let implicit = std::fs::canonicalize(implicit).expect("implicit workspace should canonicalize");
+    let socket = isolated.join("resident.sock");
+    let state = isolated.join("state");
+    let invoke_from = |directory: &std::path::Path, arguments: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_turtletap"))
+            .args(arguments)
+            .current_dir(directory)
+            .env("TURTLETAP_SOCKET", &socket)
+            .env("TURTLETAP_STATE_DIR", &state)
+            .output()
+            .expect("turtletap should run")
+    };
+
+    let explicit_result = invoke_from(
+        &isolated,
+        &["new", "explicit", "explicit workspace", "--no-attach"],
+    );
+    assert!(explicit_result.status.success(), "{explicit_result:?}");
+    let explicit_json: serde_json::Value = serde_json::from_slice(&explicit_result.stdout)
+        .expect("explicit creation should emit JSON");
+    assert_eq!(explicit_json["cwd"], explicit.to_string_lossy().as_ref());
+
+    let implicit_result = invoke_from(&implicit, &["new", "implicit", "--no-attach"]);
+    assert!(implicit_result.status.success(), "{implicit_result:?}");
+    let implicit_json: serde_json::Value = serde_json::from_slice(&implicit_result.stdout)
+        .expect("implicit creation should emit JSON");
+    assert_eq!(implicit_json["cwd"], implicit.to_string_lossy().as_ref());
+
+    let first_stop = invoke_from(&isolated, &["stop"]);
+    assert!(first_stop.status.success(), "{first_stop:?}");
+    let restarted = invoke_from(&isolated, &["start"]);
+    assert!(restarted.status.success(), "{restarted:?}");
+    let listed = invoke_from(&isolated, &["list"]);
+    assert!(listed.status.success(), "{listed:?}");
+    let sessions: serde_json::Value =
+        serde_json::from_slice(&listed.stdout).expect("list should emit JSON");
+    let sessions = sessions.as_array().expect("list should be an array");
+    let explicit_session = sessions
+        .iter()
+        .find(|session| session["name"] == "explicit")
+        .expect("explicit session should recover");
+    let implicit_session = sessions
+        .iter()
+        .find(|session| session["name"] == "implicit")
+        .expect("implicit session should recover");
+    assert_eq!(
+        explicit_session["digest"]["cwd"],
+        explicit.to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        implicit_session["digest"]["cwd"],
+        implicit.to_string_lossy().as_ref()
+    );
+
+    let final_stop = invoke_from(&isolated, &["stop"]);
+    assert!(final_stop.status.success(), "{final_stop:?}");
+    let _ = std::fs::remove_dir_all(isolated);
+}
+
+#[test]
+#[cfg(unix)]
+fn new_rejects_an_invalid_path_before_starting_the_resident() {
+    let isolated = std::path::PathBuf::from("/tmp").join(format!(
+        "turtletap-cli-new-invalid-path-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should follow the Unix epoch")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&isolated).expect("isolated directory should be created");
+    let socket = isolated.join("resident.sock");
+    let state = isolated.join("state");
+    let file = isolated.join("not-a-directory");
+    std::fs::write(&file, "file").expect("test file should be created");
+    let invoke = |path: &std::path::Path| {
+        Command::new(env!("CARGO_BIN_EXE_turtletap"))
+            .args(["--format", "json", "new", "build"])
+            .arg(path)
+            .arg("--no-attach")
+            .current_dir(&isolated)
+            .env("TURTLETAP_SOCKET", &socket)
+            .env("TURTLETAP_STATE_DIR", &state)
+            .output()
+            .expect("turtletap should run")
+    };
+
+    let missing = invoke(std::path::Path::new("missing"));
+    assert_eq!(missing.status.code(), Some(2), "{missing:?}");
+    assert!(
+        String::from_utf8_lossy(&missing.stderr)
+            .contains("session path does not resolve to an existing directory"),
+        "{missing:?}"
+    );
+
+    let not_directory = invoke(&file);
+    assert_eq!(not_directory.status.code(), Some(2), "{not_directory:?}");
+    assert!(
+        String::from_utf8_lossy(&not_directory.stderr).contains("session path is not a directory"),
+        "{not_directory:?}"
+    );
+    assert!(
+        !socket.exists(),
+        "invalid input must not start the resident"
+    );
+    assert!(
+        !state.exists(),
+        "invalid input must not create durable state"
+    );
+
+    let _ = std::fs::remove_dir_all(isolated);
+}
+
+#[test]
+#[cfg(unix)]
 fn start_create_alias_rename_doctor_and_human_list_form_a_complete_cli_lifecycle() {
     let isolated = std::path::PathBuf::from("/tmp").join(format!(
         "turtletap-cli-lifecycle-{}-{}",

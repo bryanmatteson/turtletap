@@ -298,6 +298,20 @@ impl CommandSurface {
         Ok(surface)
     }
 
+    pub(crate) fn set_working_directory(&mut self, path: PathBuf) -> io::Result<()> {
+        let path = path.canonicalize()?;
+        if !path.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("session path is not a directory: {}", path.display()),
+            ));
+        }
+        self.cwd = path;
+        self.last_failed = false;
+        self.touch();
+        Ok(())
+    }
+
     pub(crate) fn push(&mut self, kind: TranscriptKind, text: impl Into<String>) {
         self.transcript.push(TranscriptEntry {
             kind,
@@ -764,13 +778,9 @@ impl CommandSurface {
         } else {
             self.cwd.join(requested)
         };
-        match path.canonicalize() {
-            Ok(path) if path.is_dir() => {
-                self.cwd = path;
-                self.last_failed = false;
-                self.touch();
-            }
-            Ok(_) => {
+        match self.set_working_directory(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::InvalidInput => {
                 self.last_failed = true;
                 self.push(
                     TranscriptKind::Error,
@@ -1180,6 +1190,7 @@ impl CommandSurface {
             "complete"
         };
         serde_json::json!({
+            "cwd": self.cwd,
             "preview": preview,
             "status": status,
         })

@@ -1,7 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.2.2 — 2026-07-25
 
+- Added `turtletap new NAME [PATH]`; sessions start in the selected directory
+  or the caller's current directory.
+- Re-exported Termosaic through `turtletap::termosaic` and the version-aligned
+  Laidout 0.3 API through `turtletap::layout`.
 - Added `TerminalRuntime` and the non-`Send` `TerminalApplication` contract so
   thread-affine products can reuse terminal setup, restoration, input, resize,
   and ticks without adopting TurtleTap's multiplexed shell.

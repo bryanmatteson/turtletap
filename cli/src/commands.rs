@@ -18,7 +18,7 @@ pub(crate) struct InteractiveOptions {
 #[cfg(unix)]
 mod imp {
     use std::{
-        env,
+        env, fs,
         io::{self, BufRead as _, IsTerminal as _, Write as _},
         os::unix::process::CommandExt,
         path::{Path, PathBuf},
@@ -38,7 +38,7 @@ mod imp {
     };
 
     use super::{InteractiveOptions, OutputFormat};
-    use crate::app::ShellApplication;
+    use crate::app::{ShellApplication, ShellCommand};
     use crate::async_client;
     use crate::client::{SessionClient, protocol_error};
     use crate::command::split_command;
@@ -109,11 +109,13 @@ mod imp {
 
     pub(crate) fn create(
         name: &str,
+        requested_directory: Option<&Path>,
         no_attach: bool,
         options: InteractiveOptions,
         format: OutputFormat,
     ) -> io::Result<()> {
         validate_session_name(name)?;
+        let directory = resolve_start_directory(requested_directory)?;
         if !no_attach {
             interactive_preflight(options)?;
         }
@@ -129,15 +131,34 @@ mod imp {
                 "resident returned the wrong create response",
             ));
         };
+        if let Err(error) = initialize_session_directory(&mut client, &session, &directory) {
+            let cleanup = client.request(ClientRequest::StopSession {
+                session: session.id,
+            });
+            return match cleanup {
+                Ok(ControlResult::Stopping) => Err(error),
+                Ok(_) => Err(io::Error::other(format!(
+                    "{error}; resident returned the wrong cleanup response"
+                ))),
+                Err(cleanup) => Err(io::Error::other(format!(
+                    "{error}; session cleanup failed: {cleanup}"
+                ))),
+            };
+        }
         if no_attach {
             if format == OutputFormat::Json {
                 return print_json(&serde_json::json!({
                     "created": true,
                     "session": session_json(&session),
+                    "cwd": directory,
                     "attached": false,
                 }));
             }
-            println!("Created session '{}'.", session.name);
+            println!(
+                "Created session '{}' in {}.",
+                session.name,
+                directory.display()
+            );
             println!(
                 "Attach with: turtletap attach {}",
                 shell_word(&session.name)
@@ -145,6 +166,86 @@ mod imp {
             return Ok(());
         }
         attach_path(&path, &session.name, AttachmentMode::Drive, false, options)
+    }
+
+    fn initialize_session_directory(
+        client: &mut SessionClient,
+        session: &turtletap::resident::SessionSummary,
+        directory: &Path,
+    ) -> io::Result<()> {
+        let attached = client.request(ClientRequest::Attach {
+            session: SessionSelector::Id(session.id),
+            mode: AttachmentMode::Drive,
+            after: None,
+            force: false,
+        })?;
+        let ControlResult::Attached {
+            session: attached,
+            lease: Some(lease),
+        } = attached
+        else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "resident returned the wrong initialization attach response",
+            ));
+        };
+        if attached.id != session.id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "resident attached the wrong session during initialization",
+            ));
+        }
+        let command = serde_json::to_value(ShellCommand::SetWorkingDirectory {
+            path: directory.to_owned(),
+        })
+        .map_err(protocol_error)?;
+        let accepted = client.request(ClientRequest::Command {
+            session: session.id,
+            lease,
+            command,
+        })?;
+        if !matches!(
+            accepted,
+            ControlResult::Accepted {
+                session: accepted,
+                ..
+            } if accepted == session.id
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "resident returned the wrong directory initialization response",
+            ));
+        }
+        let _ = client.request(ClientRequest::Detach {
+            session: session.id,
+        });
+        Ok(())
+    }
+
+    fn resolve_start_directory(requested: Option<&Path>) -> io::Result<PathBuf> {
+        let current = env::current_dir()?;
+        let requested = requested.unwrap_or_else(|| Path::new("."));
+        let candidate = if requested.is_absolute() {
+            requested.to_owned()
+        } else {
+            current.join(requested)
+        };
+        let directory = fs::canonicalize(&candidate).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "session path does not resolve to an existing directory: {} ({error})",
+                    candidate.display()
+                ),
+            )
+        })?;
+        if !directory.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("session path is not a directory: {}", directory.display()),
+            ));
+        }
+        Ok(directory)
     }
 
     pub(crate) fn rename(old: &str, new: &str, format: OutputFormat) -> io::Result<()> {
@@ -846,6 +947,7 @@ pub(crate) fn take(
 #[cfg(not(unix))]
 pub(crate) fn create(
     _name: &str,
+    _requested_directory: Option<&std::path::Path>,
     _no_attach: bool,
     _options: InteractiveOptions,
     _format: OutputFormat,

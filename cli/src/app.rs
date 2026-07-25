@@ -49,6 +49,7 @@ impl SessionSnapshot {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum ShellCommand {
     Prepare,
+    SetWorkingDirectory { path: PathBuf },
     Submit { line: String },
     Interrupt,
     Clear,
@@ -380,6 +381,10 @@ impl ResidentSession for CommandSurface {
                 } else {
                     vec![EffectRequest::at_least_once(ShellEffect::PrepareWorker)]
                 }
+            }
+            ShellCommand::SetWorkingDirectory { path } => {
+                self.set_working_directory(path).map_err(shell_io)?;
+                Vec::new()
             }
             ShellCommand::Submit { line } => {
                 let _ = self.accept_line(line);

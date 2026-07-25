@@ -1224,9 +1224,9 @@ dependencies = [
 
 [[package]]
 name = "termosaic"
-version = "0.2.2"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe7be39a65a8e40f0a69b0726e59d5ecf6f19d34fa7f61f8c77e4e1c7ffc8e41"
+checksum = "bb9347695e200952ac854d569fcf0ac4249d1a019cddc780b44874b07a057506"
 dependencies = [
  "console",
  "laidout",
@@ -1237,9 +1237,9 @@ dependencies = [
 
 [[package]]
 name = "termosaic-ratatui"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "541b41c85b0eb17add96d9db67d4b3421c9b1dbaf556d4b8f6b221020b3a49e9"
+checksum = "dfe4bb71a330449a8e5e4463e1d3d965b29a026e7aabae7b5e9affa89ff763aa"
 dependencies = [
  "ratatui-core",
  "termosaic",
@@ -1396,7 +1396,7 @@ checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
 
 [[package]]
 name = "turtletap"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-channel",
  "crc32fast",

@@ -69,6 +69,9 @@ pub(crate) enum Command {
     #[command(name = "new", alias = "create")]
     New {
         name: String,
+        /// Directory where the session starts; defaults to the current directory.
+        #[arg(value_name = "PATH")]
+        path: Option<PathBuf>,
         /// Create the session without opening the TUI.
         #[arg(long)]
         no_attach: bool,
