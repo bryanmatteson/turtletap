@@ -778,12 +778,24 @@ mod imp {
     }
 
     fn process_exists(pid: u32) -> bool {
-        Command::new("kill")
+        let exists = Command::new("kill")
             .args(["-0", &pid.to_string()])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .is_ok_and(|status| status.success())
+            .is_ok_and(|status| status.success());
+        if !exists {
+            return false;
+        }
+        Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .map_or(true, |output| {
+                !output.status.success()
+                    || !String::from_utf8_lossy(&output.stdout)
+                        .trim()
+                        .starts_with('Z')
+            })
     }
 
     pub(crate) fn is_detach_command(line: &str) -> bool {

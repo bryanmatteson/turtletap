@@ -1078,6 +1078,7 @@ fn verify_group_leader(group: u32) -> io::Result<()> {
 fn signal_group(group: u32, signal: &str) -> io::Result<()> {
     let status = Command::new("kill")
         .arg(signal)
+        .arg("--")
         .arg(format!("-{group}"))
         .status()?;
     if status.success() || !group_has_live_processes(group) {
@@ -1110,6 +1111,7 @@ fn terminate_child_group(child: &mut Child) -> io::Result<()> {
     let group = child.id();
     let status = Command::new("kill")
         .arg("-KILL")
+        .arg("--")
         .arg(format!("-{group}"))
         .status()?;
     let _ = child.wait();

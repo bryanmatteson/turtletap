@@ -43,7 +43,7 @@ jobs:
       - name: Test CLI
         run: cargo test -p turtletap-cli --all-features --bins --test cli
       - name: Test resident lifecycle serially
-        run: cargo test -p turtletap-cli --test resident -- --test-threads=1
+        run: cargo test --release -p turtletap-cli --test resident -- --test-threads=1
       - name: Test crate documentation
         run: cargo test -p turtletap --all-features --doc
       - name: Build library documentation

@@ -1927,6 +1927,7 @@ pub(crate) fn terminate_child(child: &mut Child) -> io::Result<()> {
 pub(crate) fn signal_child_group(child: &Child, signal: &str) -> io::Result<()> {
     let status = Command::new("kill")
         .arg(signal)
+        .arg("--")
         .arg(format!("-{}", child.id()))
         .status()?;
     if status.success() {
