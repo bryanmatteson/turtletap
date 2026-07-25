@@ -5,12 +5,12 @@
     edition.workspace      = true
     homepage.workspace     = true
     keywords               = ["terminal", "tui", "shell", "session", "multiplexer"]
-license.workspace      = true
-name                   = "turtletap-cli"
-readme                 = "README.md"
-repository.workspace   = true
-rust-version.workspace = true
-version                = "0.2.0"
+    license.workspace      = true
+    name                   = "turtletap-cli"
+    readme                 = "README.md"
+    repository.workspace   = true
+    rust-version.workspace = true
+    version                = "0.2.0"
 
 [[bin]]
     name = "turtletap"

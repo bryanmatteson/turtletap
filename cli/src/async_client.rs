@@ -93,6 +93,29 @@ impl Drop for SessionHandle {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn test_handle() -> (
+    SessionHandle,
+    mpsc::Receiver<ClientOperation>,
+    mpsc::Sender<ClientEvent>,
+    watch::Receiver<bool>,
+) {
+    let (operation_tx, operation_rx) = mpsc::channel(OPERATION_CAPACITY);
+    let (event_tx, event_rx) = mpsc::channel(EVENT_CAPACITY);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    (
+        SessionHandle {
+            operations: operation_tx,
+            events: event_rx,
+            shutdown: shutdown_tx,
+            next_operation: 1,
+        },
+        operation_rx,
+        event_tx,
+        shutdown_rx,
+    )
+}
+
 pub(crate) async fn connect_and_attach(
     path: &Path,
     selector: SessionSelector,

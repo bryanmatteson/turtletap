@@ -28,21 +28,31 @@ jobs:
         run: |
           cargo check -p turtletap --no-default-features
           cargo check -p turtletap --features resident
+          cargo check -p turtletap --features async-shell
+          cargo check -p turtletap --features tokio
       - name: Verify dependency boundaries
         run: |
           test -z "$(cargo tree -p turtletap --all-features | grep -E '(^| )(kdl|toml) v' || true)"
-          test -z "$(grep -R -n UnixStream cli/src || true)"
+          test -z "$(grep -R -n --exclude=command.rs --exclude=worker.rs UnixStream cli/src || true)"
           grep -R -n 'blocking::Client' cli/src
           test "$(grep -R -E -n 'fn [A-Za-z0-9_]*_is_newer' src cli/src | wc -l | tr -d ' ')" = 1
       - name: Lint workspace
         run: cargo clippy --workspace --all-features --all-targets -- -D warnings
       - name: Test library
-        run: cargo test -p turtletap --all-features
+        run: cargo test -p turtletap --all-features --all-targets
       - name: Test workspace
-        run: cargo test --workspace --all-features
+        run: cargo test --workspace --all-features --all-targets
+      - name: Test resident lifecycle serially
+        run: cargo test -p turtletap-cli --test resident -- --test-threads=1
+      - name: Test crate documentation
+        run: cargo test -p turtletap --all-features --doc
       - name: Build library documentation
         run: RUSTDOCFLAGS="-D warnings" cargo doc -p turtletap --all-features --no-deps
+      - name: Build CLI documentation
+        run: RUSTDOCFLAGS="-D warnings" cargo doc -p turtletap-cli --all-features --no-deps
       - name: Verify library release package
         run: cargo package -p turtletap --locked
+      - name: Verify CLI release package
+        run: cargo package -p turtletap-cli --locked --config 'patch.crates-io.turtletap.path="."'
       - name: Verify CLI installation
         run: cargo install --path cli --locked --root "${{ runner.temp }}/turtletap-install"

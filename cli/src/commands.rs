@@ -389,15 +389,25 @@ mod imp {
             return Ok(());
         }
         let mut client = SessionClient::connect(&path)?;
+        let pid = match client.request(ClientRequest::Status)? {
+            ControlResult::Status { pid, .. } => pid,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "resident returned the wrong status response before shutdown",
+                ));
+            }
+        };
         let _ = client.request(ClientRequest::StopLeader)?;
+        drop(client);
         let deadline = Instant::now() + START_TIMEOUT;
-        while path.exists() && Instant::now() < deadline {
+        while (path.exists() || process_exists(pid)) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(20));
         }
-        if path.exists() {
+        if path.exists() || process_exists(pid) {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                "resident acknowledged shutdown but did not release its socket",
+                "resident acknowledged shutdown but did not exit",
             ));
         }
         if format == OutputFormat::Json {
@@ -452,7 +462,6 @@ mod imp {
     pub(crate) fn serve(path: PathBuf) -> io::Result<()> {
         supervisor::validate_socket_path(&path)?;
         let state_dir = state_dir(&path);
-        let worker_state_dir = state_dir.with_extension("workers");
         let mut config =
             ResidentHostConfig::new(&path, state_dir.clone(), env!("CARGO_PKG_VERSION"))
                 .with_initial_session(DEFAULT_SESSION);
@@ -461,7 +470,7 @@ mod imp {
         config.event_history = EVENT_HISTORY;
         config.durability = Durability::Flush;
         blocking::serve(ResidentHost::new(
-            ShellApplication::new(worker_state_dir),
+            ShellApplication::new(state_dir, config.durability),
             TokioRuntime,
             TokioUnixTransport,
             config,
@@ -768,6 +777,15 @@ mod imp {
         }
     }
 
+    fn process_exists(pid: u32) -> bool {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
     pub(crate) fn is_detach_command(line: &str) -> bool {
         matches!(split_command(line).0, ":quit" | ":detach" | "exit")
     }
@@ -887,6 +905,6 @@ pub(crate) fn serve(_path: PathBuf) -> io::Result<()> {
 fn unsupported() -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "resident sessions currently require a Unix platform",
+        "resident sessions require a Unix platform",
     ))
 }

@@ -13,7 +13,7 @@ use crate::commands::OutputFormat;
     version,
     about = "Persistent, reconnectable terminal command sessions",
     long_about = "TurtleTap hosts durable command sessions in a terminal dashboard.\n\
-                  Persistent sessions currently require Unix. Child commands are non-interactive;\n\
+                  Persistent sessions require Unix. Child commands are non-interactive;\n\
                   stdin is closed so TurtleTap remains the sole owner of terminal input.",
     after_help = "Environment:\n  \
                   TURTLETAP_CONFIG     Explicit .kdl or .toml configuration\n  \

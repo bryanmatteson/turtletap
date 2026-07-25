@@ -34,9 +34,9 @@ pub enum ExchangeItem {
 pub enum ClientError {
     /// Local transport failed.
     Io(std::io::Error),
-    /// A frame could not be encoded.
+    /// Frame encoding failed.
     Frame(super::FrameError),
-    /// A payload could not be decoded.
+    /// Payload decoding failed.
     Json(serde_json::Error),
     /// Leader selected an unsupported protocol.
     IncompatibleProtocol(ProtocolRejection),
@@ -180,7 +180,7 @@ impl<T: Transport> ResidentClient<T> {
             .find(|attachment| attachment.session.id == current)
     }
 
-    /// Every session this connection is currently subscribed to.
+    /// Every session subscribed through this connection.
     #[must_use]
     pub fn attachments(&self) -> impl ExactSizeIterator<Item = &Attachment> {
         self.attachments.iter()
@@ -209,7 +209,7 @@ impl<T: Transport> ResidentClient<T> {
         }
     }
 
-    /// Records the authority this client should request after reconnecting.
+    /// Records the authority requested after reconnecting.
     ///
     /// Incoming driver notifications and successful driver requests update
     /// this automatically.

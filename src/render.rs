@@ -389,7 +389,7 @@ fn draw_palette(
         .title_bottom(
             Line::styled(
                 format!(
-                    " type to search · {clear_query} clear · shortcuts · Enter run · Esc close "
+                    " type to filter · ↑/↓ select · Enter run · {clear_query} clear · Esc close "
                 ),
                 shell.config.theme.muted,
             )
@@ -407,8 +407,12 @@ fn draw_palette(
         Span::styled("_", shell.config.theme.muted),
     ]);
     let items = palette_items.into_iter().map(|item| {
-        let prefix = match item.action {
-            PaletteAction::SelectSurface(index) if query.is_empty() && index < 9 => shell
+        let prefix = match &item.action {
+            PaletteAction::RunSurfaceCommand(_) => item
+                .shortcut
+                .as_ref()
+                .map_or_else(|| " · ".to_owned(), |shortcut| format!(" {shortcut} ")),
+            PaletteAction::SelectSurface(index) if query.is_empty() && *index < 9 => shell
                 .config
                 .bindings
                 .action_jump_modifiers
@@ -419,7 +423,7 @@ fn draw_palette(
                         format!(
                             " {} ",
                             KeyBinding::new(
-                                KeyCode::Char(char::from(b'1' + index as u8)),
+                                KeyCode::Char(char::from(b'1' + *index as u8)),
                                 *modifiers,
                             )
                             .label()
@@ -429,15 +433,10 @@ fn draw_palette(
             PaletteAction::SelectSurface(_) => {
                 format!(" {} ", item.status.unwrap_or(SurfaceStatus::Ready).marker())
             }
-            PaletteAction::NextSurface => binding_prefix(&shell.config.bindings.action_next_screen),
-            PaletteAction::PreviousSurface => {
-                binding_prefix(&shell.config.bindings.action_previous_screen)
-            }
-            PaletteAction::ScrollUp => binding_prefix(&shell.config.bindings.action_scroll_up),
-            PaletteAction::ScrollDown => binding_prefix(&shell.config.bindings.action_scroll_down),
-            PaletteAction::CloseSurface => binding_prefix(&shell.config.bindings.action_close),
-            PaletteAction::Detach => binding_prefix(&shell.config.bindings.action_detach),
-            PaletteAction::Help => binding_prefix(&shell.config.bindings.action_help),
+            _ => item
+                .shortcut
+                .as_ref()
+                .map_or_else(|| " · ".to_owned(), |shortcut| format!(" {shortcut} ")),
         };
         let marker_style = item.status.map_or(shell.config.theme.accent, |status| {
             status_style(shell, status)
@@ -464,13 +463,6 @@ fn draw_palette(
             sections[1],
         );
     }
-}
-
-fn binding_prefix(bindings: &[KeyBinding]) -> String {
-    bindings.first().map_or_else(
-        || " · ".to_owned(),
-        |binding| format!(" {} ", binding.label()),
-    )
 }
 
 fn binding_labels(bindings: &[KeyBinding]) -> String {

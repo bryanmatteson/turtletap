@@ -8,8 +8,8 @@ use std::{
 use crossterm::event::{MouseButton, MouseEventKind};
 use turtletap::{
     Chrome, Event, Frame, InputPolicy, KeyBinding, KeyCode, KeyEvent, KeyModifiers, MouseEvent,
-    Rect, Shell, ShellBindings, ShellConfig, ShellSignal, Surface, SurfaceAction, SurfaceEvent,
-    SurfaceId,
+    Rect, Shell, ShellBindings, ShellConfig, ShellSignal, Surface, SurfaceAction, SurfaceCommand,
+    SurfaceEvent, SurfaceId,
 };
 
 struct Probe {
@@ -18,11 +18,14 @@ struct Probe {
     policy: InputPolicy,
     escape_opens_action_bar: bool,
     events: Arc<Mutex<Vec<SurfaceEvent>>>,
+    command_enabled: bool,
+    commands: Arc<Mutex<Vec<&'static str>>>,
 }
 
 impl Probe {
     fn new(title: &'static str, policy: InputPolicy) -> (Self, Arc<Mutex<Vec<SurfaceEvent>>>) {
         let events = Arc::new(Mutex::new(Vec::new()));
+        let commands = Arc::new(Mutex::new(Vec::new()));
         (
             Self {
                 title,
@@ -30,6 +33,8 @@ impl Probe {
                 policy,
                 escape_opens_action_bar: false,
                 events: Arc::clone(&events),
+                command_enabled: false,
+                commands,
             },
             events,
         )
@@ -42,6 +47,12 @@ impl Probe {
 
     fn with_key(mut self, key: &'static str) -> Self {
         self.key = Some(key);
+        self
+    }
+
+    fn with_commands(mut self, commands: Arc<Mutex<Vec<&'static str>>>) -> Self {
+        self.command_enabled = true;
+        self.commands = commands;
         self
     }
 }
@@ -73,6 +84,29 @@ impl Surface for Probe {
             .expect("probe lock should be healthy")
             .push(event);
         SurfaceAction::Consumed
+    }
+
+    fn commands(&self) -> Vec<SurfaceCommand> {
+        self.command_enabled
+            .then(|| {
+                SurfaceCommand::new("probe.refresh", "Refresh data")
+                    .with_description("Probe")
+                    .with_shortcut("R")
+            })
+            .into_iter()
+            .collect()
+    }
+
+    fn execute_command(&mut self, id: &str) -> SurfaceAction {
+        if id == "probe.refresh" {
+            self.commands
+                .lock()
+                .expect("command log should be healthy")
+                .push("probe.refresh");
+            SurfaceAction::Consumed
+        } else {
+            SurfaceAction::Ignored
+        }
     }
 }
 
@@ -175,6 +209,24 @@ fn ctrl_backtick_opens_the_action_bar_over_a_captured_surface() {
             .expect("probe lock should be healthy")
             .is_empty()
     );
+}
+
+#[test]
+fn ctrl_p_remains_available_to_captured_surface_input() {
+    let (surface, events) = Probe::new("terminal", InputPolicy::Captured);
+    let mut shell = Shell::new(ShellConfig::new("Talos"));
+    shell.add_surface(surface);
+
+    shell.handle_event(key(KeyCode::Char('p'), KeyModifiers::CONTROL));
+
+    assert!(matches!(
+        events
+            .lock()
+            .expect("probe lock should be healthy")
+            .as_slice(),
+        [SurfaceEvent::Key(key)]
+            if key.code == KeyCode::Char('p') && key.modifiers == KeyModifiers::CONTROL
+    ));
 }
 
 #[test]
@@ -386,7 +438,7 @@ fn palette_numbers_select_the_visible_surface() {
     shell.add_surface(second);
     shell.add_surface(third);
 
-    shell.handle_event(key(KeyCode::Char('p'), KeyModifiers::CONTROL));
+    shell.handle_event(key(KeyCode::Char('`'), KeyModifiers::CONTROL));
     shell.handle_event(key(KeyCode::Char('1'), KeyModifiers::ALT));
 
     assert_eq!(shell.active_id(), Some(first_id));
@@ -400,7 +452,7 @@ fn palette_filters_surfaces_and_opens_the_match() {
     let first_id = shell.add_surface(first);
     shell.add_surface(second);
 
-    shell.handle_event(key(KeyCode::Char('p'), KeyModifiers::CONTROL));
+    shell.handle_event(key(KeyCode::Char('`'), KeyModifiers::CONTROL));
     for character in "first".chars() {
         shell.handle_event(key(KeyCode::Char(character), KeyModifiers::empty()));
     }
@@ -421,7 +473,7 @@ fn palette_runs_shell_actions() {
     let mut shell = Shell::new(ShellConfig::new("Koda"));
     shell.add_surface(surface);
 
-    shell.handle_event(key(KeyCode::Char('p'), KeyModifiers::CONTROL));
+    shell.handle_event(key(KeyCode::Char('`'), KeyModifiers::CONTROL));
     for character in "dtch".chars() {
         shell.handle_event(key(KeyCode::Char(character), KeyModifiers::empty()));
     }
@@ -429,6 +481,33 @@ fn palette_runs_shell_actions() {
     assert_eq!(
         shell.handle_event(key(KeyCode::Enter, KeyModifiers::empty())),
         ShellSignal::Exit(turtletap::ExitReason::Detached)
+    );
+}
+
+#[test]
+fn action_bar_discovers_and_executes_active_surface_commands() {
+    let commands = Arc::new(Mutex::new(Vec::new()));
+    let (surface, _) = Probe::new("agent", InputPolicy::Captured);
+    let mut shell = Shell::new(ShellConfig::new("Koda"));
+    shell.add_surface(surface.with_commands(Arc::clone(&commands)));
+
+    shell.handle_event(key(KeyCode::Char('`'), KeyModifiers::CONTROL));
+    for character in "refresh".chars() {
+        shell.handle_event(key(KeyCode::Char(character), KeyModifiers::empty()));
+    }
+    let rendered = shell
+        .render_to_string(72, 12)
+        .expect("action bar should render");
+
+    assert!(rendered.contains("Refresh data"));
+    assert!(rendered.contains("Probe"));
+    shell.handle_event(key(KeyCode::Enter, KeyModifiers::empty()));
+    assert_eq!(
+        commands
+            .lock()
+            .expect("command log should be healthy")
+            .as_slice(),
+        ["probe.refresh"]
     );
 }
 
@@ -469,7 +548,7 @@ fn palette_accepts_pasted_queries_and_reports_no_matches() {
     let mut shell = Shell::new(ShellConfig::new("Koda"));
     shell.add_surface(surface);
 
-    shell.handle_event(key(KeyCode::Char('p'), KeyModifiers::CONTROL));
+    shell.handle_event(key(KeyCode::Char('`'), KeyModifiers::CONTROL));
     shell.handle_event(Event::Paste("nothing matches this".to_owned()));
     let rendered = shell
         .render_to_string(72, 12)
@@ -494,7 +573,7 @@ fn action_bar_query_clear_uses_the_configured_binding() {
     let mut shell = Shell::new(ShellConfig::new("Koda").with_bindings(bindings));
     shell.add_surface(surface);
 
-    shell.handle_event(key(KeyCode::Char('p'), KeyModifiers::CONTROL));
+    shell.handle_event(key(KeyCode::Char('`'), KeyModifiers::CONTROL));
     shell.handle_event(Event::Paste("missing".to_owned()));
     shell.handle_event(key(KeyCode::Char('u'), KeyModifiers::CONTROL));
     assert!(
@@ -594,7 +673,7 @@ fn modal_overlay_consumes_mouse_input() {
         .render_to_string(72, 12)
         .expect("off-screen render should succeed");
 
-    shell.handle_event(key(KeyCode::Char('?'), KeyModifiers::empty()));
+    shell.handle_event(key(KeyCode::Char('h'), KeyModifiers::ALT));
     let signal = shell.handle_event(click(8, 0));
 
     assert_eq!(signal, ShellSignal::Continue);
@@ -838,8 +917,8 @@ fn keyboard_selection_behaves_identically_in_both_chrome_modes() {
     }
 
     for shell in [&mut rail, &mut tabs] {
-        shell.handle_event(key(KeyCode::Char('p'), KeyModifiers::CONTROL));
-        shell.handle_event(key(KeyCode::Char('1'), KeyModifiers::empty()));
+        shell.handle_event(key(KeyCode::Char('`'), KeyModifiers::CONTROL));
+        shell.handle_event(key(KeyCode::Char('1'), KeyModifiers::ALT));
     }
     assert_eq!(
         rail.active_id().map(SurfaceId::get),

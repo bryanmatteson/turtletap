@@ -21,7 +21,7 @@ pub struct SessionControlSnapshot {
     /// Milliseconds since the Unix epoch when the latest event was committed.
     #[serde(default)]
     pub last_event_at: Option<u64>,
-    /// Current lease epoch. The owner is intentionally not restored after restart.
+    /// Current lease epoch. Restart clears the owner.
     pub lease_epoch: LeaseEpoch,
     /// Recently committed requests used for reconnect deduplication.
     pub committed: Vec<(RequestId, EventSequence)>,
@@ -136,7 +136,7 @@ impl std::error::Error for CoreError {}
 pub enum AttachError {
     /// Generic control-plane failure.
     Core(CoreError),
-    /// Another client currently owns the driver lease.
+    /// Another client owns the driver lease.
     DriverBusy(DriverLease),
 }
 
@@ -183,10 +183,10 @@ pub struct DriverChange {
     pub subscribers: Vec<ConnectionId>,
 }
 
-/// Whether a validated domain request should execute.
+/// Execution decision for a validated domain request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Authorization {
-    /// Execute and eventually commit this request.
+    /// Execute and commit this request.
     Apply,
     /// Return the original committed sequence without executing again.
     Duplicate(EventSequence),
@@ -293,7 +293,7 @@ impl LeaderCore {
         Ok(summary)
     }
 
-    /// Restores session control state. Driver ownership is deliberately cleared.
+    /// Restores session control state with driver ownership cleared.
     pub fn restore_session(&mut self, snapshot: SessionControlSnapshot) -> Result<(), CoreError> {
         let name = normalize_name(snapshot.name);
         if self.names.contains_key(&name) {

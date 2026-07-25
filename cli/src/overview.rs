@@ -10,8 +10,8 @@ use std::{
 };
 
 use turtletap::{
-    Frame, KeyCode, KeyModifiers, MouseEventKind, Rect, ShellBindings, Shortcut, Surface,
-    SurfaceAction, SurfaceEvent, SurfaceStatus, Theme,
+    Frame, InputPolicy, KeyCode, KeyModifiers, MouseEventKind, Rect, ShellBindings, Shortcut,
+    Surface, SurfaceAction, SurfaceCommand, SurfaceEvent, SurfaceStatus, Theme,
     resident::{
         AttachmentMode, ClientRequest, ControlResult, ServerMessage, SessionId, SessionSelector,
         SessionSummary,
@@ -24,8 +24,18 @@ use turtletap::{
     },
 };
 
+const OPEN_SESSION: &str = "dashboard.open";
+const VIEW_SESSION: &str = "dashboard.view";
+const TAKE_SESSION: &str = "dashboard.take";
+const SEARCH_SESSIONS: &str = "dashboard.search";
+const NEW_SESSION: &str = "dashboard.new";
+const RENAME_SESSION: &str = "dashboard.rename";
+const DELETE_SESSION: &str = "dashboard.delete";
+const STOP_RESIDENT: &str = "dashboard.stop";
+const EDIT_KEYBINDINGS: &str = "dashboard.keybindings";
+
 use crate::async_client::{self, ClientEvent, ConnectionState, SessionHandle};
-use crate::command::{binding_labels, matches_binding};
+use crate::command::{binding_labels, command_shortcut, matches_binding};
 use crate::keybindings::KeybindingEditor;
 use crate::remote::{OpenSessions, RemoteSurface, session_surface_key};
 
@@ -398,10 +408,11 @@ impl SessionDashboard {
 
     fn dashboard_hint(&self) -> String {
         format!(
-            "Enter open · {} search · {} new · {} keys · ? help",
+            "Enter open · {} search · {} new · {} keys · {} help",
             binding_labels(&self.bindings.dashboard_search),
             binding_labels(&self.bindings.dashboard_new),
             binding_labels(&self.bindings.dashboard_keybindings),
+            binding_labels(&self.bindings.shell_help),
         )
     }
 
@@ -420,11 +431,110 @@ impl SessionDashboard {
             }
         }
     }
+
+    fn execute_dashboard_command(&mut self, id: &str) -> SurfaceAction {
+        match id {
+            OPEN_SESSION => {
+                let mode = if self
+                    .selected_session()
+                    .is_some_and(|session| session.driver.is_some())
+                {
+                    AttachmentMode::View
+                } else {
+                    AttachmentMode::Drive
+                };
+                self.open_selected(mode, false)
+            }
+            VIEW_SESSION => self.open_selected(AttachmentMode::View, false),
+            TAKE_SESSION => {
+                if let Some(session) = self.selected_session() {
+                    if session.driver.is_some() {
+                        self.mode = DashboardMode::ConfirmTake(session.id);
+                        SurfaceAction::Consumed
+                    } else {
+                        self.open_selected(AttachmentMode::Drive, false)
+                    }
+                } else {
+                    SurfaceAction::Ignored
+                }
+            }
+            SEARCH_SESSIONS => {
+                self.mode = DashboardMode::Search;
+                self.query.clear();
+                self.query_cursor = 0;
+                SurfaceAction::Consumed
+            }
+            NEW_SESSION => {
+                self.mode = DashboardMode::Create;
+                self.query.clear();
+                self.query_cursor = 0;
+                SurfaceAction::Consumed
+            }
+            RENAME_SESSION => {
+                if let Some(session) = self.selected_session() {
+                    self.query.clone_from(&session.name);
+                    self.query_cursor = self.query.len();
+                    self.mode = DashboardMode::Rename(session.id);
+                }
+                SurfaceAction::Consumed
+            }
+            DELETE_SESSION => {
+                if let Some(session) = self.selected_session() {
+                    self.mode = DashboardMode::ConfirmDelete(session.id);
+                }
+                SurfaceAction::Consumed
+            }
+            STOP_RESIDENT => {
+                self.mode = DashboardMode::ConfirmStopLeader;
+                SurfaceAction::Consumed
+            }
+            EDIT_KEYBINDINGS => self.open_keybindings(),
+            _ => SurfaceAction::Ignored,
+        }
+    }
+
+    fn reload_configuration(
+        &mut self,
+        stamp: Option<(PathBuf, std::time::SystemTime)>,
+        load: impl FnOnce() -> io::Result<turtletap::ShellConfig>,
+    ) -> Option<SurfaceAction> {
+        if stamp == self.config_stamp {
+            return None;
+        }
+        self.config_stamp = stamp;
+        Some(match load() {
+            Ok(mut config) => {
+                if self.no_color {
+                    config.theme = config.theme.without_color();
+                }
+                self.notice = Some("Configuration reloaded.".to_owned());
+                SurfaceAction::Reconfigure(Box::new(config))
+            }
+            Err(error) => {
+                self.notice = Some(format!(
+                    "Configuration reload failed; keeping current settings: {error}"
+                ));
+                SurfaceAction::Consumed
+            }
+        })
+    }
 }
 
 impl Surface for SessionDashboard {
     fn title(&self) -> std::borrow::Cow<'_, str> {
         "sessions".into()
+    }
+
+    fn input_policy(&self) -> InputPolicy {
+        match self.mode {
+            DashboardMode::Search | DashboardMode::Create | DashboardMode::Rename(_) => {
+                InputPolicy::Captured
+            }
+            DashboardMode::Browse
+            | DashboardMode::ConfirmTake(_)
+            | DashboardMode::ConfirmDelete(_)
+            | DashboardMode::ConfirmStopLeader => InputPolicy::Shell,
+        }
     }
 
     fn reconfigure(&mut self, config: &turtletap::ShellConfig) {
@@ -634,23 +744,10 @@ impl Surface for SessionDashboard {
             SurfaceEvent::Tick(elapsed) => {
                 self.refresh_elapsed += elapsed;
                 let stamp = config_stamp();
-                if stamp != self.config_stamp {
-                    self.config_stamp = stamp;
-                    match crate::settings::shell_config("TurtleTap") {
-                        Ok(mut config) => {
-                            if self.no_color {
-                                config.theme = config.theme.without_color();
-                            }
-                            self.notice = Some("Configuration reloaded.".to_owned());
-                            return SurfaceAction::Reconfigure(Box::new(config));
-                        }
-                        Err(error) => {
-                            self.notice = Some(format!(
-                                "Configuration reload failed; keeping current settings: {error}"
-                            ));
-                            return SurfaceAction::Consumed;
-                        }
-                    }
+                if let Some(action) =
+                    self.reload_configuration(stamp, || crate::settings::shell_config("TurtleTap"))
+                {
+                    return action;
                 }
                 if self.refresh_elapsed >= Duration::from_secs(2) {
                     return self.refresh();
@@ -676,55 +773,23 @@ impl Surface for SessionDashboard {
                         self.move_selection(self.grid_columns as isize);
                         SurfaceAction::Consumed
                     } else if key.code == KeyCode::Enter {
-                        let mode = if self
-                            .selected_session()
-                            .is_some_and(|session| session.driver.is_some())
-                        {
-                            AttachmentMode::View
-                        } else {
-                            AttachmentMode::Drive
-                        };
-                        self.open_selected(mode, false)
+                        self.execute_dashboard_command(OPEN_SESSION)
                     } else if matches_binding(&self.bindings.dashboard_view, key) {
-                        self.open_selected(AttachmentMode::View, false)
+                        self.execute_dashboard_command(VIEW_SESSION)
                     } else if matches_binding(&self.bindings.dashboard_take, key) {
-                        if let Some(session) = self.selected_session() {
-                            if session.driver.is_some() {
-                                self.mode = DashboardMode::ConfirmTake(session.id);
-                                SurfaceAction::Consumed
-                            } else {
-                                self.open_selected(AttachmentMode::Drive, false)
-                            }
-                        } else {
-                            SurfaceAction::Ignored
-                        }
+                        self.execute_dashboard_command(TAKE_SESSION)
                     } else if matches_binding(&self.bindings.dashboard_search, key) {
-                        self.mode = DashboardMode::Search;
-                        self.query.clear();
-                        self.query_cursor = 0;
-                        SurfaceAction::Consumed
+                        self.execute_dashboard_command(SEARCH_SESSIONS)
                     } else if matches_binding(&self.bindings.dashboard_new, key) {
-                        self.mode = DashboardMode::Create;
-                        self.query.clear();
-                        self.query_cursor = 0;
-                        SurfaceAction::Consumed
+                        self.execute_dashboard_command(NEW_SESSION)
                     } else if matches_binding(&self.bindings.dashboard_rename, key) {
-                        if let Some(session) = self.selected_session() {
-                            self.query.clone_from(&session.name);
-                            self.query_cursor = self.query.len();
-                            self.mode = DashboardMode::Rename(session.id);
-                        }
-                        SurfaceAction::Consumed
+                        self.execute_dashboard_command(RENAME_SESSION)
                     } else if matches_binding(&self.bindings.dashboard_delete, key) {
-                        if let Some(session) = self.selected_session() {
-                            self.mode = DashboardMode::ConfirmDelete(session.id);
-                        }
-                        SurfaceAction::Consumed
+                        self.execute_dashboard_command(DELETE_SESSION)
                     } else if matches_binding(&self.bindings.dashboard_stop, key) {
-                        self.mode = DashboardMode::ConfirmStopLeader;
-                        SurfaceAction::Consumed
+                        self.execute_dashboard_command(STOP_RESIDENT)
                     } else if matches_binding(&self.bindings.dashboard_keybindings, key) {
-                        self.open_keybindings()
+                        self.execute_dashboard_command(EDIT_KEYBINDINGS)
                     } else if matches_binding(&self.bindings.dashboard_close, key) {
                         SurfaceAction::Close
                     } else {
@@ -930,6 +995,68 @@ impl Surface for SessionDashboard {
             ),
         ]
     }
+
+    fn commands(&self) -> Vec<SurfaceCommand> {
+        if !matches!(self.mode, DashboardMode::Browse) {
+            return Vec::new();
+        }
+        let mut commands = vec![
+            command_shortcut(
+                SurfaceCommand::new(NEW_SESSION, "New session").with_description("Dashboard"),
+                &self.bindings.dashboard_new,
+            ),
+            command_shortcut(
+                SurfaceCommand::new(SEARCH_SESSIONS, "Search sessions")
+                    .with_description("Dashboard"),
+                &self.bindings.dashboard_search,
+            ),
+            command_shortcut(
+                SurfaceCommand::new(EDIT_KEYBINDINGS, "Edit keybindings")
+                    .with_description("Dashboard"),
+                &self.bindings.dashboard_keybindings,
+            ),
+            command_shortcut(
+                SurfaceCommand::new(STOP_RESIDENT, "Stop resident")
+                    .with_description("Dashboard · confirmation required"),
+                &self.bindings.dashboard_stop,
+            ),
+        ];
+        if self.selected_session().is_some() {
+            commands.splice(
+                0..0,
+                [
+                    SurfaceCommand::new(OPEN_SESSION, "Open selected session")
+                        .with_description("Dashboard")
+                        .with_shortcut("Enter"),
+                    command_shortcut(
+                        SurfaceCommand::new(VIEW_SESSION, "View selected session")
+                            .with_description("Dashboard"),
+                        &self.bindings.dashboard_view,
+                    ),
+                    command_shortcut(
+                        SurfaceCommand::new(TAKE_SESSION, "Take control of selected session")
+                            .with_description("Dashboard · confirmation may be required"),
+                        &self.bindings.dashboard_take,
+                    ),
+                    command_shortcut(
+                        SurfaceCommand::new(RENAME_SESSION, "Rename selected session")
+                            .with_description("Dashboard"),
+                        &self.bindings.dashboard_rename,
+                    ),
+                    command_shortcut(
+                        SurfaceCommand::new(DELETE_SESSION, "Delete selected session")
+                            .with_description("Dashboard · confirmation required"),
+                        &self.bindings.dashboard_delete,
+                    ),
+                ],
+            );
+        }
+        commands
+    }
+
+    fn execute_command(&mut self, id: &str) -> SurfaceAction {
+        self.execute_dashboard_command(id)
+    }
 }
 
 fn config_stamp() -> Option<(PathBuf, std::time::SystemTime)> {
@@ -1022,4 +1149,262 @@ fn unix_millis() -> u64 {
         .map_or(0, |elapsed| {
             u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use turtletap::{
+        KeyEvent,
+        resident::{ClientInstanceId, DriverLease, EventSequence, LeaseEpoch, SessionSummary},
+    };
+
+    use super::*;
+
+    fn summary(name: &str, driven: bool) -> SessionSummary {
+        SessionSummary {
+            id: SessionId::new(),
+            name: name.to_owned(),
+            driver: driven.then(|| DriverLease {
+                owner: ClientInstanceId::new(),
+                epoch: LeaseEpoch(1),
+            }),
+            attached_clients: usize::from(driven),
+            sequence: EventSequence(0),
+            last_event_at: None,
+            digest: None,
+        }
+    }
+
+    fn dashboard(
+        sessions: Vec<SessionSummary>,
+    ) -> (
+        SessionDashboard,
+        tokio::sync::mpsc::Receiver<crate::async_client::ClientOperation>,
+        tokio::sync::mpsc::Sender<ClientEvent>,
+        tokio::sync::watch::Receiver<bool>,
+    ) {
+        let (client, operations, events, shutdown) = crate::async_client::test_handle();
+        (
+            SessionDashboard::connect_async(
+                Path::new("/tmp/turtletap-dashboard-test.sock"),
+                Theme::default(),
+                ShellBindings::default(),
+                crate::remote::open_sessions(),
+                sessions,
+                client,
+                true,
+            ),
+            operations,
+            events,
+            shutdown,
+        )
+    }
+
+    fn key(code: KeyCode) -> SurfaceEvent {
+        SurfaceEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn dashboard_filter_and_text_editing_are_unicode_safe() {
+        let (mut dashboard, _operations, _events, _shutdown) =
+            dashboard(vec![summary("alpha", false), summary("βeta", false)]);
+
+        assert!(matches!(
+            dashboard.handle(key(KeyCode::Char('/'))),
+            SurfaceAction::Consumed
+        ));
+        assert!(matches!(dashboard.mode, DashboardMode::Search));
+        assert!(matches!(
+            dashboard.handle(SurfaceEvent::Paste("βe".to_owned())),
+            SurfaceAction::Consumed
+        ));
+        assert_eq!(dashboard.filtered_indices(), vec![1]);
+
+        dashboard.handle(key(KeyCode::Left));
+        dashboard.handle(key(KeyCode::Backspace));
+        assert_eq!(dashboard.query, "e");
+        dashboard.handle(key(KeyCode::Esc));
+        assert!(matches!(dashboard.mode, DashboardMode::Browse));
+        assert!(dashboard.query.is_empty());
+    }
+
+    #[test]
+    fn action_bar_commands_cover_dashboard_operations_and_keep_confirmation() {
+        let selected = summary("alpha", true);
+        let selected_id = selected.id;
+        let (mut dashboard, _operations, _events, _shutdown) = dashboard(vec![selected]);
+
+        let commands = dashboard.commands();
+        for id in [
+            OPEN_SESSION,
+            VIEW_SESSION,
+            TAKE_SESSION,
+            SEARCH_SESSIONS,
+            NEW_SESSION,
+            RENAME_SESSION,
+            DELETE_SESSION,
+            STOP_RESIDENT,
+            EDIT_KEYBINDINGS,
+        ] {
+            assert!(
+                commands.iter().any(|command| command.id == id),
+                "dashboard command {id} should be discoverable"
+            );
+        }
+
+        assert!(matches!(
+            dashboard.execute_command(DELETE_SESSION),
+            SurfaceAction::Consumed
+        ));
+        assert!(matches!(
+            dashboard.mode,
+            DashboardMode::ConfirmDelete(session) if session == selected_id
+        ));
+    }
+
+    #[test]
+    fn dashboard_create_rename_delete_and_stop_emit_typed_requests() {
+        let original = summary("alpha", false);
+        let original_id = original.id;
+        let (mut dashboard, mut operations, _events, _shutdown) = dashboard(vec![original]);
+
+        dashboard.handle(key(KeyCode::Char('n')));
+        dashboard.handle(SurfaceEvent::Paste("build".to_owned()));
+        dashboard.handle(key(KeyCode::Enter));
+        let create = operations.try_recv().expect("create request");
+        assert!(matches!(
+            create.request,
+            ClientRequest::CreateSession { name } if name == "build"
+        ));
+
+        dashboard.query.clear();
+        dashboard.query_cursor = 0;
+        dashboard.handle(key(KeyCode::Char('r')));
+        dashboard.handle(key(KeyCode::End));
+        dashboard.handle(SurfaceEvent::Paste("-renamed".to_owned()));
+        dashboard.handle(key(KeyCode::Enter));
+        let rename = operations.try_recv().expect("rename request");
+        assert!(matches!(
+            rename.request,
+            ClientRequest::RenameSession { session, name }
+                if session == original_id && name == "alpha-renamed"
+        ));
+
+        dashboard.query.clear();
+        dashboard.query_cursor = 0;
+        dashboard.handle(key(KeyCode::Char('x')));
+        assert!(matches!(
+            dashboard.mode,
+            DashboardMode::ConfirmDelete(session) if session == original_id
+        ));
+        dashboard.handle(key(KeyCode::Char('y')));
+        let delete = operations.try_recv().expect("delete request");
+        assert!(matches!(
+            delete.request,
+            ClientRequest::StopSession { session } if session == original_id
+        ));
+
+        dashboard.mode = DashboardMode::Browse;
+        dashboard.handle(key(KeyCode::Char('!')));
+        assert!(matches!(dashboard.mode, DashboardMode::ConfirmStopLeader));
+        dashboard.handle(key(KeyCode::Char('y')));
+        let stop = operations.try_recv().expect("stop request");
+        assert!(matches!(stop.request, ClientRequest::StopLeader));
+    }
+
+    #[test]
+    fn dashboard_open_view_take_and_cancel_preserve_session_identity() {
+        let driven = summary("build", true);
+        let id = driven.id;
+        let (mut dashboard, _operations, _events, _shutdown) = dashboard(vec![driven]);
+        dashboard
+            .open_sessions
+            .lock()
+            .expect("open-session registry")
+            .insert(id);
+
+        assert!(matches!(
+            dashboard.handle(key(KeyCode::Enter)),
+            SurfaceAction::FocusKey(key) if key == session_surface_key(id)
+        ));
+        assert!(matches!(
+            dashboard.handle(key(KeyCode::Char('v'))),
+            SurfaceAction::FocusKey(key) if key == session_surface_key(id)
+        ));
+
+        dashboard.handle(key(KeyCode::Char('t')));
+        assert!(matches!(
+            dashboard.mode,
+            DashboardMode::ConfirmTake(session) if session == id
+        ));
+        assert!(matches!(
+            dashboard.handle(key(KeyCode::Char('y'))),
+            SurfaceAction::FocusKey(key) if key == session_surface_key(id)
+        ));
+
+        dashboard.handle(key(KeyCode::Char('x')));
+        dashboard.handle(key(KeyCode::Esc));
+        assert!(matches!(dashboard.mode, DashboardMode::Browse));
+        assert_eq!(dashboard.notice.as_deref(), Some("Delete cancelled."));
+    }
+
+    #[test]
+    fn dashboard_selection_and_relative_time_have_stable_boundaries() {
+        let (mut dashboard, _operations, _events, _shutdown) = dashboard(vec![
+            summary("one", false),
+            summary("two", false),
+            summary("three", false),
+        ]);
+        dashboard.move_selection(20);
+        assert_eq!(dashboard.selected, 2);
+        dashboard.move_selection(-20);
+        assert_eq!(dashboard.selected, 0);
+
+        assert_eq!(relative_time(10_000, None), "new");
+        assert_eq!(relative_time(10_000, Some(9_000)), "active");
+        assert_eq!(relative_time(70_000, Some(10_000)), "idle 1m");
+        assert_eq!(relative_time(7_300_000, Some(100_000)), "idle 2h");
+    }
+
+    #[test]
+    fn dashboard_reload_applies_valid_changes_and_retains_settings_on_error() {
+        let (mut dashboard, _operations, _events, _shutdown) = dashboard(Vec::new());
+        let stamp = Some((
+            PathBuf::from("/tmp/turtletap-config.kdl"),
+            std::time::UNIX_EPOCH,
+        ));
+        let loaded = dashboard.reload_configuration(stamp.clone(), || {
+            Ok(turtletap::ShellConfig::new("Reloaded"))
+        });
+        let Some(SurfaceAction::Reconfigure(config)) = loaded else {
+            panic!("valid settings must reconfigure the dashboard");
+        };
+        assert_eq!(config.title, "Reloaded");
+        assert_eq!(config.theme.chrome.fg, None);
+        assert_eq!(dashboard.notice.as_deref(), Some("Configuration reloaded."));
+        assert!(
+            dashboard
+                .reload_configuration(stamp, || {
+                    panic!("unchanged stamps do not reload configuration")
+                })
+                .is_none()
+        );
+
+        let failed = dashboard.reload_configuration(
+            Some((
+                PathBuf::from("/tmp/turtletap-config.kdl"),
+                std::time::UNIX_EPOCH + Duration::from_secs(1),
+            )),
+            || Err(io::Error::new(io::ErrorKind::InvalidData, "invalid theme")),
+        );
+        assert!(matches!(failed, Some(SurfaceAction::Consumed)));
+        assert!(
+            dashboard
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("keeping current settings: invalid theme"))
+        );
+    }
 }

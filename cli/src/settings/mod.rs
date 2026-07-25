@@ -10,11 +10,10 @@ use std::{
 
 use serde::Deserialize;
 use turtletap::{
-    Chrome, KeyBinding, KeyCode, KeyModifiers, ShellBindings, ShellConfig, Theme,
+    BindingId, Chrome, KeyBinding, KeyModifiers, ShellBindings, ShellConfig, Theme,
+    key_modifiers_config_label, parse_key_modifiers,
     tui::style::{Color, Style},
 };
-
-use crate::keybindings::BindingAction;
 
 mod kdl;
 mod toml;
@@ -109,55 +108,85 @@ struct BindingSettings {
     next_screen: Option<Vec<String>>,
     previous_screen: Option<Vec<String>>,
     jump_modifiers: Option<Vec<String>>,
-    shell_detach: Option<Vec<String>>,
-    shell_next_screen: Option<Vec<String>>,
-    shell_previous_screen: Option<Vec<String>>,
-    shell_help: Option<Vec<String>>,
-    leader_palette: Option<Vec<String>>,
-    leader_next_screen: Option<Vec<String>>,
-    leader_previous_screen: Option<Vec<String>>,
-    leader_scroll_up: Option<Vec<String>>,
-    leader_scroll_down: Option<Vec<String>>,
-    leader_close: Option<Vec<String>>,
-    leader_detach: Option<Vec<String>>,
-    leader_help: Option<Vec<String>>,
-    leader_jump_modifiers: Option<Vec<String>>,
-    action_next_screen: Option<Vec<String>>,
-    action_previous_screen: Option<Vec<String>>,
-    action_scroll_up: Option<Vec<String>>,
-    action_scroll_down: Option<Vec<String>>,
-    action_close: Option<Vec<String>>,
-    action_detach: Option<Vec<String>>,
-    action_help: Option<Vec<String>>,
-    action_clear_query: Option<Vec<String>>,
-    action_jump_modifiers: Option<Vec<String>>,
-    session_release_driver: Option<Vec<String>>,
-    session_take_driver: Option<Vec<String>>,
-    session_clear: Option<Vec<String>>,
-    session_interrupt: Option<Vec<String>>,
-    session_detach: Option<Vec<String>>,
-    session_delete_to_start: Option<Vec<String>>,
-    session_word_left: Option<Vec<String>>,
-    session_word_right: Option<Vec<String>>,
-    session_line_start: Option<Vec<String>>,
-    session_line_end: Option<Vec<String>>,
-    session_delete_word: Option<Vec<String>>,
-    session_complete: Option<Vec<String>>,
-    session_scroll_up: Option<Vec<String>>,
-    session_scroll_down: Option<Vec<String>>,
-    session_scroll_top: Option<Vec<String>>,
-    session_scroll_bottom: Option<Vec<String>>,
-    dashboard_up: Option<Vec<String>>,
-    dashboard_down: Option<Vec<String>>,
-    dashboard_view: Option<Vec<String>>,
-    dashboard_take: Option<Vec<String>>,
-    dashboard_search: Option<Vec<String>>,
-    dashboard_new: Option<Vec<String>>,
-    dashboard_rename: Option<Vec<String>>,
-    dashboard_delete: Option<Vec<String>>,
-    dashboard_stop: Option<Vec<String>>,
-    dashboard_keybindings: Option<Vec<String>>,
-    dashboard_close: Option<Vec<String>>,
+    shell: ShellBindingSettings,
+    leader: LeaderBindingSettings,
+    action: ActionBindingSettings,
+    session: SessionBindingSettings,
+    dashboard: DashboardBindingSettings,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ShellBindingSettings {
+    detach: Option<Vec<String>>,
+    next_screen: Option<Vec<String>>,
+    previous_screen: Option<Vec<String>>,
+    help: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct LeaderBindingSettings {
+    palette: Option<Vec<String>>,
+    next_screen: Option<Vec<String>>,
+    previous_screen: Option<Vec<String>>,
+    scroll_up: Option<Vec<String>>,
+    scroll_down: Option<Vec<String>>,
+    close: Option<Vec<String>>,
+    detach: Option<Vec<String>>,
+    help: Option<Vec<String>>,
+    jump_modifiers: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ActionBindingSettings {
+    next_screen: Option<Vec<String>>,
+    previous_screen: Option<Vec<String>>,
+    scroll_up: Option<Vec<String>>,
+    scroll_down: Option<Vec<String>>,
+    close: Option<Vec<String>>,
+    detach: Option<Vec<String>>,
+    help: Option<Vec<String>>,
+    clear_query: Option<Vec<String>>,
+    jump_modifiers: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct SessionBindingSettings {
+    release_driver: Option<Vec<String>>,
+    take_driver: Option<Vec<String>>,
+    clear: Option<Vec<String>>,
+    interrupt: Option<Vec<String>>,
+    detach: Option<Vec<String>>,
+    delete_to_start: Option<Vec<String>>,
+    word_left: Option<Vec<String>>,
+    word_right: Option<Vec<String>>,
+    line_start: Option<Vec<String>>,
+    line_end: Option<Vec<String>>,
+    delete_word: Option<Vec<String>>,
+    complete: Option<Vec<String>>,
+    scroll_up: Option<Vec<String>>,
+    scroll_down: Option<Vec<String>>,
+    scroll_top: Option<Vec<String>>,
+    scroll_bottom: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct DashboardBindingSettings {
+    up: Option<Vec<String>>,
+    down: Option<Vec<String>>,
+    view: Option<Vec<String>>,
+    take: Option<Vec<String>>,
+    search: Option<Vec<String>>,
+    new: Option<Vec<String>>,
+    rename: Option<Vec<String>>,
+    delete: Option<Vec<String>>,
+    stop: Option<Vec<String>>,
+    keybindings: Option<Vec<String>>,
+    close: Option<Vec<String>>,
 }
 
 pub(crate) fn shell_config(title: &str) -> io::Result<ShellConfig> {
@@ -166,31 +195,7 @@ pub(crate) fn shell_config(title: &str) -> io::Result<ShellConfig> {
     resolve(title, settings)
 }
 
-pub(crate) fn validate_binding_set(bindings: &ShellBindings) -> io::Result<()> {
-    validate_bindings(bindings)
-}
-
-pub(crate) fn canonical_binding(binding: KeyBinding) -> io::Result<KeyBinding> {
-    let label = binding.label();
-    let parsed = parse_key_binding(&label).map_err(|message| {
-        invalid(format!(
-            "this terminal key cannot be stored as a TurtleTap binding: {message}"
-        ))
-    })?;
-    let normalized_code = match binding.code {
-        KeyCode::Char(character) => KeyCode::Char(character.to_ascii_lowercase()),
-        code => code,
-    };
-    if parsed != KeyBinding::new(normalized_code, binding.modifiers) {
-        return Err(invalid(format!(
-            "{} uses terminal modifiers TurtleTap cannot store",
-            binding.label()
-        )));
-    }
-    Ok(parsed)
-}
-
-pub(crate) fn save_binding(action: BindingAction, binding: KeyBinding) -> io::Result<ShellConfig> {
+pub(crate) fn save_binding(action: BindingId, binding: KeyBinding) -> io::Result<ShellConfig> {
     let location = active_location()?;
     let source = match fs::read_to_string(&location.path) {
         Ok(source) => source,
@@ -199,10 +204,24 @@ pub(crate) fn save_binding(action: BindingAction, binding: KeyBinding) -> io::Re
         }
         Err(error) => return Err(error),
     };
-    let label = binding.label().to_ascii_lowercase();
+    let label = binding
+        .config_label()
+        .map_err(|error| invalid(error.to_string()))?;
     let updated = match location.format {
-        ConfigFormat::Kdl => update_kdl_binding(&source, action.id(), &label, &location.path)?,
-        ConfigFormat::Toml => update_toml_binding(&source, action.id(), &label, &location.path)?,
+        ConfigFormat::Kdl => update_kdl_binding(
+            &source,
+            action.context().config_scope(),
+            action.config_name(),
+            &label,
+            &location.path,
+        )?,
+        ConfigFormat::Toml => update_toml_binding(
+            &source,
+            action.context().config_scope(),
+            action.config_name(),
+            &label,
+            &location.path,
+        )?,
     };
     let settings = parse_settings_source(&updated, &location)?;
     let config = resolve("TurtleTap keybindings", settings)?;
@@ -214,19 +233,76 @@ pub(crate) fn save_binding(action: BindingAction, binding: KeyBinding) -> io::Re
 fn parse_settings_source(source: &str, location: &ConfigLocation) -> io::Result<SettingsFile> {
     match location.format {
         ConfigFormat::Kdl => parse_kdl(source, &location.path),
-        ConfigFormat::Toml => ::toml::from_str(source).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "invalid configuration at {}: {error}",
-                    location.path.display()
-                ),
-            )
-        }),
+        ConfigFormat::Toml => parse_toml(source, &location.path),
     }
 }
 
-fn update_kdl_binding(source: &str, name: &str, label: &str, path: &Path) -> io::Result<String> {
+fn parse_toml(source: &str, path: &Path) -> io::Result<SettingsFile> {
+    let mut value = ::toml::from_str::<::toml::Value>(source).map_err(|error| {
+        invalid(format!(
+            "invalid configuration at {}: {error}",
+            path.display()
+        ))
+    })?;
+    normalize_legacy_toml_bindings(&mut value, path)?;
+    value.try_into().map_err(|error| {
+        invalid(format!(
+            "invalid configuration at {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn normalize_legacy_toml_bindings(value: &mut ::toml::Value, path: &Path) -> io::Result<()> {
+    let Some(bindings) = value
+        .as_table_mut()
+        .and_then(|root| root.get_mut("bindings"))
+        .and_then(::toml::Value::as_table_mut)
+    else {
+        return Ok(());
+    };
+    for scope in ["shell", "leader", "action", "session", "dashboard"] {
+        let prefix = format!("{scope}_");
+        let legacy = bindings
+            .keys()
+            .filter_map(|key| {
+                key.strip_prefix(&prefix)
+                    .map(|name| (key.clone(), name.to_owned()))
+            })
+            .collect::<Vec<_>>();
+        for (legacy_name, nested_name) in legacy {
+            let legacy_value = bindings
+                .remove(&legacy_name)
+                .expect("legacy key came from this table");
+            let group = bindings
+                .entry(scope)
+                .or_insert_with(|| ::toml::Value::Table(::toml::map::Map::new()))
+                .as_table_mut()
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "invalid configuration at {}: bindings.{scope} must be a table",
+                        path.display()
+                    ))
+                })?;
+            if group.contains_key(&nested_name) {
+                return Err(invalid(format!(
+                    "invalid configuration at {}: bindings.{scope}.{nested_name} is set in both nested and legacy flat form",
+                    path.display()
+                )));
+            }
+            group.insert(nested_name, legacy_value);
+        }
+    }
+    Ok(())
+}
+
+fn update_kdl_binding(
+    source: &str,
+    scope: Option<&str>,
+    name: &str,
+    label: &str,
+    path: &Path,
+) -> io::Result<String> {
     let mut document = source.parse::<::kdl::KdlDocument>().map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -240,6 +316,24 @@ fn update_kdl_binding(source: &str, name: &str, label: &str, path: &Path) -> io:
         .get_mut("bindings")
         .ok_or_else(|| invalid("could not create bindings section"))?;
     let children = bindings.ensure_children();
+    let children = if let Some(scope) = scope {
+        let legacy_name = format!("{scope}-{name}");
+        if let Some(node) = children.get_mut(&legacy_name) {
+            node.clear_entries();
+            node.push(label);
+            node.fmt();
+            return Ok(document.to_string());
+        }
+        if children.get(scope).is_none() {
+            children.nodes_mut().push(::kdl::KdlNode::new(scope));
+        }
+        children
+            .get_mut(scope)
+            .ok_or_else(|| invalid(format!("could not create bindings group '{scope}'")))?
+            .ensure_children()
+    } else {
+        children
+    };
     if children.get(name).is_none() {
         children.nodes_mut().push(::kdl::KdlNode::new(name));
     }
@@ -252,7 +346,13 @@ fn update_kdl_binding(source: &str, name: &str, label: &str, path: &Path) -> io:
     Ok(document.to_string())
 }
 
-fn update_toml_binding(source: &str, name: &str, label: &str, path: &Path) -> io::Result<String> {
+fn update_toml_binding(
+    source: &str,
+    scope: Option<&str>,
+    name: &str,
+    label: &str,
+    path: &Path,
+) -> io::Result<String> {
     let mut document = source.parse::<toml_edit::DocumentMut>().map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -265,18 +365,43 @@ fn update_toml_binding(source: &str, name: &str, label: &str, path: &Path) -> io
     if !document["bindings"].is_table() {
         return Err(invalid("bindings must be a TOML table"));
     }
+    let table = if let Some(scope) = scope {
+        let legacy_key = format!("{scope}_{}", name.replace('-', "_"));
+        if document["bindings"]
+            .as_table()
+            .is_some_and(|bindings| bindings.contains_key(&legacy_key))
+        {
+            let table = &mut document["bindings"];
+            replace_toml_binding(table, &legacy_key, label);
+            return Ok(document.to_string());
+        }
+        if !document["bindings"]
+            .as_table()
+            .is_some_and(|bindings| bindings.contains_key(scope))
+        {
+            document["bindings"][scope] = toml_edit::Item::Table(toml_edit::Table::new());
+        }
+        if !document["bindings"][scope].is_table() {
+            return Err(invalid(format!("bindings.{scope} must be a TOML table")));
+        }
+        &mut document["bindings"][scope]
+    } else {
+        &mut document["bindings"]
+    };
     let key = name.replace('-', "_");
-    let decor = document["bindings"][&key]
-        .as_value()
-        .map(|value| value.decor().clone());
+    replace_toml_binding(table, &key, label);
+    Ok(document.to_string())
+}
+
+fn replace_toml_binding(table: &mut toml_edit::Item, key: &str, label: &str) {
+    let decor = table[&key].as_value().map(|value| value.decor().clone());
     let mut values = toml_edit::Array::new();
     values.push(label);
     let mut value = toml_edit::Value::Array(values);
     if let Some(decor) = decor {
         *value.decor_mut() = decor;
     }
-    document["bindings"][&key] = toml_edit::Item::Value(value);
-    Ok(document.to_string())
+    table[&key] = toml_edit::Item::Value(value);
 }
 
 fn atomic_write(path: &Path, contents: &[u8]) -> io::Result<()> {
@@ -342,12 +467,8 @@ pub(crate) fn command(
         [show, format] if show == "show" => show_config(Some(ConfigFormat::parse(format)?)),
         [path] if path == "path" => {
             let path = active_location()?.path;
-            if output == crate::commands::OutputFormat::Json {
-                crate::commands::print_json(&serde_json::json!({ "path": path }))
-            } else {
-                println!("{}", path.display());
-                Ok(())
-            }
+            println!("{}", path.display());
+            Ok(())
         }
         [check] if check == "check" => {
             let location = active_location()?;
@@ -705,15 +826,7 @@ fn read_settings(location: &ConfigLocation) -> io::Result<SettingsFile> {
     };
     match location.format {
         ConfigFormat::Kdl => parse_kdl(&source, &location.path),
-        ConfigFormat::Toml => ::toml::from_str(&source).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "invalid configuration at {}: {error}",
-                    location.path.display()
-                ),
-            )
-        }),
+        ConfigFormat::Toml => parse_toml(&source, &location.path),
     }
 }
 
@@ -755,222 +868,250 @@ fn resolve(title: &str, settings: SettingsFile) -> io::Result<ShellConfig> {
             defaults.jump_modifiers,
             "jump_modifiers",
         )?,
-        shell_detach: parse_bindings(bindings.shell_detach, defaults.shell_detach, "shell_detach")?,
+        shell_detach: parse_bindings(
+            bindings.shell.detach,
+            defaults.shell_detach,
+            "bindings.shell.detach",
+        )?,
         shell_next_screen: parse_bindings(
-            bindings.shell_next_screen,
+            bindings.shell.next_screen,
             defaults.shell_next_screen,
-            "shell_next_screen",
+            "bindings.shell.next_screen",
         )?,
         shell_previous_screen: parse_bindings(
-            bindings.shell_previous_screen,
+            bindings.shell.previous_screen,
             defaults.shell_previous_screen,
-            "shell_previous_screen",
+            "bindings.shell.previous_screen",
         )?,
-        shell_help: parse_bindings(bindings.shell_help, defaults.shell_help, "shell_help")?,
+        shell_help: parse_bindings(
+            bindings.shell.help,
+            defaults.shell_help,
+            "bindings.shell.help",
+        )?,
         leader_palette: parse_bindings(
-            bindings.leader_palette,
+            bindings.leader.palette,
             defaults.leader_palette,
-            "leader_palette",
+            "bindings.leader.palette",
         )?,
         leader_next_screen: parse_bindings(
-            bindings.leader_next_screen,
+            bindings.leader.next_screen,
             defaults.leader_next_screen,
-            "leader_next_screen",
+            "bindings.leader.next_screen",
         )?,
         leader_previous_screen: parse_bindings(
-            bindings.leader_previous_screen,
+            bindings.leader.previous_screen,
             defaults.leader_previous_screen,
-            "leader_previous_screen",
+            "bindings.leader.previous_screen",
         )?,
         leader_scroll_up: parse_bindings(
-            bindings.leader_scroll_up,
+            bindings.leader.scroll_up,
             defaults.leader_scroll_up,
-            "leader_scroll_up",
+            "bindings.leader.scroll_up",
         )?,
         leader_scroll_down: parse_bindings(
-            bindings.leader_scroll_down,
+            bindings.leader.scroll_down,
             defaults.leader_scroll_down,
-            "leader_scroll_down",
+            "bindings.leader.scroll_down",
         )?,
-        leader_close: parse_bindings(bindings.leader_close, defaults.leader_close, "leader_close")?,
+        leader_close: parse_bindings(
+            bindings.leader.close,
+            defaults.leader_close,
+            "bindings.leader.close",
+        )?,
         leader_detach: parse_bindings(
-            bindings.leader_detach,
+            bindings.leader.detach,
             defaults.leader_detach,
-            "leader_detach",
+            "bindings.leader.detach",
         )?,
-        leader_help: parse_bindings(bindings.leader_help, defaults.leader_help, "leader_help")?,
+        leader_help: parse_bindings(
+            bindings.leader.help,
+            defaults.leader_help,
+            "bindings.leader.help",
+        )?,
         leader_jump_modifiers: parse_modifiers(
-            bindings.leader_jump_modifiers,
+            bindings.leader.jump_modifiers,
             defaults.leader_jump_modifiers,
-            "leader_jump_modifiers",
+            "bindings.leader.jump_modifiers",
         )?,
         action_next_screen: parse_bindings(
-            bindings.action_next_screen,
+            bindings.action.next_screen,
             defaults.action_next_screen,
-            "action_next_screen",
+            "bindings.action.next_screen",
         )?,
         action_previous_screen: parse_bindings(
-            bindings.action_previous_screen,
+            bindings.action.previous_screen,
             defaults.action_previous_screen,
-            "action_previous_screen",
+            "bindings.action.previous_screen",
         )?,
         action_scroll_up: parse_bindings(
-            bindings.action_scroll_up,
+            bindings.action.scroll_up,
             defaults.action_scroll_up,
-            "action_scroll_up",
+            "bindings.action.scroll_up",
         )?,
         action_scroll_down: parse_bindings(
-            bindings.action_scroll_down,
+            bindings.action.scroll_down,
             defaults.action_scroll_down,
-            "action_scroll_down",
+            "bindings.action.scroll_down",
         )?,
-        action_close: parse_bindings(bindings.action_close, defaults.action_close, "action_close")?,
+        action_close: parse_bindings(
+            bindings.action.close,
+            defaults.action_close,
+            "bindings.action.close",
+        )?,
         action_detach: parse_bindings(
-            bindings.action_detach,
+            bindings.action.detach,
             defaults.action_detach,
-            "action_detach",
+            "bindings.action.detach",
         )?,
-        action_help: parse_bindings(bindings.action_help, defaults.action_help, "action_help")?,
+        action_help: parse_bindings(
+            bindings.action.help,
+            defaults.action_help,
+            "bindings.action.help",
+        )?,
         action_clear_query: parse_bindings(
-            bindings.action_clear_query,
+            bindings.action.clear_query,
             defaults.action_clear_query,
-            "action_clear_query",
+            "bindings.action.clear_query",
         )?,
         action_jump_modifiers: parse_modifiers(
-            bindings.action_jump_modifiers,
+            bindings.action.jump_modifiers,
             defaults.action_jump_modifiers,
-            "action_jump_modifiers",
+            "bindings.action.jump_modifiers",
         )?,
         session_release_driver: parse_bindings(
-            bindings.session_release_driver,
+            bindings.session.release_driver,
             defaults.session_release_driver,
-            "session_release_driver",
+            "bindings.session.release_driver",
         )?,
         session_take_driver: parse_bindings(
-            bindings.session_take_driver,
+            bindings.session.take_driver,
             defaults.session_take_driver,
-            "session_take_driver",
+            "bindings.session.take_driver",
         )?,
         session_clear: parse_bindings(
-            bindings.session_clear,
+            bindings.session.clear,
             defaults.session_clear,
-            "session_clear",
+            "bindings.session.clear",
         )?,
         session_interrupt: parse_bindings(
-            bindings.session_interrupt,
+            bindings.session.interrupt,
             defaults.session_interrupt,
-            "session_interrupt",
+            "bindings.session.interrupt",
         )?,
         session_detach: parse_bindings(
-            bindings.session_detach,
+            bindings.session.detach,
             defaults.session_detach,
-            "session_detach",
+            "bindings.session.detach",
         )?,
         session_delete_to_start: parse_bindings(
-            bindings.session_delete_to_start,
+            bindings.session.delete_to_start,
             defaults.session_delete_to_start,
-            "session_delete_to_start",
+            "bindings.session.delete_to_start",
         )?,
         session_word_left: parse_bindings(
-            bindings.session_word_left,
+            bindings.session.word_left,
             defaults.session_word_left,
-            "session_word_left",
+            "bindings.session.word_left",
         )?,
         session_word_right: parse_bindings(
-            bindings.session_word_right,
+            bindings.session.word_right,
             defaults.session_word_right,
-            "session_word_right",
+            "bindings.session.word_right",
         )?,
         session_line_start: parse_bindings(
-            bindings.session_line_start,
+            bindings.session.line_start,
             defaults.session_line_start,
-            "session_line_start",
+            "bindings.session.line_start",
         )?,
         session_line_end: parse_bindings(
-            bindings.session_line_end,
+            bindings.session.line_end,
             defaults.session_line_end,
-            "session_line_end",
+            "bindings.session.line_end",
         )?,
         session_delete_word: parse_bindings(
-            bindings.session_delete_word,
+            bindings.session.delete_word,
             defaults.session_delete_word,
-            "session_delete_word",
+            "bindings.session.delete_word",
         )?,
         session_complete: parse_bindings(
-            bindings.session_complete,
+            bindings.session.complete,
             defaults.session_complete,
-            "session_complete",
+            "bindings.session.complete",
         )?,
         session_scroll_up: parse_bindings(
-            bindings.session_scroll_up,
+            bindings.session.scroll_up,
             defaults.session_scroll_up,
-            "session_scroll_up",
+            "bindings.session.scroll_up",
         )?,
         session_scroll_down: parse_bindings(
-            bindings.session_scroll_down,
+            bindings.session.scroll_down,
             defaults.session_scroll_down,
-            "session_scroll_down",
+            "bindings.session.scroll_down",
         )?,
         session_scroll_top: parse_bindings(
-            bindings.session_scroll_top,
+            bindings.session.scroll_top,
             defaults.session_scroll_top,
-            "session_scroll_top",
+            "bindings.session.scroll_top",
         )?,
         session_scroll_bottom: parse_bindings(
-            bindings.session_scroll_bottom,
+            bindings.session.scroll_bottom,
             defaults.session_scroll_bottom,
-            "session_scroll_bottom",
+            "bindings.session.scroll_bottom",
         )?,
-        dashboard_up: parse_bindings(bindings.dashboard_up, defaults.dashboard_up, "dashboard_up")?,
+        dashboard_up: parse_bindings(
+            bindings.dashboard.up,
+            defaults.dashboard_up,
+            "bindings.dashboard.up",
+        )?,
         dashboard_down: parse_bindings(
-            bindings.dashboard_down,
+            bindings.dashboard.down,
             defaults.dashboard_down,
-            "dashboard_down",
+            "bindings.dashboard.down",
         )?,
         dashboard_view: parse_bindings(
-            bindings.dashboard_view,
+            bindings.dashboard.view,
             defaults.dashboard_view,
-            "dashboard_view",
+            "bindings.dashboard.view",
         )?,
         dashboard_take: parse_bindings(
-            bindings.dashboard_take,
+            bindings.dashboard.take,
             defaults.dashboard_take,
-            "dashboard_take",
+            "bindings.dashboard.take",
         )?,
         dashboard_search: parse_bindings(
-            bindings.dashboard_search,
+            bindings.dashboard.search,
             defaults.dashboard_search,
-            "dashboard_search",
+            "bindings.dashboard.search",
         )?,
         dashboard_new: parse_bindings(
-            bindings.dashboard_new,
+            bindings.dashboard.new,
             defaults.dashboard_new,
-            "dashboard_new",
+            "bindings.dashboard.new",
         )?,
         dashboard_rename: parse_bindings(
-            bindings.dashboard_rename,
+            bindings.dashboard.rename,
             defaults.dashboard_rename,
-            "dashboard_rename",
+            "bindings.dashboard.rename",
         )?,
         dashboard_delete: parse_bindings(
-            bindings.dashboard_delete,
+            bindings.dashboard.delete,
             defaults.dashboard_delete,
-            "dashboard_delete",
+            "bindings.dashboard.delete",
         )?,
         dashboard_stop: parse_bindings(
-            bindings.dashboard_stop,
+            bindings.dashboard.stop,
             defaults.dashboard_stop,
-            "dashboard_stop",
+            "bindings.dashboard.stop",
         )?,
         dashboard_keybindings: parse_bindings(
-            bindings.dashboard_keybindings,
+            bindings.dashboard.keybindings,
             defaults.dashboard_keybindings,
-            "dashboard_keybindings",
+            "bindings.dashboard.keybindings",
         )?,
         dashboard_close: parse_bindings(
-            bindings.dashboard_close,
+            bindings.dashboard.close,
             defaults.dashboard_close,
-            "dashboard_close",
+            "bindings.dashboard.close",
         )?,
     };
     validate_bindings(&bindings)?;
@@ -1102,8 +1243,14 @@ fn parse_bindings(
         values
             .iter()
             .map(|value| {
-                parse_key_binding(value)
-                    .map_err(|message| invalid(format!("bindings.{field}: {message}")))
+                value.parse::<KeyBinding>().map_err(|error| {
+                    let path = if field.starts_with("bindings.") {
+                        field.to_owned()
+                    } else {
+                        format!("bindings.{field}")
+                    };
+                    invalid(format!("{path}: {error}"))
+                })
             })
             .collect()
     })
@@ -1118,234 +1265,27 @@ fn parse_modifiers(
         values
             .iter()
             .map(|value| {
-                parse_modifier_set(value)
-                    .map_err(|message| invalid(format!("bindings.{field}: {message}")))
+                parse_key_modifiers(value).map_err(|error| {
+                    let path = if field.starts_with("bindings.") {
+                        field.to_owned()
+                    } else {
+                        format!("bindings.{field}")
+                    };
+                    invalid(format!("{path}: {error}"))
+                })
             })
             .collect()
     })
 }
 
 fn validate_bindings(bindings: &ShellBindings) -> io::Result<()> {
-    validate_binding_context(
-        &[
-            ("leaders", &bindings.leaders),
-            ("palette", &bindings.palette),
-            ("redraw", &bindings.redraw),
-            ("next_screen", &bindings.next_screen),
-            ("previous_screen", &bindings.previous_screen),
-        ],
-        &[("jump_modifiers", &bindings.jump_modifiers)],
-    )?;
-    validate_binding_context(
-        &[
-            ("shell_detach", &bindings.shell_detach),
-            ("shell_next_screen", &bindings.shell_next_screen),
-            ("shell_previous_screen", &bindings.shell_previous_screen),
-            ("shell_help", &bindings.shell_help),
-        ],
-        &[],
-    )?;
-    validate_binding_context(
-        &[
-            ("leader_palette", &bindings.leader_palette),
-            ("leader_next_screen", &bindings.leader_next_screen),
-            ("leader_previous_screen", &bindings.leader_previous_screen),
-            ("leader_scroll_up", &bindings.leader_scroll_up),
-            ("leader_scroll_down", &bindings.leader_scroll_down),
-            ("leader_close", &bindings.leader_close),
-            ("leader_detach", &bindings.leader_detach),
-            ("leader_help", &bindings.leader_help),
-        ],
-        &[("leader_jump_modifiers", &bindings.leader_jump_modifiers)],
-    )?;
-    validate_binding_context(
-        &[
-            ("action_next_screen", &bindings.action_next_screen),
-            ("action_previous_screen", &bindings.action_previous_screen),
-            ("action_scroll_up", &bindings.action_scroll_up),
-            ("action_scroll_down", &bindings.action_scroll_down),
-            ("action_close", &bindings.action_close),
-            ("action_detach", &bindings.action_detach),
-            ("action_help", &bindings.action_help),
-            ("action_clear_query", &bindings.action_clear_query),
-        ],
-        &[("action_jump_modifiers", &bindings.action_jump_modifiers)],
-    )?;
-    validate_binding_context(
-        &[
-            ("session_release_driver", &bindings.session_release_driver),
-            ("session_take_driver", &bindings.session_take_driver),
-            ("session_clear", &bindings.session_clear),
-            ("session_interrupt", &bindings.session_interrupt),
-            ("session_detach", &bindings.session_detach),
-            ("session_delete_to_start", &bindings.session_delete_to_start),
-            ("session_word_left", &bindings.session_word_left),
-            ("session_word_right", &bindings.session_word_right),
-            ("session_line_start", &bindings.session_line_start),
-            ("session_line_end", &bindings.session_line_end),
-            ("session_delete_word", &bindings.session_delete_word),
-            ("session_complete", &bindings.session_complete),
-            ("session_scroll_up", &bindings.session_scroll_up),
-            ("session_scroll_down", &bindings.session_scroll_down),
-            ("session_scroll_top", &bindings.session_scroll_top),
-            ("session_scroll_bottom", &bindings.session_scroll_bottom),
-        ],
-        &[],
-    )?;
-    validate_binding_context(
-        &[
-            ("dashboard_up", &bindings.dashboard_up),
-            ("dashboard_down", &bindings.dashboard_down),
-            ("dashboard_view", &bindings.dashboard_view),
-            ("dashboard_take", &bindings.dashboard_take),
-            ("dashboard_search", &bindings.dashboard_search),
-            ("dashboard_new", &bindings.dashboard_new),
-            ("dashboard_rename", &bindings.dashboard_rename),
-            ("dashboard_delete", &bindings.dashboard_delete),
-            ("dashboard_stop", &bindings.dashboard_stop),
-            ("dashboard_keybindings", &bindings.dashboard_keybindings),
-            ("dashboard_close", &bindings.dashboard_close),
-        ],
-        &[],
-    )
-}
-
-fn validate_binding_context(
-    groups: &[(&str, &Vec<KeyBinding>)],
-    modifier_groups: &[(&str, &Vec<KeyModifiers>)],
-) -> io::Result<()> {
-    for (name, modifier_list) in modifier_groups {
-        if let Some(duplicate) = modifier_list
-            .iter()
-            .enumerate()
-            .find_map(|(item, modifier)| {
-                modifier_list[item + 1..]
-                    .contains(modifier)
-                    .then_some(*modifier)
-            })
-        {
-            return Err(invalid(format!(
-                "bindings.{name} contains {} more than once",
-                modifier_label(duplicate)
-            )));
-        }
-    }
-    for (index, (left_name, left)) in groups.iter().enumerate() {
-        if let Some(duplicate) = left
-            .iter()
-            .enumerate()
-            .find_map(|(item, binding)| left[item + 1..].contains(binding).then_some(*binding))
-        {
-            return Err(invalid(format!(
-                "bindings.{left_name} contains {} more than once",
-                duplicate.label()
-            )));
-        }
-        for (right_name, right) in &groups[index + 1..] {
-            if let Some(collision) = left.iter().find(|binding| right.contains(binding)) {
-                return Err(invalid(format!(
-                    "{} is assigned to both bindings.{left_name} and bindings.{right_name}",
-                    collision.label()
-                )));
-            }
-        }
-        for (modifier_name, modifiers) in modifier_groups {
-            for modifiers in *modifiers {
-                for digit in '1'..='9' {
-                    let jump = KeyBinding::new(KeyCode::Char(digit), *modifiers);
-                    if left.contains(&jump) {
-                        return Err(invalid(format!(
-                            "{} is assigned to both bindings.{left_name} and bindings.{modifier_name}",
-                            jump.label()
-                        )));
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn parse_key_binding(value: &str) -> Result<KeyBinding, String> {
-    let normalized = value.trim().to_ascii_lowercase();
-    let mut parts: Vec<&str> = normalized.split('-').collect();
-    let key = parts
-        .pop()
-        .filter(|key| !key.is_empty())
-        .ok_or_else(|| format!("'{value}' has no key"))?;
-    let modifiers = parse_modifier_parts(&parts, value)?;
-    let code = match key {
-        "backspace" => KeyCode::Backspace,
-        "enter" | "return" => KeyCode::Enter,
-        "left" => KeyCode::Left,
-        "right" => KeyCode::Right,
-        "up" => KeyCode::Up,
-        "down" => KeyCode::Down,
-        "home" => KeyCode::Home,
-        "end" => KeyCode::End,
-        "pageup" | "pgup" => KeyCode::PageUp,
-        "pagedown" | "pgdown" => KeyCode::PageDown,
-        "tab" => KeyCode::Tab,
-        "backtab" => KeyCode::BackTab,
-        "delete" | "del" => KeyCode::Delete,
-        "insert" | "ins" => KeyCode::Insert,
-        "escape" | "esc" => KeyCode::Esc,
-        "space" => KeyCode::Char(' '),
-        key if key.len() == 1 => KeyCode::Char(key.chars().next().unwrap_or_default()),
-        key if key.starts_with('f') => {
-            let number = key[1..]
-                .parse::<u8>()
-                .ok()
-                .filter(|number| (1..=24).contains(number))
-                .ok_or_else(|| format!("'{key}' is not a supported function key"))?;
-            KeyCode::F(number)
-        }
-        _ => return Err(format!("'{key}' is not a supported key name")),
-    };
-    Ok(KeyBinding::new(code, modifiers))
-}
-
-fn parse_modifier_set(value: &str) -> Result<KeyModifiers, String> {
-    let normalized = value.trim().to_ascii_lowercase();
-    if normalized == "none" {
-        return Ok(KeyModifiers::empty());
-    }
-    let parts: Vec<&str> = normalized.split(['-', '+']).collect();
-    let modifiers = parse_modifier_parts(&parts, value)?;
-    if modifiers.is_empty() {
-        return Err(format!("'{value}' must contain at least one modifier"));
-    }
-    Ok(modifiers)
+    bindings
+        .validate()
+        .map_err(|error| invalid(error.to_string()))
 }
 
 fn modifier_label(modifiers: KeyModifiers) -> String {
-    if modifiers.is_empty() {
-        "none".to_owned()
-    } else {
-        KeyBinding::new(KeyCode::Char('1'), modifiers)
-            .label()
-            .trim_end_matches("-1")
-            .to_ascii_lowercase()
-    }
-}
-
-fn parse_modifier_parts(parts: &[&str], original: &str) -> Result<KeyModifiers, String> {
-    let mut modifiers = KeyModifiers::empty();
-    for part in parts {
-        let modifier = match *part {
-            "ctrl" | "control" => KeyModifiers::CONTROL,
-            "alt" | "option" | "opt" => KeyModifiers::ALT,
-            "shift" => KeyModifiers::SHIFT,
-            "super" | "cmd" | "command" => KeyModifiers::SUPER,
-            "" => return Err(format!("'{original}' contains an empty modifier")),
-            unknown => return Err(format!("'{unknown}' is not a supported modifier")),
-        };
-        if modifiers.contains(modifier) {
-            return Err(format!("'{original}' repeats a modifier"));
-        }
-        modifiers.insert(modifier);
-    }
-    Ok(modifiers)
+    key_modifiers_config_label(modifiers).unwrap_or_else(|_| format!("{modifiers:?}"))
 }
 
 fn print_resolved(config: &ShellConfig, format: ConfigFormat) {
@@ -1386,7 +1326,12 @@ fn color_name(color: Option<Color>) -> String {
 fn print_binding_list(name: &str, bindings: &[KeyBinding]) {
     let values = bindings
         .iter()
-        .map(|binding| format!("\"{}\"", binding.label().to_ascii_lowercase()))
+        .map(|binding| {
+            let label = binding
+                .config_label()
+                .unwrap_or_else(|_| binding.label().to_ascii_lowercase());
+            format!("\"{label}\"")
+        })
         .collect::<Vec<_>>()
         .join(", ");
     println!("{name} = [{values}]");
@@ -1399,38 +1344,7 @@ fn invalid(message: impl Into<String>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn key_chords_parse_with_terminal_friendly_aliases() {
-        assert_eq!(
-            parse_key_binding("Option-Right"),
-            Ok(KeyBinding::new(KeyCode::Right, KeyModifiers::ALT))
-        );
-        assert_eq!(
-            parse_key_binding("ctrl-space"),
-            Ok(KeyBinding::new(KeyCode::Char(' '), KeyModifiers::CONTROL))
-        );
-        assert_eq!(
-            parse_key_binding("ctrl-`"),
-            Ok(KeyBinding::new(KeyCode::Char('`'), KeyModifiers::CONTROL))
-        );
-        assert_eq!(
-            parse_key_binding("Ctrl-PgDown"),
-            Ok(KeyBinding::new(KeyCode::PageDown, KeyModifiers::CONTROL))
-        );
-        assert_eq!(
-            parse_key_binding("ctrl-/"),
-            Ok(KeyBinding::new(KeyCode::Char('/'), KeyModifiers::CONTROL))
-        );
-    }
-
-    #[test]
-    fn captured_chords_reject_unrepresentable_modifiers() {
-        let binding = KeyBinding::new(KeyCode::Char('h'), KeyModifiers::HYPER);
-        let error = canonical_binding(binding).expect_err("Hyper cannot be persisted");
-
-        assert!(error.to_string().contains("cannot store"));
-    }
+    use turtletap::KeyCode;
 
     #[test]
     fn conflicting_bindings_are_rejected() {
@@ -1455,8 +1369,46 @@ mod tests {
     }
 
     #[test]
+    fn text_input_contexts_reject_unmodified_characters_and_arrows() {
+        let defaults = ShellBindings::default();
+        let character = ShellBindings {
+            session_interrupt: vec![KeyBinding::new(KeyCode::Char('x'), KeyModifiers::empty())],
+            ..defaults.clone()
+        };
+        let arrow = ShellBindings {
+            action_next_screen: vec![KeyBinding::new(KeyCode::Right, KeyModifiers::empty())],
+            ..defaults
+        };
+
+        assert!(
+            validate_bindings(&character)
+                .expect_err("unmodified session text should fail")
+                .to_string()
+                .contains("bindings.session.interrupt")
+        );
+        assert!(
+            validate_bindings(&arrow)
+                .expect_err("unmodified action-bar arrow should fail")
+                .to_string()
+                .contains("bindings.action.next-screen")
+        );
+    }
+
+    #[test]
+    fn single_keys_remain_valid_in_leader_and_dashboard_contexts() {
+        let defaults = ShellBindings::default();
+        let bindings = ShellBindings {
+            leader_close: vec![KeyBinding::new(KeyCode::Char('z'), KeyModifiers::empty())],
+            dashboard_view: vec![KeyBinding::new(KeyCode::Char('z'), KeyModifiers::empty())],
+            ..defaults
+        };
+
+        validate_bindings(&bindings).expect("scoped single-key actions should remain valid");
+    }
+
+    #[test]
     fn unmodified_digit_groups_parse_for_leader_sequences() {
-        assert_eq!(parse_modifier_set("none"), Ok(KeyModifiers::empty()));
+        assert_eq!(parse_key_modifiers("none"), Ok(KeyModifiers::empty()));
     }
 
     #[test]
@@ -1485,7 +1437,7 @@ mod tests {
         assert!(config.bindings.next_screen.is_empty());
         assert_eq!(
             config.bindings.redraw[0],
-            KeyBinding::new(KeyCode::Char('/'), KeyModifiers::CONTROL)
+            KeyBinding::new(KeyCode::F(5), KeyModifiers::NONE)
         );
         assert_eq!(
             config.bindings.action_close[0],
@@ -1495,6 +1447,7 @@ mod tests {
             config.bindings.dashboard_new[0],
             KeyBinding::new(KeyCode::Char('n'), KeyModifiers::empty())
         );
+        assert_eq!(config.bindings, ShellBindings::default());
         assert_eq!(config.theme.selected.bg, Some(Color::Cyan));
     }
 
@@ -1508,10 +1461,56 @@ mod tests {
     }
 
     #[test]
+    fn legacy_flat_context_binding_names_remain_readable() {
+        let kdl = "bindings {\n    session-interrupt \"ctrl-c\"\n}\n";
+        let toml = "[bindings]\nsession_interrupt = [\"ctrl-c\"]\n";
+
+        let kdl_config = resolve(
+            "test",
+            parse_kdl(kdl, Path::new("config.kdl")).expect("legacy flat KDL should parse"),
+        )
+        .expect("legacy flat KDL should resolve");
+        let toml_config = resolve(
+            "test",
+            parse_toml(toml, Path::new("config.toml")).expect("legacy flat TOML should parse"),
+        )
+        .expect("legacy flat TOML should resolve");
+
+        assert_eq!(
+            kdl_config.bindings.session_interrupt,
+            toml_config.bindings.session_interrupt
+        );
+    }
+
+    #[test]
+    fn duplicate_nested_and_legacy_binding_names_are_rejected() {
+        let kdl = "bindings {\n    session-interrupt \"ctrl-c\"\n    session {\n        interrupt \"ctrl-x\"\n    }\n}\n";
+        let toml = "[bindings]\nsession_interrupt = [\"ctrl-c\"]\n[bindings.session]\ninterrupt = [\"ctrl-x\"]\n";
+
+        let kdl_error =
+            parse_kdl(kdl, Path::new("config.kdl")).expect_err("duplicate KDL should fail");
+        let toml_error =
+            parse_toml(toml, Path::new("config.toml")).expect_err("duplicate TOML should fail");
+
+        assert!(kdl_error.to_string().contains("more than once"));
+        assert!(
+            toml_error
+                .to_string()
+                .contains("nested and legacy flat form")
+        );
+    }
+
+    #[test]
     fn kdl_binding_update_preserves_surrounding_comments_and_resolves() {
         let source = "// keep me\nbindings {\n    palette \"ctrl-p\" // keep this too\n}\n";
-        let updated = update_kdl_binding(source, "palette", "ctrl-space", Path::new("config.kdl"))
-            .expect("binding should update");
+        let updated = update_kdl_binding(
+            source,
+            None,
+            "palette",
+            "ctrl-space",
+            Path::new("config.kdl"),
+        )
+        .expect("binding should update");
 
         assert!(updated.contains("// keep me"));
         assert!(updated.contains("// keep this too"));
@@ -1527,9 +1526,14 @@ mod tests {
     #[test]
     fn toml_binding_update_preserves_surrounding_comments_and_resolves() {
         let source = "# keep me\n[bindings]\npalette = [\"ctrl-p\"] # keep this too\n";
-        let updated =
-            update_toml_binding(source, "palette", "ctrl-space", Path::new("config.toml"))
-                .expect("binding should update");
+        let updated = update_toml_binding(
+            source,
+            None,
+            "palette",
+            "ctrl-space",
+            Path::new("config.toml"),
+        )
+        .expect("binding should update");
 
         assert!(updated.contains("# keep me"));
         assert!(updated.contains("# keep this too"));
@@ -1539,6 +1543,84 @@ mod tests {
             config.bindings.palette,
             vec![KeyBinding::new(KeyCode::Char(' '), KeyModifiers::CONTROL)]
         );
+    }
+
+    #[test]
+    fn scoped_binding_updates_stay_inside_their_kdl_group() {
+        let source = "bindings {\n    session {\n        interrupt \"ctrl-c\" // keep\n    }\n}\n";
+        let updated = update_kdl_binding(
+            source,
+            Some("session"),
+            "interrupt",
+            "ctrl-x",
+            Path::new("config.kdl"),
+        )
+        .expect("scoped binding should update");
+
+        assert!(updated.contains("session {"));
+        assert!(updated.contains("interrupt \"ctrl-x\""));
+        assert!(updated.contains("// keep"));
+        let settings =
+            parse_kdl(&updated, Path::new("config.kdl")).expect("updated KDL should parse");
+        let config = resolve("test", settings).expect("updated KDL should resolve");
+        assert_eq!(
+            config.bindings.session_interrupt,
+            vec![KeyBinding::new(KeyCode::Char('x'), KeyModifiers::CONTROL)]
+        );
+    }
+
+    #[test]
+    fn scoped_binding_updates_stay_inside_their_toml_table() {
+        let source = "[bindings.session]\ninterrupt = [\"ctrl-c\"] # keep\n\n[bindings.dashboard]\nview = [\"v\"]\n";
+        let updated = update_toml_binding(
+            source,
+            Some("session"),
+            "interrupt",
+            "ctrl-x",
+            Path::new("config.toml"),
+        )
+        .expect("scoped binding should update");
+
+        assert!(updated.contains("[bindings.session]"));
+        assert!(updated.contains("interrupt = [\"ctrl-x\"]"));
+        assert!(updated.contains("# keep"));
+        assert!(updated.contains("[bindings.dashboard]"));
+        let settings: SettingsFile = ::toml::from_str(&updated).expect("updated TOML should parse");
+        let config = resolve("test", settings).expect("updated TOML should resolve");
+        assert_eq!(
+            config.bindings.session_interrupt,
+            vec![KeyBinding::new(KeyCode::Char('x'), KeyModifiers::CONTROL)]
+        );
+    }
+
+    #[test]
+    fn scoped_binding_updates_preserve_legacy_flat_layout() {
+        let kdl = "bindings {\n    session-interrupt \"ctrl-c\" // keep\n}\n";
+        let toml = "[bindings]\nsession_interrupt = [\"ctrl-c\"] # keep\n";
+
+        let updated_kdl = update_kdl_binding(
+            kdl,
+            Some("session"),
+            "interrupt",
+            "ctrl-x",
+            Path::new("config.kdl"),
+        )
+        .expect("legacy KDL binding should update");
+        let updated_toml = update_toml_binding(
+            toml,
+            Some("session"),
+            "interrupt",
+            "ctrl-x",
+            Path::new("config.toml"),
+        )
+        .expect("legacy TOML binding should update");
+
+        assert!(updated_kdl.contains("session-interrupt \"ctrl-x\""));
+        assert!(!updated_kdl.contains("session {"));
+        assert!(updated_kdl.contains("// keep"));
+        assert!(updated_toml.contains("session_interrupt = [\"ctrl-x\"]"));
+        assert!(!updated_toml.contains("[bindings.session]"));
+        assert!(updated_toml.contains("# keep"));
     }
 
     #[test]

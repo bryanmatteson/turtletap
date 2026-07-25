@@ -38,6 +38,18 @@ fn every_top_level_command_accepts_help() {
 }
 
 #[test]
+fn public_command_aliases_accept_help() {
+    for command in ["create", "settings"] {
+        let output = run(&[command, "--help"]);
+        assert!(output.status.success(), "{command}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("Usage:"),
+            "{command}: {output:?}"
+        );
+    }
+}
+
+#[test]
 fn config_actions_have_focused_help() {
     for action in ["show", "path", "check", "init", "edit", "reload", "keys"] {
         let output = run(&["config", action, "--help"]);
@@ -114,30 +126,69 @@ fn config_init_requires_an_explicit_format_switch() {
     let activated = invoke(&["config", "init", "toml", "--activate"]);
     assert!(activated.status.success(), "{activated:?}");
     let path = invoke(&["config", "path"]);
-    let path: serde_json::Value =
-        serde_json::from_slice(&path.stdout).expect("captured path should be JSON");
-    assert!(
-        path["path"]
-            .as_str()
-            .is_some_and(|path| path.ends_with("config.toml")),
-        "{path:?}"
-    );
+    let path = String::from_utf8(path.stdout).expect("captured path should be text");
+    assert!(path.trim_end().ends_with("config.toml"), "{path:?}");
     let selected_kdl = invoke(&["config", "init", "kdl", "--activate"]);
     assert!(selected_kdl.status.success(), "{selected_kdl:?}");
     let selected: serde_json::Value =
         serde_json::from_slice(&selected_kdl.stdout).expect("selection should be JSON");
     assert_eq!(selected["created"], false);
     let path = invoke(&["config", "path"]);
-    let path: serde_json::Value =
-        serde_json::from_slice(&path.stdout).expect("captured path should be JSON");
-    assert!(
-        path["path"]
-            .as_str()
-            .is_some_and(|path| path.ends_with("config.kdl")),
-        "{path:?}"
-    );
+    let path = String::from_utf8(path.stdout).expect("captured path should be text");
+    assert!(path.trim_end().ends_with("config.kdl"), "{path:?}");
 
     let _ = std::fs::remove_dir_all(isolated);
+}
+
+#[test]
+fn config_path_is_always_one_raw_path() {
+    let isolated =
+        std::env::temp_dir().join(format!("turtletap-config-path-{}", std::process::id()));
+    let expected = isolated.join("turtletap/config.kdl");
+
+    for arguments in [
+        &["config", "path"][..],
+        &["--format", "human", "config", "path"],
+        &["--format", "json", "config", "path"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_turtletap"))
+            .args(arguments)
+            .env("XDG_CONFIG_HOME", &isolated)
+            .env_remove("TURTLETAP_CONFIG")
+            .output()
+            .expect("turtletap should run");
+
+        assert!(output.status.success(), "{arguments:?}: {output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            format!("{}\n", expected.display()),
+            "{arguments:?}"
+        );
+        assert!(output.stderr.is_empty(), "{arguments:?}: {output:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn config_path_is_safe_in_shell_substitution() {
+    let isolated =
+        std::env::temp_dir().join(format!("turtletap-config-shell-{}", std::process::id()));
+    let expected = isolated.join("turtletap/config.kdl");
+    let output = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("path=$($TURTLETAP_BIN config path) && printf '%s' \"$path\"")
+        .env("TURTLETAP_BIN", env!("CARGO_BIN_EXE_turtletap"))
+        .env("XDG_CONFIG_HOME", &isolated)
+        .env_remove("TURTLETAP_CONFIG")
+        .output()
+        .expect("shell should run");
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        expected.display().to_string()
+    );
+    assert!(output.stderr.is_empty(), "{output:?}");
 }
 
 #[test]
@@ -164,18 +215,86 @@ fn help_is_honored_after_positional_arguments() {
 
 #[test]
 fn completions_and_man_page_are_generated() {
-    let completions = run(&["completions", "zsh"]);
+    for shell in ["bash", "elvish", "fish", "powershell", "zsh"] {
+        let completions = run(&["completions", shell]);
+        assert!(completions.status.success(), "{shell}: {completions:?}");
+        assert!(
+            String::from_utf8_lossy(&completions.stdout).contains("turtletap"),
+            "{shell}: {completions:?}"
+        );
+        assert!(completions.stderr.is_empty(), "{shell}: {completions:?}");
+    }
+
     let man = run(&["man"]);
-    assert!(completions.status.success(), "{completions:?}");
-    assert!(
-        String::from_utf8_lossy(&completions.stdout).contains("_turtletap"),
-        "{completions:?}"
-    );
     assert!(man.status.success(), "{man:?}");
     assert!(
         String::from_utf8_lossy(&man.stdout).contains(".TH turtletap"),
         "{man:?}"
     );
+    assert!(man.stderr.is_empty(), "{man:?}");
+}
+
+#[test]
+fn config_show_check_edit_reload_and_alias_cover_both_formats() {
+    let isolated = std::env::temp_dir().join(format!(
+        "turtletap-config-surface-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should follow the Unix epoch")
+            .as_nanos()
+    ));
+    let invoke = |arguments: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_turtletap"))
+            .args(arguments)
+            .env("XDG_CONFIG_HOME", &isolated)
+            .env_remove("TURTLETAP_CONFIG")
+            .env_remove("VISUAL")
+            .env("EDITOR", "/usr/bin/true")
+            .output()
+            .expect("turtletap should run")
+    };
+
+    let initialized = invoke(&["config", "init", "kdl"]);
+    assert!(initialized.status.success(), "{initialized:?}");
+
+    let kdl = invoke(&["config", "show", "kdl"]);
+    assert!(kdl.status.success(), "{kdl:?}");
+    let kdl = String::from_utf8_lossy(&kdl.stdout);
+    assert!(kdl.contains("shell mouse-capture="), "{kdl:?}");
+    assert!(kdl.contains("bindings {"), "{kdl:?}");
+
+    let toml = invoke(&["settings", "show", "toml"]);
+    assert!(toml.status.success(), "{toml:?}");
+    let toml = String::from_utf8_lossy(&toml.stdout);
+    assert!(toml.contains("[shell]"), "{toml:?}");
+    assert!(toml.contains("[bindings.dashboard]"), "{toml:?}");
+
+    let checked = invoke(&["--format", "human", "config", "check"]);
+    assert!(checked.status.success(), "{checked:?}");
+    assert!(
+        String::from_utf8_lossy(&checked.stdout).contains("Configuration is valid:"),
+        "{checked:?}"
+    );
+
+    let edited = invoke(&["--format", "json", "config", "edit"]);
+    assert!(edited.status.success(), "{edited:?}");
+    let edited: serde_json::Value =
+        serde_json::from_slice(&edited.stdout).expect("edit report should be JSON");
+    assert_eq!(edited["edited"], true);
+    assert_eq!(edited["valid"], true);
+
+    let reloaded = invoke(&["--format=json", "config", "reload"]);
+    assert!(reloaded.status.success(), "{reloaded:?}");
+    let reloaded: serde_json::Value =
+        serde_json::from_slice(&reloaded.stdout).expect("reload report should be JSON");
+    assert_eq!(reloaded["valid"], true);
+    assert_eq!(
+        reloaded["applies_on"],
+        "automatic_file_watch_or_next_attach"
+    );
+
+    let _ = std::fs::remove_dir_all(isolated);
 }
 
 #[test]
@@ -294,6 +413,83 @@ fn noninteractive_create_delete_and_stop_have_safe_machine_contracts() {
 
 #[test]
 #[cfg(unix)]
+fn start_create_alias_rename_doctor_and_human_list_form_a_complete_cli_lifecycle() {
+    let isolated = std::path::PathBuf::from("/tmp").join(format!(
+        "turtletap-cli-lifecycle-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should follow the Unix epoch")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&isolated).expect("isolated test directory should be created");
+    let socket = isolated.join("resident.sock");
+    let state = isolated.join("state");
+    let config = isolated.join("config");
+    let invoke = |arguments: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_turtletap"))
+            .args(arguments)
+            .env("TURTLETAP_SOCKET", &socket)
+            .env("TURTLETAP_STATE_DIR", &state)
+            .env("XDG_CONFIG_HOME", &config)
+            .output()
+            .expect("turtletap should run")
+    };
+
+    let started = invoke(&["--format=json", "start"]);
+    assert!(started.status.success(), "{started:?}");
+    let started: serde_json::Value =
+        serde_json::from_slice(&started.stdout).expect("start report should be JSON");
+    assert_eq!(started["resident"], "running");
+    assert_eq!(started["started"], true);
+
+    let created = invoke(&["--format", "json", "create", "build", "--no-attach"]);
+    assert!(created.status.success(), "{created:?}");
+    let created: serde_json::Value =
+        serde_json::from_slice(&created.stdout).expect("create report should be JSON");
+    assert_eq!(created["session"]["name"], "build");
+    assert_eq!(created["attached"], false);
+
+    let renamed = invoke(&["--format=json", "rename", "build", "ci"]);
+    assert!(renamed.status.success(), "{renamed:?}");
+    let renamed: serde_json::Value =
+        serde_json::from_slice(&renamed.stdout).expect("rename report should be JSON");
+    assert_eq!(renamed["old_name"], "build");
+    assert_eq!(renamed["session"]["name"], "ci");
+
+    let listed = invoke(&["--format", "human", "--no-color", "list"]);
+    assert!(listed.status.success(), "{listed:?}");
+    let listed = String::from_utf8_lossy(&listed.stdout);
+    assert!(listed.contains("NAME"), "{listed:?}");
+    assert!(listed.contains("ci"), "{listed:?}");
+    assert!(!listed.contains('\u{1b}'), "{listed:?}");
+
+    let doctor = invoke(&["--format=json", "doctor"]);
+    assert!(doctor.status.success(), "{doctor:?}");
+    let doctor: serde_json::Value =
+        serde_json::from_slice(&doctor.stdout).expect("doctor report should be JSON");
+    assert_eq!(doctor["platform"]["persistent_sessions_supported"], true);
+    assert_eq!(doctor["resident"]["running"], true);
+    assert_eq!(
+        doctor["resident"]["socket"],
+        socket.to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        doctor["resident"]["state_dir"],
+        state.to_string_lossy().as_ref()
+    );
+    assert_eq!(doctor["config"]["valid"], true);
+
+    let deleted = invoke(&["--format=json", "delete", "ci", "--yes"]);
+    assert!(deleted.status.success(), "{deleted:?}");
+    let stopped = invoke(&["--format=json", "stop"]);
+    assert!(stopped.status.success(), "{stopped:?}");
+
+    let _ = std::fs::remove_dir_all(isolated);
+}
+
+#[test]
+#[cfg(unix)]
 fn invalid_session_names_are_rejected_before_creation() {
     let isolated = std::path::PathBuf::from("/tmp")
         .join(format!("turtletap-cli-names-{}", std::process::id()));
@@ -329,7 +525,7 @@ fn invalid_session_names_are_rejected_before_creation() {
 
 #[test]
 #[cfg(unix)]
-fn rejected_interactive_json_request_does_not_start_the_resident() {
+fn interactive_commands_reject_json_before_starting_or_mutating_the_resident() {
     let isolated = std::path::PathBuf::from("/tmp")
         .join(format!("turtletap-cli-preflight-{}", std::process::id()));
     let socket = isolated.join("resident.sock");
@@ -343,11 +539,24 @@ fn rejected_interactive_json_request_does_not_start_the_resident() {
             .expect("turtletap should run")
     };
 
-    let rejected = invoke(&["open", "--format", "json"]);
-    assert_eq!(rejected.status.code(), Some(2), "{rejected:?}");
-    let error: serde_json::Value =
-        serde_json::from_slice(&rejected.stderr).expect("usage error should be JSON");
-    assert_eq!(error["error"]["code"], "usage_error");
+    for arguments in [
+        &["open", "--format", "json"][..],
+        &["attach", "default", "--format", "json"],
+        &["view", "default", "--format", "json"],
+        &["take", "default", "--yes", "--format", "json"],
+        &["new", "build", "--format", "json"],
+        &["config", "keys", "--format", "json"],
+    ] {
+        let rejected = invoke(arguments);
+        assert_eq!(
+            rejected.status.code(),
+            Some(2),
+            "{arguments:?}: {rejected:?}"
+        );
+        let error: serde_json::Value =
+            serde_json::from_slice(&rejected.stderr).expect("usage error should be JSON");
+        assert_eq!(error["error"]["code"], "usage_error", "{arguments:?}");
+    }
 
     let status = invoke(&["status"]);
     let report: serde_json::Value =

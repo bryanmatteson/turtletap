@@ -47,6 +47,18 @@ impl LeaderLock {
         let socket_path = socket_path.into();
         let mut lock_path = socket_path.clone();
         lock_path.set_extension("lock");
+        Self::new(lock_path, socket_path)
+    }
+
+    #[cfg(all(unix, feature = "tokio"))]
+    pub(crate) fn for_startup(socket_path: impl Into<PathBuf>) -> Self {
+        let socket_path = socket_path.into();
+        let mut lock_path = socket_path.clone();
+        lock_path.set_extension("start.lock");
+        Self::new(lock_path, socket_path)
+    }
+
+    fn new(lock_path: PathBuf, socket_path: PathBuf) -> Self {
         Self {
             lock_path,
             socket_path,

@@ -15,7 +15,10 @@ use futures_util::{StreamExt as _, future::OptionFuture};
 use ratatui::{Terminal, backend::TestBackend, layout::Rect};
 
 use crate::{
-    InputPolicy, Surface, SurfaceAction, SurfaceEvent, Theme, render, terminal::TerminalSession,
+    InputPolicy, Surface, SurfaceAction, SurfaceEvent, Theme,
+    binding::{KeyBinding, ShellBindings},
+    render,
+    terminal::TerminalSession,
 };
 
 const PULSE_FRAME_RATE: Duration = Duration::from_millis(250);
@@ -75,191 +78,6 @@ pub enum ShellSignal {
     Exit(ExitReason),
 }
 
-/// One key chord reserved by the shell.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct KeyBinding {
-    /// The non-modifier key.
-    pub code: KeyCode,
-    /// Required modifier keys.
-    pub modifiers: KeyModifiers,
-}
-
-impl KeyBinding {
-    /// Creates a key binding.
-    #[must_use]
-    pub const fn new(code: KeyCode, modifiers: KeyModifiers) -> Self {
-        Self { code, modifiers }
-    }
-
-    /// Returns whether this binding matches a terminal key event exactly.
-    #[must_use]
-    pub fn matches(self, key: KeyEvent) -> bool {
-        self.code == key.code && self.modifiers == key.modifiers
-    }
-
-    /// Returns the compact label used by help and shell chrome.
-    #[must_use]
-    pub fn label(self) -> String {
-        let mut parts = Vec::new();
-        if self.modifiers.contains(KeyModifiers::CONTROL) {
-            parts.push("Ctrl".to_owned());
-        }
-        if self.modifiers.contains(KeyModifiers::ALT) {
-            parts.push("Alt".to_owned());
-        }
-        if self.modifiers.contains(KeyModifiers::SHIFT) {
-            parts.push("Shift".to_owned());
-        }
-        if self.modifiers.contains(KeyModifiers::SUPER) {
-            parts.push(
-                if cfg!(target_os = "macos") {
-                    "Cmd"
-                } else {
-                    "Super"
-                }
-                .to_owned(),
-            );
-        }
-        parts.push(match self.code {
-            KeyCode::Backspace => "Backspace".to_owned(),
-            KeyCode::Enter => "Enter".to_owned(),
-            KeyCode::Left => "Left".to_owned(),
-            KeyCode::Right => "Right".to_owned(),
-            KeyCode::Up => "Up".to_owned(),
-            KeyCode::Down => "Down".to_owned(),
-            KeyCode::Home => "Home".to_owned(),
-            KeyCode::End => "End".to_owned(),
-            KeyCode::PageUp => "PageUp".to_owned(),
-            KeyCode::PageDown => "PageDown".to_owned(),
-            KeyCode::Tab => "Tab".to_owned(),
-            KeyCode::BackTab => "BackTab".to_owned(),
-            KeyCode::Delete => "Delete".to_owned(),
-            KeyCode::Insert => "Insert".to_owned(),
-            KeyCode::F(number) => format!("F{number}"),
-            KeyCode::Char(' ') => "Space".to_owned(),
-            KeyCode::Char(character) => character.to_string().to_uppercase(),
-            KeyCode::Esc => "Esc".to_owned(),
-            _ => "Key".to_owned(),
-        });
-        parts.join("-")
-    }
-}
-
-/// Configurable action bindings for shell and host interaction contexts.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ShellBindings {
-    /// Chords that arm the shell leader.
-    pub leaders: Vec<KeyBinding>,
-    /// Chords that open the action bar.
-    pub palette: Vec<KeyBinding>,
-    /// Chords that clear and fully redraw the terminal frame.
-    pub redraw: Vec<KeyBinding>,
-    /// Chords that focus the next screen.
-    pub next_screen: Vec<KeyBinding>,
-    /// Chords that focus the previous screen.
-    pub previous_screen: Vec<KeyBinding>,
-    /// Modifiers which, with digits 1 through 9, jump to a screen.
-    pub jump_modifiers: Vec<KeyModifiers>,
-    /// Shell-managed-surface shortcuts that detach the terminal.
-    pub shell_detach: Vec<KeyBinding>,
-    /// Shell-managed-surface shortcuts that focus the next screen.
-    pub shell_next_screen: Vec<KeyBinding>,
-    /// Shell-managed-surface shortcuts that focus the previous screen.
-    pub shell_previous_screen: Vec<KeyBinding>,
-    /// Shell-managed-surface shortcuts that open contextual help.
-    pub shell_help: Vec<KeyBinding>,
-    /// Leader suffixes that open the action bar.
-    pub leader_palette: Vec<KeyBinding>,
-    /// Leader suffixes that focus the next screen.
-    pub leader_next_screen: Vec<KeyBinding>,
-    /// Leader suffixes that focus the previous screen.
-    pub leader_previous_screen: Vec<KeyBinding>,
-    /// Leader suffixes that scroll the active screen upward.
-    pub leader_scroll_up: Vec<KeyBinding>,
-    /// Leader suffixes that scroll the active screen downward.
-    pub leader_scroll_down: Vec<KeyBinding>,
-    /// Leader suffixes that close the active screen.
-    pub leader_close: Vec<KeyBinding>,
-    /// Leader suffixes that detach the terminal.
-    pub leader_detach: Vec<KeyBinding>,
-    /// Leader suffixes that open contextual help.
-    pub leader_help: Vec<KeyBinding>,
-    /// Leader-suffix modifiers which, with digits 1 through 9, jump to a screen.
-    pub leader_jump_modifiers: Vec<KeyModifiers>,
-    /// Action-bar shortcuts that focus the next screen.
-    pub action_next_screen: Vec<KeyBinding>,
-    /// Action-bar shortcuts that focus the previous screen.
-    pub action_previous_screen: Vec<KeyBinding>,
-    /// Action-bar shortcuts that scroll the active screen upward.
-    pub action_scroll_up: Vec<KeyBinding>,
-    /// Action-bar shortcuts that scroll the active screen downward.
-    pub action_scroll_down: Vec<KeyBinding>,
-    /// Action-bar shortcuts that close the active screen.
-    pub action_close: Vec<KeyBinding>,
-    /// Action-bar shortcuts that detach the terminal.
-    pub action_detach: Vec<KeyBinding>,
-    /// Action-bar shortcuts that open contextual help.
-    pub action_help: Vec<KeyBinding>,
-    /// Action-bar shortcuts that clear the search query.
-    pub action_clear_query: Vec<KeyBinding>,
-    /// Action-bar modifiers which, with digits 1 through 9, jump to a screen.
-    pub action_jump_modifiers: Vec<KeyModifiers>,
-    /// Session shortcuts that release the driver lease.
-    pub session_release_driver: Vec<KeyBinding>,
-    /// Session shortcuts that take the driver lease.
-    pub session_take_driver: Vec<KeyBinding>,
-    /// Session shortcuts that clear the transcript.
-    pub session_clear: Vec<KeyBinding>,
-    /// Session shortcuts that interrupt a running command.
-    pub session_interrupt: Vec<KeyBinding>,
-    /// Session shortcuts that detach the terminal from an empty prompt.
-    pub session_detach: Vec<KeyBinding>,
-    /// Session shortcuts that delete input before the cursor.
-    pub session_delete_to_start: Vec<KeyBinding>,
-    /// Session shortcuts that move to the previous word.
-    pub session_word_left: Vec<KeyBinding>,
-    /// Session shortcuts that move to the next word.
-    pub session_word_right: Vec<KeyBinding>,
-    /// Session shortcuts that move to the start of the input line.
-    pub session_line_start: Vec<KeyBinding>,
-    /// Session shortcuts that move to the end of the input line.
-    pub session_line_end: Vec<KeyBinding>,
-    /// Session shortcuts that delete the previous word.
-    pub session_delete_word: Vec<KeyBinding>,
-    /// Session shortcuts that complete the current command.
-    pub session_complete: Vec<KeyBinding>,
-    /// Session shortcuts that scroll upward.
-    pub session_scroll_up: Vec<KeyBinding>,
-    /// Session shortcuts that scroll downward.
-    pub session_scroll_down: Vec<KeyBinding>,
-    /// Session shortcuts that jump to the oldest output.
-    pub session_scroll_top: Vec<KeyBinding>,
-    /// Session shortcuts that return to live output.
-    pub session_scroll_bottom: Vec<KeyBinding>,
-    /// Dashboard shortcuts that move selection upward.
-    pub dashboard_up: Vec<KeyBinding>,
-    /// Dashboard shortcuts that move selection downward.
-    pub dashboard_down: Vec<KeyBinding>,
-    /// Dashboard shortcuts that open the selected session in view mode.
-    pub dashboard_view: Vec<KeyBinding>,
-    /// Dashboard shortcuts that take the selected session.
-    pub dashboard_take: Vec<KeyBinding>,
-    /// Dashboard shortcuts that start search.
-    pub dashboard_search: Vec<KeyBinding>,
-    /// Dashboard shortcuts that create a session.
-    pub dashboard_new: Vec<KeyBinding>,
-    /// Dashboard shortcuts that rename the selected session.
-    pub dashboard_rename: Vec<KeyBinding>,
-    /// Dashboard shortcuts that delete the selected session.
-    pub dashboard_delete: Vec<KeyBinding>,
-    /// Dashboard shortcuts that stop the resident leader.
-    pub dashboard_stop: Vec<KeyBinding>,
-    /// Dashboard shortcuts that open the keybinding editor.
-    pub dashboard_keybindings: Vec<KeyBinding>,
-    /// Dashboard shortcuts that close the overview.
-    pub dashboard_close: Vec<KeyBinding>,
-}
-
 impl Default for ShellBindings {
     fn default() -> Self {
         Self {
@@ -269,19 +87,19 @@ impl Default for ShellBindings {
                 // Some terminals encode Ctrl-` as the same NUL byte as
                 // Ctrl-Space, so accept both representations.
                 KeyBinding::new(KeyCode::Char(' '), KeyModifiers::CONTROL),
-                KeyBinding::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
             ],
-            redraw: vec![
-                KeyBinding::new(KeyCode::Char('/'), KeyModifiers::CONTROL),
-                KeyBinding::new(KeyCode::Char('_'), KeyModifiers::CONTROL),
-            ],
+            redraw: vec![plain(KeyCode::F(5))],
             next_screen: Vec::new(),
             previous_screen: Vec::new(),
             jump_modifiers: Vec::new(),
             shell_detach: vec![ctrl('d')],
             shell_next_screen: vec![plain(KeyCode::Tab)],
             shell_previous_screen: vec![plain(KeyCode::BackTab)],
-            shell_help: vec![plain(KeyCode::Char('?'))],
+            shell_help: vec![
+                plain(KeyCode::Char('?')),
+                plain(KeyCode::F(1)),
+                alt(KeyCode::Char('h')),
+            ],
             leader_palette: vec![plain(KeyCode::Char('s'))],
             leader_next_screen: vec![
                 plain(KeyCode::Char('n')),
@@ -311,8 +129,8 @@ impl Default for ShellBindings {
             session_release_driver: vec![plain(KeyCode::F(2))],
             session_take_driver: vec![plain(KeyCode::F(3))],
             session_clear: vec![
-                KeyBinding::new(KeyCode::Char('k'), KeyModifiers::SUPER),
                 ctrl('l'),
+                KeyBinding::new(KeyCode::Char('k'), KeyModifiers::SUPER),
             ],
             session_interrupt: vec![ctrl('c')],
             session_detach: vec![ctrl('d')],
@@ -320,11 +138,17 @@ impl Default for ShellBindings {
                 ctrl('u'),
                 KeyBinding::new(KeyCode::Backspace, KeyModifiers::SUPER),
             ],
-            session_word_left: vec![alt(KeyCode::Left), alt(KeyCode::Char('b'))],
-            session_word_right: vec![alt(KeyCode::Right), alt(KeyCode::Char('f'))],
-            session_line_start: vec![KeyBinding::new(KeyCode::Left, KeyModifiers::SUPER)],
-            session_line_end: vec![KeyBinding::new(KeyCode::Right, KeyModifiers::SUPER)],
-            session_delete_word: vec![alt(KeyCode::Backspace)],
+            session_word_left: vec![alt(KeyCode::Char('b')), alt(KeyCode::Left)],
+            session_word_right: vec![alt(KeyCode::Char('f')), alt(KeyCode::Right)],
+            session_line_start: vec![
+                ctrl('a'),
+                KeyBinding::new(KeyCode::Left, KeyModifiers::SUPER),
+            ],
+            session_line_end: vec![
+                ctrl('e'),
+                KeyBinding::new(KeyCode::Right, KeyModifiers::SUPER),
+            ],
+            session_delete_word: vec![ctrl('w'), alt(KeyCode::Backspace)],
             session_complete: vec![plain(KeyCode::Tab)],
             session_scroll_up: vec![plain(KeyCode::PageUp)],
             session_scroll_down: vec![plain(KeyCode::PageDown)],
@@ -582,8 +406,9 @@ pub(crate) enum Overlay {
     Help,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PaletteAction {
+    RunSurfaceCommand(std::borrow::Cow<'static, str>),
     SelectSurface(usize),
     NextSurface,
     PreviousSurface,
@@ -597,6 +422,7 @@ pub(crate) enum PaletteAction {
 pub(crate) struct PaletteItem {
     pub(crate) label: String,
     pub(crate) detail: String,
+    pub(crate) shortcut: Option<String>,
     pub(crate) status: Option<crate::SurfaceStatus>,
     pub(crate) action: PaletteAction,
 }
@@ -683,7 +509,7 @@ impl Shell {
         id
     }
 
-    /// Number of currently open surfaces.
+    /// Number of open surfaces.
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -987,8 +813,8 @@ impl Shell {
             return ShellSignal::Continue;
         }
 
-        // Direct screen navigation is intentionally available even when the
-        // active surface captures ordinary input.
+        // Direct screen navigation remains active while the surface captures
+        // ordinary input.
         if ShellBindings::matches(&self.config.bindings.previous_screen, key) {
             self.select_relative(-1);
             return ShellSignal::Continue;
@@ -1146,7 +972,7 @@ impl Shell {
                         if let Some(action) = self
                             .palette_items(&query)
                             .get(selected)
-                            .map(|item| item.action)
+                            .map(|item| item.action.clone())
                         {
                             signal = self.execute_palette_action(action);
                         }
@@ -1366,10 +1192,9 @@ impl Shell {
     }
 
     fn open_palette(&mut self) {
-        let selected = self.active.unwrap_or(0);
         self.overlay = Some(Overlay::Palette {
             query: String::new(),
-            selected,
+            selected: 0,
         });
         self.dirty = true;
     }
@@ -1392,6 +1217,13 @@ impl Shell {
     fn execute_palette_action(&mut self, action: PaletteAction) -> ShellSignal {
         self.overlay = None;
         match action {
+            PaletteAction::RunSurfaceCommand(id) => {
+                let Some(index) = self.active else {
+                    return ShellSignal::Exit(ExitReason::NoSurfaces);
+                };
+                let action = self.entries[index].surface.execute_command(&id);
+                self.apply_surface_action(index, action)
+            }
             PaletteAction::SelectSurface(index) => {
                 self.select_index(index);
                 ShellSignal::Continue
@@ -1417,88 +1249,93 @@ impl Shell {
 
     pub(crate) fn palette_items(&self, query: &str) -> Vec<PaletteItem> {
         let mut items = self
-            .entries
-            .iter()
-            .enumerate()
-            .map(|(index, entry)| {
-                let status = entry.surface.status();
-                PaletteItem {
-                    label: format!("Switch to {}", entry.surface.title()),
-                    detail: format!("surface · {}", status.label()),
-                    status: Some(status),
-                    action: PaletteAction::SelectSurface(index),
-                }
+            .active_surface()
+            .into_iter()
+            .flat_map(|surface| surface.commands())
+            .map(|command| PaletteItem {
+                label: command.label.into_owned(),
+                detail: command.description.into_owned(),
+                shortcut: command.shortcut.map(std::borrow::Cow::into_owned),
+                status: None,
+                action: PaletteAction::RunSurfaceCommand(command.id),
             })
             .collect::<Vec<_>>();
+        items.extend(self.entries.iter().enumerate().map(|(index, entry)| {
+            let status = entry.surface.status();
+            PaletteItem {
+                label: format!("Switch to {}", entry.surface.title()),
+                detail: if self.active == Some(index) {
+                    format!("Surface · current · {}", status.label())
+                } else {
+                    format!("Surface · {}", status.label())
+                },
+                shortcut: None,
+                status: Some(status),
+                action: PaletteAction::SelectSurface(index),
+            }
+        }));
         items.extend([
             PaletteItem {
                 label: "Next surface".to_owned(),
-                detail: format!(
-                    "action bar · {}",
-                    primary_binding_label(&self.config.bindings.action_next_screen)
-                ),
+                detail: "Shell".to_owned(),
+                shortcut: primary_binding_label(&self.config.bindings.action_next_screen),
                 status: None,
                 action: PaletteAction::NextSurface,
             },
             PaletteItem {
                 label: "Previous surface".to_owned(),
-                detail: format!(
-                    "action bar · {}",
-                    primary_binding_label(&self.config.bindings.action_previous_screen)
-                ),
+                detail: "Shell".to_owned(),
+                shortcut: primary_binding_label(&self.config.bindings.action_previous_screen),
                 status: None,
                 action: PaletteAction::PreviousSurface,
             },
             PaletteItem {
                 label: "Scroll active surface up".to_owned(),
-                detail: format!(
-                    "action bar · {}",
-                    primary_binding_label(&self.config.bindings.action_scroll_up)
-                ),
+                detail: "Shell".to_owned(),
+                shortcut: primary_binding_label(&self.config.bindings.action_scroll_up),
                 status: None,
                 action: PaletteAction::ScrollUp,
             },
             PaletteItem {
                 label: "Scroll active surface down".to_owned(),
-                detail: format!(
-                    "action bar · {}",
-                    primary_binding_label(&self.config.bindings.action_scroll_down)
-                ),
+                detail: "Shell".to_owned(),
+                shortcut: primary_binding_label(&self.config.bindings.action_scroll_down),
                 status: None,
                 action: PaletteAction::ScrollDown,
             },
             PaletteItem {
                 label: "Close active surface".to_owned(),
-                detail: format!(
-                    "action bar · {}",
-                    primary_binding_label(&self.config.bindings.action_close)
-                ),
+                detail: "Shell".to_owned(),
+                shortcut: primary_binding_label(&self.config.bindings.action_close),
                 status: None,
                 action: PaletteAction::CloseSurface,
             },
             PaletteItem {
                 label: "Detach".to_owned(),
-                detail: format!(
-                    "action bar · {}",
-                    primary_binding_label(&self.config.bindings.action_detach)
-                ),
+                detail: "Shell".to_owned(),
+                shortcut: primary_binding_label(&self.config.bindings.action_detach),
                 status: None,
                 action: PaletteAction::Detach,
             },
             PaletteItem {
                 label: "Show keyboard help".to_owned(),
-                detail: format!(
-                    "action bar · {}",
-                    primary_binding_label(&self.config.bindings.action_help)
-                ),
+                detail: "Shell".to_owned(),
+                shortcut: primary_binding_label(&self.config.bindings.action_help),
                 status: None,
                 action: PaletteAction::Help,
             },
         ]);
-        items
+        let mut matched = items
             .into_iter()
-            .filter(|item| palette_matches(item, query))
-            .collect()
+            .enumerate()
+            .filter_map(|(position, item)| {
+                palette_match_score(&item, query).map(|score| (score, position, item))
+            })
+            .collect::<Vec<_>>();
+        if !query.trim().is_empty() {
+            matched.sort_by_key(|(score, position, _)| (*score, *position));
+        }
+        matched.into_iter().map(|(_, _, item)| item).collect()
     }
 
     fn close_active(&mut self) -> ShellSignal {
@@ -1613,10 +1450,8 @@ impl Shell {
     }
 }
 
-fn primary_binding_label(bindings: &[KeyBinding]) -> String {
-    bindings
-        .first()
-        .map_or_else(|| "disabled".to_owned(), |binding| binding.label())
+fn primary_binding_label(bindings: &[KeyBinding]) -> Option<String> {
+    bindings.first().map(|binding| binding.label())
 }
 
 fn wrap_index(current: usize, delta: isize, len: usize) -> usize {
@@ -1633,22 +1468,54 @@ fn contains(area: Rect, x: u16, y: u16) -> bool {
         && y < area.y.saturating_add(area.height)
 }
 
-fn palette_matches(item: &PaletteItem, query: &str) -> bool {
+fn palette_match_score(item: &PaletteItem, query: &str) -> Option<usize> {
     let query = query.trim().to_lowercase();
     if query.is_empty() {
-        return true;
+        return Some(0);
     }
-    let haystack = format!("{} {}", item.label, item.detail).to_lowercase();
+    let label = item.label.to_lowercase();
+    let detail = item.detail.to_lowercase();
+    let haystack = format!("{label} {detail}");
     query
         .split_whitespace()
-        .all(|needle| fuzzy_subsequence(needle, &haystack))
+        .map(|needle| fuzzy_score(needle, &label, &haystack))
+        .try_fold(0, |total, score| score.map(|score| total + score))
 }
 
-fn fuzzy_subsequence(needle: &str, haystack: &str) -> bool {
-    let mut characters = haystack.chars();
-    needle
-        .chars()
-        .all(|needle| characters.by_ref().any(|candidate| candidate == needle))
+fn fuzzy_score(needle: &str, label: &str, haystack: &str) -> Option<usize> {
+    if label == needle {
+        return Some(0);
+    }
+    if label
+        .split(|character: char| !character.is_alphanumeric())
+        .any(|word| word == needle)
+    {
+        return Some(10);
+    }
+    if label
+        .split(|character: char| !character.is_alphanumeric())
+        .any(|word| word.starts_with(needle))
+    {
+        return Some(20);
+    }
+    if let Some(position) = label.find(needle) {
+        return Some(30 + position);
+    }
+    if let Some(position) = haystack.find(needle) {
+        return Some(50 + position);
+    }
+
+    let mut cursor = 0;
+    let mut first = None;
+    let mut last = 0;
+    for character in needle.chars() {
+        let offset = haystack[cursor..].find(character)?;
+        let position = cursor + offset;
+        first.get_or_insert(position);
+        last = position;
+        cursor = position + character.len_utf8();
+    }
+    Some(100 + last.saturating_sub(first.unwrap_or(0)))
 }
 
 #[cfg(test)]
@@ -1790,13 +1657,34 @@ mod tests {
         shell.dirty = false;
 
         assert_eq!(
-            shell.handle_event(Event::Key(KeyEvent::new(
-                KeyCode::Char('/'),
-                KeyModifiers::CONTROL,
-            ))),
+            shell.handle_event(Event::Key(
+                KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE,)
+            )),
             ShellSignal::Continue
         );
         assert!(shell.clear_requested);
         assert!(shell.dirty);
+    }
+
+    #[test]
+    fn palette_search_prefers_exact_labels_to_subsequence_matches() {
+        let exact = PaletteItem {
+            label: "Detach".to_owned(),
+            detail: "Shell".to_owned(),
+            shortcut: None,
+            status: None,
+            action: PaletteAction::Detach,
+        };
+        let subsequence = PaletteItem {
+            label: "Detach terminal".to_owned(),
+            detail: "Dashboard".to_owned(),
+            shortcut: None,
+            status: None,
+            action: PaletteAction::Detach,
+        };
+
+        assert!(
+            palette_match_score(&exact, "detach") < palette_match_score(&subsequence, "detach")
+        );
     }
 }

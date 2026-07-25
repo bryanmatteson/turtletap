@@ -21,7 +21,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use turtletap::{
     Frame, InputPolicy, KeyBinding, KeyCode, KeyEvent, KeyModifiers, MouseEventKind, Rect,
-    ShellBindings, Shortcut, Surface, SurfaceAction, SurfaceEvent, SurfaceStatus,
+    ShellBindings, Shortcut, Surface, SurfaceAction, SurfaceCommand, SurfaceEvent, SurfaceStatus,
     resident::EffectWake,
     tui::{
         layout::{Constraint, Direction, Layout, Position},
@@ -34,6 +34,16 @@ use turtletap::{
 pub(crate) const MAX_TRANSCRIPT_LINES: usize = 5_000;
 pub(crate) const MAX_HISTORY_LINES: usize = 1_000;
 pub(crate) const ACTIVE_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+const CLEAR_TRANSCRIPT: &str = "command.clear";
+const INTERRUPT_COMMAND: &str = "command.interrupt";
+const SHOW_COMMAND_HELP: &str = "command.help";
+const SHOW_COMMANDS: &str = "command.commands";
+const SHOW_QUEUE: &str = "command.queue";
+
+const fn initial_command_id() -> u64 {
+    1
+}
 
 pub(crate) fn matches_binding(bindings: &[KeyBinding], key: KeyEvent) -> bool {
     bindings.iter().any(|binding| binding.matches(key))
@@ -48,6 +58,14 @@ pub(crate) fn binding_labels(bindings: &[KeyBinding]) -> String {
         .map(|binding| binding.label())
         .collect::<Vec<_>>()
         .join(" / ")
+}
+
+pub(crate) fn command_shortcut(command: SurfaceCommand, bindings: &[KeyBinding]) -> SurfaceCommand {
+    if let Some(binding) = bindings.first() {
+        command.with_shortcut(binding.label())
+    } else {
+        command
+    }
 }
 
 pub(crate) fn leader_binding_label(leaders: &[KeyBinding], suffixes: &[KeyBinding]) -> String {
@@ -206,8 +224,11 @@ pub(crate) struct CommandSurface {
     environment: BTreeMap<String, String>,
     pending: VecDeque<String>,
     started_command: Option<String>,
+    started_command_id: Option<u64>,
+    next_command_id: u64,
     cwd: PathBuf,
     running: Option<RunningCommand>,
+    reconnect_scheduled: bool,
     last_worker_sequence: u64,
     worker_recoverable: bool,
     last_failed: bool,
@@ -226,6 +247,10 @@ pub(crate) struct PersistedCommandSurface {
     pending: VecDeque<String>,
     cwd: PathBuf,
     running_command: Option<String>,
+    #[serde(default)]
+    running_command_id: Option<u64>,
+    #[serde(default = "initial_command_id")]
+    next_command_id: u64,
     #[serde(default)]
     last_worker_sequence: u64,
     #[serde(default)]
@@ -249,8 +274,11 @@ impl CommandSurface {
             environment: BTreeMap::new(),
             pending: VecDeque::new(),
             started_command: None,
+            started_command_id: None,
+            next_command_id: initial_command_id(),
             cwd,
             running: None,
+            reconnect_scheduled: false,
             last_worker_sequence: 0,
             worker_recoverable: false,
             last_failed: false,
@@ -265,7 +293,7 @@ impl CommandSurface {
         );
         surface.push(
             TranscriptKind::System,
-            "Child commands receive closed stdin; interactive programs should be run in a normal terminal.",
+            "Child commands receive closed stdin. Run interactive programs in a separate terminal.",
         );
         Ok(surface)
     }
@@ -337,6 +365,8 @@ impl CommandSurface {
             pending: self.pending.clone(),
             cwd: self.cwd.clone(),
             running_command: self.started_command.clone(),
+            running_command_id: self.started_command_id,
+            next_command_id: self.next_command_id,
             last_worker_sequence: self
                 .running
                 .as_ref()
@@ -349,8 +379,9 @@ impl CommandSurface {
 
     pub(crate) fn restore(state: PersistedCommandSurface) -> Self {
         let interrupted = state.running_command;
+        let recoverable = state.worker_recoverable && state.running_command_id.is_some();
         let mut pending = state.pending;
-        if !state.worker_recoverable
+        if !recoverable
             && interrupted
                 .as_ref()
                 .is_some_and(|command| pending.front() == Some(command))
@@ -368,22 +399,20 @@ impl CommandSurface {
             commands: state.commands,
             environment: state.environment,
             pending,
-            started_command: state
-                .worker_recoverable
-                .then(|| interrupted.clone())
-                .flatten(),
+            started_command: recoverable.then(|| interrupted.clone()).flatten(),
+            started_command_id: recoverable.then_some(state.running_command_id).flatten(),
+            next_command_id: state.next_command_id,
             cwd: state.cwd,
             running: None,
+            reconnect_scheduled: false,
             last_worker_sequence: state.last_worker_sequence,
-            worker_recoverable: state.worker_recoverable,
+            worker_recoverable: recoverable,
             last_failed: state.last_failed,
             revision: state.revision,
             scrollback: Scrollback::default(),
             multiline_confirmation: false,
         };
-        if !state.worker_recoverable
-            && let Some(command) = interrupted
-        {
+        if !recoverable && let Some(command) = interrupted {
             surface.last_failed = true;
             surface.push(
                 TranscriptKind::Error,
@@ -396,10 +425,12 @@ impl CommandSurface {
     pub(crate) fn execute(&mut self, line: &str) -> SurfaceAction {
         if self.started_command.is_none() {
             self.started_command = Some(line.to_owned());
+            self.started_command_id = Some(self.allocate_command_id());
             self.touch();
         }
         if let Some(action) = self.run_builtin(line) {
             self.started_command = None;
+            self.started_command_id = None;
             self.touch();
             return action;
         }
@@ -412,6 +443,7 @@ impl CommandSurface {
             }
             Err(error) => {
                 self.started_command = None;
+                self.started_command_id = None;
                 self.last_failed = true;
                 self.push(
                     TranscriptKind::Error,
@@ -832,7 +864,9 @@ impl CommandSurface {
             return SurfaceAction::Ignored;
         };
         self.started_command = None;
+        self.started_command_id = None;
         self.worker_recoverable = false;
+        self.reconnect_scheduled = false;
         self.touch();
         match running.completion {
             Some(CommandCompletion::Exited(status)) => {
@@ -1045,7 +1079,7 @@ impl CommandSurface {
         self.commands.keys().cloned().collect()
     }
 
-    /// Whether a child process is currently executing.
+    /// Whether a child process is executing.
     pub(crate) fn is_running(&self) -> bool {
         self.running.is_some()
     }
@@ -1070,6 +1104,8 @@ impl CommandSurface {
             pending: self.pending.clone(),
             cwd: self.cwd.clone(),
             running_command: self.started_command.clone(),
+            running_command_id: self.started_command_id,
+            next_command_id: self.next_command_id,
             last_worker_sequence: self
                 .running
                 .as_ref()
@@ -1092,7 +1128,10 @@ impl CommandSurface {
         self.pending.clone_from(&state.pending);
         self.cwd.clone_from(&state.cwd);
         self.started_command.clone_from(&state.running_command);
+        self.started_command_id = state.running_command_id;
+        self.next_command_id = state.next_command_id;
         self.running = None;
+        self.reconnect_scheduled = false;
         self.last_worker_sequence = state.last_worker_sequence;
         self.worker_recoverable = state.worker_recoverable;
         self.last_failed = state.last_failed;
@@ -1170,6 +1209,7 @@ impl CommandSurface {
             let _ = self.pending.pop_front();
         }
         self.running = Some(running);
+        self.reconnect_scheduled = false;
         self.last_failed = false;
     }
 
@@ -1178,7 +1218,11 @@ impl CommandSurface {
         self.touch();
     }
 
-    /// Records that the started command's child process could not be spawned.
+    pub(crate) fn worker_cursor(&self) -> u64 {
+        self.last_worker_sequence
+    }
+
+    /// Records a child-process spawn failure.
     pub(crate) fn command_launch_failed(&mut self, message: impl std::fmt::Display) {
         if self
             .started_command
@@ -1188,7 +1232,9 @@ impl CommandSurface {
             let _ = self.pending.pop_front();
         }
         self.started_command = None;
+        self.started_command_id = None;
         self.worker_recoverable = false;
+        self.reconnect_scheduled = false;
         self.last_failed = true;
         self.push(
             TranscriptKind::Error,
@@ -1202,6 +1248,15 @@ impl CommandSurface {
         if self.started_command.is_some() {
             let _ = self.pending.pop_front();
         }
+        self.started_command = None;
+        self.started_command_id = None;
+        self.worker_recoverable = false;
+        self.reconnect_scheduled = false;
+        self.last_failed = true;
+        self.push(
+            TranscriptKind::Error,
+            "The command may have started, but its outcome could not be recovered.",
+        );
     }
 
     /// Advances the pending queue, running builtins inline, and returns the
@@ -1209,25 +1264,50 @@ impl CommandSurface {
     ///
     /// Returns `None` when a command is already running, one is already
     /// started, or the queue drains without reaching an external command.
-    pub(crate) fn start_next_external(&mut self) -> Option<(String, PathBuf)> {
+    pub(crate) fn start_next_external(&mut self) -> Option<(u64, String, PathBuf, bool)> {
+        if self.running.is_none()
+            && self.worker_recoverable
+            && !self.reconnect_scheduled
+            && let (Some(command_id), Some(line)) =
+                (self.started_command_id, self.started_command.clone())
+        {
+            self.reconnect_scheduled = true;
+            return Some((
+                command_id,
+                self.with_environment(&self.expand_command(&line)),
+                self.cwd.clone(),
+                true,
+            ));
+        }
         while self.running.is_none() && self.started_command.is_none() {
             let line = self.pending.front().cloned()?;
             self.last_worker_sequence = 0;
             self.worker_recoverable = false;
             self.started_command = Some(line.clone());
+            let command_id = self.allocate_command_id();
+            self.started_command_id = Some(command_id);
             self.touch();
             if self.run_builtin(&line).is_some() {
                 let _ = self.pending.pop_front();
                 self.started_command = None;
+                self.started_command_id = None;
                 self.touch();
                 continue;
             }
             return Some((
+                command_id,
                 self.with_environment(&self.expand_command(&line)),
                 self.cwd.clone(),
+                false,
             ));
         }
         None
+    }
+
+    fn allocate_command_id(&mut self) -> u64 {
+        let command_id = self.next_command_id.max(initial_command_id());
+        self.next_command_id = command_id.saturating_add(1);
+        command_id
     }
 }
 
@@ -1238,11 +1318,7 @@ impl RunningCommand {
         }
         #[cfg(unix)]
         if let Some(worker) = self.worker.as_mut() {
-            use std::io::Write as _;
-            serde_json::to_writer(&mut *worker, &crate::worker::WorkerRequest::Interrupt)
-                .map_err(io::Error::other)?;
-            worker.write_all(b"\n")?;
-            worker.flush()?;
+            crate::worker::write_frame(worker, &crate::worker::WorkerRequest::Interrupt)?;
             return Ok(());
         }
         Err(io::Error::new(
@@ -1255,17 +1331,16 @@ impl RunningCommand {
 #[cfg(unix)]
 pub(crate) fn running_from_worker(
     stream: UnixStream,
+    control: UnixStream,
     wake: Option<EffectWake>,
 ) -> io::Result<RunningCommand> {
-    let reader = stream.try_clone()?;
     let (sender, output) = mpsc::channel();
     let completion = Arc::new(Mutex::new(None));
     let reader_completion = Arc::clone(&completion);
     thread::spawn(move || {
-        for event in serde_json::Deserializer::from_reader(BufReader::new(reader))
-            .into_iter::<crate::worker::WorkerEvent>()
-        {
-            let event = match event {
+        let mut stream = stream;
+        loop {
+            let event = match crate::worker::read_frame::<crate::worker::WorkerEvent>(&mut stream) {
                 Ok(event) => event,
                 Err(error) => {
                     let _ = sender.send(OutputLine {
@@ -1273,10 +1348,25 @@ pub(crate) fn running_from_worker(
                         text: format!("worker protocol error: {error}"),
                         sequence: None,
                     });
+                    if let Ok(mut completion) = reader_completion.lock() {
+                        *completion = Some(125);
+                    }
                     break;
                 }
             };
             match event {
+                crate::worker::WorkerEvent::Ready => {}
+                crate::worker::WorkerEvent::OutputGap {
+                    first_available, ..
+                } => {
+                    let _ = sender.send(OutputLine {
+                        stream: OutputStream::Stderr,
+                        text: format!(
+                            "Earlier worker output was pruned; replay resumes at sequence {first_available}."
+                        ),
+                        sequence: None,
+                    });
+                }
                 crate::worker::WorkerEvent::Output {
                     sequence,
                     stderr,
@@ -1314,6 +1404,7 @@ pub(crate) fn running_from_worker(
                         sequence: None,
                     });
                 }
+                crate::worker::WorkerEvent::Stopped => {}
             }
             if let Some(wake) = &wake {
                 wake.notify();
@@ -1325,7 +1416,7 @@ pub(crate) fn running_from_worker(
     });
     Ok(RunningCommand {
         child: None,
-        worker: Some(stream),
+        worker: Some(control),
         output,
         completion: None,
         output_disconnected: false,
@@ -1357,6 +1448,10 @@ pub(crate) struct ShellRecoveryState {
     pending: VecDeque<String>,
     cwd: PathBuf,
     running_command: Option<String>,
+    #[serde(default)]
+    running_command_id: Option<u64>,
+    #[serde(default = "initial_command_id")]
+    next_command_id: u64,
     #[serde(default)]
     last_worker_sequence: u64,
     #[serde(default)]
@@ -1660,6 +1755,46 @@ impl Surface for CommandSurface {
                 "Detach when input is empty",
             ),
         ]
+    }
+
+    fn commands(&self) -> Vec<SurfaceCommand> {
+        let mut commands = vec![
+            command_shortcut(
+                SurfaceCommand::new(CLEAR_TRANSCRIPT, "Clear transcript")
+                    .with_description("Command session"),
+                &self.bindings.session_clear,
+            ),
+            SurfaceCommand::new(SHOW_QUEUE, "Show queued commands")
+                .with_description("Command session"),
+            SurfaceCommand::new(SHOW_COMMANDS, "Show added commands")
+                .with_description("Command session"),
+            SurfaceCommand::new(SHOW_COMMAND_HELP, "Show command help")
+                .with_description("Command session"),
+        ];
+        if self.running.is_some() {
+            commands.insert(
+                0,
+                command_shortcut(
+                    SurfaceCommand::new(INTERRUPT_COMMAND, "Interrupt running command")
+                        .with_description("Command session"),
+                    &self.bindings.session_interrupt,
+                ),
+            );
+        }
+        commands
+    }
+
+    fn execute_command(&mut self, id: &str) -> SurfaceAction {
+        match id {
+            CLEAR_TRANSCRIPT => self.run_builtin(":clear").unwrap_or(SurfaceAction::Ignored),
+            INTERRUPT_COMMAND => self.interrupt(),
+            SHOW_COMMAND_HELP => self.run_builtin(":help").unwrap_or(SurfaceAction::Ignored),
+            SHOW_COMMANDS => self
+                .run_builtin(":commands")
+                .unwrap_or(SurfaceAction::Ignored),
+            SHOW_QUEUE => self.run_builtin(":queue").unwrap_or(SurfaceAction::Ignored),
+            _ => SurfaceAction::Ignored,
+        }
     }
 }
 
@@ -1979,6 +2114,26 @@ mod tests {
                 .last()
                 .is_some_and(|entry| entry.text.contains("only letters"))
         );
+    }
+
+    #[test]
+    fn action_bar_commands_expose_and_execute_command_session_operations() {
+        let mut surface = CommandSurface::new().expect("surface should initialize");
+        surface.push(TranscriptKind::Stdout, "visible output");
+
+        let commands = surface.commands();
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.id == CLEAR_TRANSCRIPT)
+        );
+        assert!(commands.iter().any(|command| command.id == SHOW_QUEUE));
+
+        assert!(matches!(
+            surface.execute_command(CLEAR_TRANSCRIPT),
+            SurfaceAction::Consumed
+        ));
+        assert!(surface.transcript.is_empty());
     }
 
     #[test]

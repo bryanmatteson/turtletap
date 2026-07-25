@@ -7,6 +7,7 @@ use std::{
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
+use super::journal::JournalWriter;
 use super::{
     ApplicationError, AttachmentMode, Authorization, ClientEnvelope, ClientHello, ClientInstanceId,
     ClientRequest, ConnectionId, ControlResult, DriverChange, Durability, EffectCancellation,
@@ -19,6 +20,7 @@ use super::{
 };
 
 const HOST_STORAGE_VERSION: u32 = 2;
+const OPEN_JOURNAL_LIMIT: usize = 64;
 
 /// Configuration shared by every resident application host.
 #[derive(Clone, Debug)]
@@ -309,6 +311,8 @@ struct HostState<A: ResidentApplication, R: Clock + Spawner> {
     leader: LeaderInstanceId,
     core: LeaderCore,
     sessions: HashMap<SessionId, HostedSession<A>>,
+    journals: HashMap<SessionId, JournalWriter<HostLogEvent<A::Event>>>,
+    journal_order: VecDeque<SessionId>,
     clients: HashMap<ConnectionId, async_channel::Sender<ServerMessage>>,
     incoming_tx: IncomingSender<A::EffectOutput>,
     incoming: IncomingReceiver<A::EffectOutput>,
@@ -576,6 +580,8 @@ where
             leader,
             core,
             sessions,
+            journals: HashMap::new(),
+            journal_order: VecDeque::new(),
             clients: HashMap::new(),
             incoming_tx,
             incoming,
@@ -585,6 +591,10 @@ where
         for id in state.sessions.keys().copied() {
             state.persist_manifest(id)?;
             state.persist_checkpoint(id)?;
+            state
+                .application
+                .session_available(id)
+                .map_err(io::Error::other)?;
         }
         if imported_legacy_root {
             let archive = state
@@ -625,7 +635,7 @@ where
                     envelope,
                 } => {
                     if let Some(reason) = self.handle_request(connection, envelope)? {
-                        self.shutdown(reason).await?;
+                        self.shutdown(reason)?;
                         return Ok(());
                     }
                 }
@@ -716,11 +726,17 @@ where
                 }
                 ClientRequest::Ping => Ok(ControlResult::Pong),
                 ClientRequest::StopLeader => {
+                    self.application
+                        .host_stopping(ShutdownReason::Manual)
+                        .map_err(wire_application)?;
                     shutdown = Some(ShutdownReason::Manual);
                     Ok(ControlResult::Stopping)
                 }
                 ClientRequest::ReplaceLeader { binary_version } => {
                     if super::replacement_is_newer(&self.config.binary_version, &binary_version) {
+                        self.application
+                            .host_stopping(ShutdownReason::Upgrade)
+                            .map_err(wire_application)?;
                         shutdown = Some(ShutdownReason::Upgrade);
                         Ok(ControlResult::Stopping)
                     } else {
@@ -755,6 +771,9 @@ where
         );
         self.persist_manifest(id).map_err(wire_io)?;
         self.persist_checkpoint(id).map_err(wire_io)?;
+        self.application
+            .session_available(id)
+            .map_err(wire_application)?;
         Ok(ControlResult::Created { session: summary })
     }
 
@@ -775,6 +794,7 @@ where
             self.broadcast_driver(change);
         }
         self.replay_or_snapshot(connection, id, after)?;
+        let _ = self.application.session_attached(id);
         Ok(ControlResult::Attached {
             session: outcome.session,
             lease: outcome.lease,
@@ -1238,13 +1258,6 @@ where
         .map_err(io::Error::other)
     }
 
-    fn journal(&self, session: SessionId) -> FileJournal<HostLogEvent<A::Event>> {
-        FileJournal::new(
-            self.session_directory(session).join("journal-v2.log"),
-            self.config.durability,
-        )
-    }
-
     fn append_log(&mut self, session: SessionId, event: HostLogEvent<A::Event>) -> io::Result<()> {
         let sequence = self
             .sessions
@@ -1255,7 +1268,25 @@ where
             .checked_add(1)
             .map(EventSequence)
             .ok_or_else(|| io::Error::other("session log sequence exhausted"))?;
-        self.journal(session)
+        if !self.journals.contains_key(&session) {
+            let writer = FileJournal::new(
+                self.session_directory(session).join("journal-v2.log"),
+                self.config.durability,
+            )
+            .writer()
+            .map_err(io::Error::other)?;
+            while self.journals.len() >= OPEN_JOURNAL_LIMIT {
+                if let Some(expired) = self.journal_order.pop_front() {
+                    self.journals.remove(&expired);
+                }
+            }
+            self.journals.insert(session, writer);
+        }
+        self.journal_order.retain(|recent| *recent != session);
+        self.journal_order.push_back(session);
+        self.journals
+            .get_mut(&session)
+            .expect("journal writer was inserted")
             .append(&JournalRecord {
                 sequence,
                 request: None,
@@ -1270,24 +1301,36 @@ where
     }
 
     fn stop_session(&mut self, session: SessionId) -> io::Result<()> {
-        let hosted = self
+        if !self.sessions.contains_key(&session) {
+            return Err(io::Error::other("unknown resident session"));
+        }
+        self.application
+            .session_stopping(session)
+            .map_err(io::Error::other)?;
+        if let Some(active) = self
             .sessions
-            .remove(&session)
-            .ok_or_else(|| io::Error::other("unknown resident session"))?;
-        if let Some(active) = hosted.active_effect {
+            .get(&session)
+            .and_then(|hosted| hosted.active_effect.as_ref())
+        {
             active.cancellation.cancel();
         }
+        let directory = self.session_directory(session);
+        match fs::remove_dir_all(&directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        self.sessions
+            .remove(&session)
+            .expect("session existence was checked before cleanup");
+        self.journals.remove(&session);
+        self.journal_order.retain(|recent| *recent != session);
         self.ready_effect_set.remove(&session);
         self.ready_effects.retain(|ready| *ready != session);
         self.core
             .remove_session(session)
             .map_err(io::Error::other)?;
-        let directory = self.session_directory(session);
-        match fs::remove_dir_all(directory) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
-        }
+        Ok(())
     }
 
     fn resolve(&self, selector: SessionSelector) -> Result<SessionId, WireError> {
@@ -1339,7 +1382,7 @@ where
         }
     }
 
-    async fn shutdown(&mut self, reason: ShutdownReason) -> io::Result<()> {
+    fn shutdown(&mut self, reason: ShutdownReason) -> io::Result<()> {
         for hosted in self.sessions.values() {
             if let Some(active) = &hosted.active_effect {
                 active.cancellation.cancel();
@@ -1348,15 +1391,23 @@ where
         for session in self.sessions.keys().copied().collect::<Vec<_>>() {
             self.persist_checkpoint(session)?;
         }
-        let clients: Vec<_> = self.clients.values().cloned().collect();
-        for client in &clients {
-            let _ = client.send(ServerMessage::ShuttingDown { reason }).await;
-        }
-        for client in &clients {
-            let _ = client.send(ServerMessage::Shutdown { reason }).await;
-        }
+        close_client_queues(&mut self.clients, reason);
         Ok(())
     }
+}
+
+fn close_client_queues(
+    clients: &mut HashMap<ConnectionId, async_channel::Sender<ServerMessage>>,
+    reason: ShutdownReason,
+) {
+    let clients_to_notify: Vec<_> = clients.values().cloned().collect();
+    for client in &clients_to_notify {
+        let _ = client.try_send(ServerMessage::ShuttingDown { reason });
+    }
+    for client in &clients_to_notify {
+        let _ = client.try_send(ServerMessage::Shutdown { reason });
+    }
+    clients.clear();
 }
 
 async fn serve_connection<R, C, O>(
@@ -1603,6 +1654,31 @@ mod tests {
 
     use super::*;
     use crate::resident::runtime::tokio::TokioRuntime;
+
+    #[test]
+    fn shutdown_closes_full_client_queues_without_waiting() {
+        let (sender, receiver) = async_channel::bounded(1);
+        sender
+            .try_send(ServerMessage::ShuttingDown {
+                reason: ShutdownReason::Manual,
+            })
+            .expect("fixture queue has capacity");
+        let mut clients = HashMap::from([(ConnectionId(1), sender)]);
+
+        close_client_queues(&mut clients, ShutdownReason::Manual);
+
+        assert!(clients.is_empty());
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(ServerMessage::ShuttingDown {
+                reason: ShutdownReason::Manual
+            })
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(async_channel::TryRecvError::Closed)
+        ));
+    }
 
     #[derive(Clone)]
     struct EffectApplication {

@@ -8,8 +8,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use turtletap::resident::{
-    ApplicationError, EffectContext, EffectId, EffectRequest, ResidentApplication, ResidentSession,
-    SessionTransition,
+    ApplicationError, Durability, EffectContext, EffectId, EffectRequest, ResidentApplication,
+    ResidentSession, SessionId, SessionTransition, ShutdownReason,
 };
 
 use crate::command::{
@@ -48,6 +48,7 @@ impl SessionSnapshot {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum ShellCommand {
+    Prepare,
     Submit { line: String },
     Interrupt,
     Clear,
@@ -224,9 +225,9 @@ pub(crate) struct ShellApplication {
 }
 
 impl ShellApplication {
-    pub(crate) fn new(state_root: PathBuf) -> Self {
+    pub(crate) fn new(state_root: PathBuf, durability: Durability) -> Self {
         Self {
-            workers: WorkerManager::new(state_root),
+            workers: WorkerManager::new(state_root, durability),
         }
     }
 }
@@ -234,10 +235,24 @@ impl ShellApplication {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum ShellEffect {
-    /// Legacy one-shot child retained for journal compatibility and rollback.
-    Run { command: String, cwd: PathBuf },
-    /// Idempotent dispatch through a durable per-session worker.
-    WorkerRun { command: String, cwd: PathBuf },
+    PrepareWorker,
+    /// One-shot child encoded by version-1 journal effects.
+    Run {
+        command: String,
+        cwd: PathBuf,
+    },
+    /// Deduplicated dispatch through a durable per-session worker.
+    WorkerRun {
+        command_id: u64,
+        command: String,
+        cwd: PathBuf,
+        after: u64,
+    },
+}
+
+pub(crate) enum ShellEffectOutput {
+    Prepared,
+    Running(RunningCommand),
 }
 
 impl ResidentApplication for ShellApplication {
@@ -246,10 +261,10 @@ impl ResidentApplication for ShellApplication {
     type Snapshot = SessionSnapshot;
     type State = PersistedCommandSurface;
     type Effect = ShellEffect;
-    type EffectOutput = RunningCommand;
+    type EffectOutput = ShellEffectOutput;
     type Session = CommandSurface;
 
-    const STORAGE_VERSION: u32 = 1;
+    const STORAGE_VERSION: u32 = 2;
 
     fn create(&self, _name: &str) -> Result<Self::Session, ApplicationError> {
         CommandSurface::new().map_err(shell_io)
@@ -259,19 +274,57 @@ impl ResidentApplication for ShellApplication {
         Ok(CommandSurface::restore(state))
     }
 
+    fn session_attached(&self, session: SessionId) -> Result<(), ApplicationError> {
+        self.workers
+            .prepare(session)
+            .map_err(|error| ApplicationError::new("worker_prepare", error.to_string()))
+    }
+
+    fn session_stopping(&self, session: SessionId) -> Result<(), ApplicationError> {
+        self.workers
+            .stop_session(session)
+            .map_err(|error| ApplicationError::new("worker_stop", error.to_string()))
+    }
+
+    fn host_stopping(&self, reason: ShutdownReason) -> Result<(), ApplicationError> {
+        self.workers
+            .stop_all(reason)
+            .map_err(|error| ApplicationError::new("worker_stop", error.to_string()))
+    }
+
     async fn execute(
         &self,
         context: EffectContext,
         effect: Self::Effect,
     ) -> Result<Self::EffectOutput, ApplicationError> {
         match effect {
+            ShellEffect::PrepareWorker => {
+                self.workers
+                    .prepare(context.session)
+                    .map_err(|error| ApplicationError::new("worker_prepare", error.to_string()))?;
+                Ok(ShellEffectOutput::Prepared)
+            }
             ShellEffect::Run { command, cwd } => {
                 spawn_command_with_wake(&command, &cwd, Some(context.wake_handle()))
+                    .map(ShellEffectOutput::Running)
                     .map_err(shell_io)
             }
-            ShellEffect::WorkerRun { command, cwd } => self
+            ShellEffect::WorkerRun {
+                command_id,
+                command,
+                cwd,
+                after,
+            } => self
                 .workers
-                .execute(&context, &command, &cwd, Some(context.wake_handle()))
+                .execute(
+                    context.session,
+                    command_id,
+                    &command,
+                    &cwd,
+                    after,
+                    Some(context.wake_handle()),
+                )
+                .map(ShellEffectOutput::Running)
                 .map_err(shell_io),
         }
     }
@@ -281,7 +334,7 @@ impl ResidentApplication for ShellApplication {
         stored_version: u32,
         state: serde_json::Value,
     ) -> Result<Self::State, ApplicationError> {
-        if !matches!(stored_version, 0 | Self::STORAGE_VERSION) {
+        if !matches!(stored_version, 0 | 1 | Self::STORAGE_VERSION) {
             return Err(ApplicationError::new(
                 "unsupported_storage_version",
                 format!(
@@ -301,7 +354,7 @@ impl ResidentSession for CommandSurface {
     type Snapshot = SessionSnapshot;
     type State = PersistedCommandSurface;
     type Effect = ShellEffect;
-    type EffectOutput = RunningCommand;
+    type EffectOutput = ShellEffectOutput;
 
     fn snapshot(&self) -> Self::Snapshot {
         SessionSnapshot::from_session(self)
@@ -321,6 +374,13 @@ impl ResidentSession for CommandSurface {
     ) -> Result<SessionTransition<Self::Event, Self::Effect>, ApplicationError> {
         let previous = SessionSnapshot::from_session(self);
         let effects = match command {
+            ShellCommand::Prepare => {
+                if self.is_running() || self.has_started_command() {
+                    Vec::new()
+                } else {
+                    vec![EffectRequest::at_least_once(ShellEffect::PrepareWorker)]
+                }
+            }
             ShellCommand::Submit { line } => {
                 let _ = self.accept_line(line);
                 resident_effects(self)
@@ -362,7 +422,9 @@ impl ResidentSession for CommandSurface {
     ) -> Result<SessionTransition<Self::Event, Self::Effect>, ApplicationError> {
         let previous = SessionSnapshot::from_session(self);
         match output {
-            Ok(running) => self.command_launched(running),
+            Ok(ShellEffectOutput::Prepared) => {}
+            Ok(ShellEffectOutput::Running(running)) => self.command_launched(running),
+            Err(error) if error.code() == "worker_prepare" => {}
             Err(error)
                 if error.code() == "effect_outcome_unknown" && !self.has_started_command() =>
             {
@@ -402,7 +464,7 @@ pub(crate) fn shell_transition(
 pub(crate) fn resident_effects(surface: &mut CommandSurface) -> Vec<EffectRequest<ShellEffect>> {
     surface
         .start_next_external()
-        .map(|(command, cwd)| {
+        .map(|(command_id, command, cwd, _reconnect)| {
             if std::env::var_os("TURTLETAP_PERSISTENT_SHELL").as_deref()
                 == Some(std::ffi::OsStr::new("0"))
             {
@@ -413,8 +475,10 @@ pub(crate) fn resident_effects(surface: &mut CommandSurface) -> Vec<EffectReques
             } else {
                 surface.mark_started_worker();
                 vec![EffectRequest::at_least_once(ShellEffect::WorkerRun {
+                    command_id,
                     command,
                     cwd,
+                    after: surface.worker_cursor(),
                 })]
             }
         })
@@ -448,6 +512,23 @@ pub(crate) fn transcript_append_count(
 mod tests {
     use super::*;
     use crate::command::TranscriptKind;
+
+    #[test]
+    fn prepare_command_prewarms_without_changing_visible_state() {
+        let mut surface = CommandSurface::new().expect("surface should initialize");
+        let before = SessionSnapshot::from_session(&surface);
+
+        let transition = ResidentSession::command(&mut surface, ShellCommand::Prepare)
+            .expect("prepare command should be accepted");
+
+        assert!(transition.events.is_empty());
+        assert_eq!(transition.effects.len(), 1);
+        assert!(matches!(
+            transition.effects[0].effect,
+            ShellEffect::PrepareWorker
+        ));
+        assert_eq!(SessionSnapshot::from_session(&surface), before);
+    }
 
     #[test]
     fn incremental_event_roundtrips() {

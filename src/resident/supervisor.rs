@@ -157,26 +157,20 @@ impl<'a> EnsureConfig<'a> {
 ///
 /// Reuses a running leader, replaces one older than `config.binary_version`,
 /// and otherwise takes the lock and spawns via `spawn`. The lock is released
-/// only once the new leader has bound its socket, so a second caller either
-/// waits or finds the leader already answering — never both spawn.
+/// only once the new leader answers a probe, so concurrent callers serialize
+/// before probing readiness and never create a connection stampede.
 pub fn ensure_leader(
     config: EnsureConfig<'_>,
     mut spawn: impl FnMut(&Path) -> io::Result<Child>,
 ) -> io::Result<EnsureOutcome> {
     let path = config.socket;
-    if use_or_replace_running_leader(&config)? {
-        return Ok(EnsureOutcome::AlreadyRunning);
-    }
     prepare_socket_parent(path)?;
 
     let deadline = Instant::now() + config.start_timeout;
-    let mut lock = LeaderLock::for_socket(path);
+    let mut lock = LeaderLock::for_startup(path);
     loop {
         if lock.try_acquire().map_err(io::Error::other)? {
             break;
-        }
-        if probe(path, config.binary_version, config.client_name)? {
-            return Ok(EnsureOutcome::AlreadyRunning);
         }
         if Instant::now() >= deadline {
             return Err(io::Error::new(
@@ -186,7 +180,7 @@ pub fn ensure_leader(
         }
         thread::sleep(config.poll_interval);
     }
-    if probe(path, config.binary_version, config.client_name)? {
+    if use_or_replace_running_leader(&config)? {
         lock.release_for_handoff().map_err(io::Error::other)?;
         return Ok(EnsureOutcome::AlreadyRunning);
     }
@@ -194,10 +188,6 @@ pub fn ensure_leader(
 
     let mut child = spawn(path)?;
     loop {
-        if socket_connectable(path) {
-            lock.release_for_handoff().map_err(io::Error::other)?;
-            break;
-        }
         if let Some(status) = child.try_wait()? {
             let mut detail = String::new();
             if let Some(mut stderr) = child.stderr.take() {
@@ -209,26 +199,20 @@ pub fn ensure_leader(
                 detail.trim()
             )));
         }
+        if probe(path, config.binary_version, config.client_name)? {
+            lock.release_for_handoff().map_err(io::Error::other)?;
+            return Ok(EnsureOutcome::Spawned);
+        }
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                "resident did not bind its socket within the start timeout",
+                "resident did not become ready within the start timeout",
             ));
         }
         thread::sleep(config.poll_interval);
     }
-    while Instant::now() < deadline {
-        if probe(path, config.binary_version, config.client_name)? {
-            return Ok(EnsureOutcome::Spawned);
-        }
-        thread::sleep(config.poll_interval);
-    }
-    Err(io::Error::new(
-        io::ErrorKind::TimedOut,
-        "resident did not become ready within the start timeout",
-    ))
 }
 
 /// Returns whether a usable leader is already serving, asking an older one to

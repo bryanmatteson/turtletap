@@ -6,8 +6,9 @@ use std::{
 };
 
 use turtletap::{
-    Chrome, Frame, InputPolicy, KeyBinding, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, Rect,
-    Shell, ShellBindings, ShellConfig, Shortcut, Surface, SurfaceAction, SurfaceEvent, Theme,
+    BindingId, Chrome, Frame, InputPolicy, KeyBinding, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, Rect, Shell, ShellConfig, Shortcut, Surface, SurfaceAction, SurfaceCommand,
+    SurfaceEvent, Theme,
     tui::{
         layout::{Constraint, Direction, Layout},
         style::{Modifier, Style},
@@ -16,251 +17,11 @@ use turtletap::{
     },
 };
 
+const REMAP_BINDING: &str = "keybindings.remap";
+const SAVE_BINDING: &str = "keybindings.save";
+const CANCEL_REVIEW: &str = "keybindings.cancel";
+
 use crate::{commands::InteractiveOptions, settings};
-
-macro_rules! binding_actions {
-    ($(($field:ident, $id:literal, $label:literal, $group:literal)),+ $(,)?) => {
-        #[allow(non_camel_case_types)]
-        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-        pub(crate) enum BindingAction {
-            $($field),+
-        }
-
-        impl BindingAction {
-            pub(crate) const ALL: &'static [Self] = &[$(Self::$field),+];
-
-            pub(crate) const fn id(self) -> &'static str {
-                match self {
-                    $(Self::$field => $id),+
-                }
-            }
-
-            const fn label(self) -> &'static str {
-                match self {
-                    $(Self::$field => $label),+
-                }
-            }
-
-            const fn group(self) -> &'static str {
-                match self {
-                    $(Self::$field => $group),+
-                }
-            }
-
-            fn bindings(self, bindings: &ShellBindings) -> &[KeyBinding] {
-                match self {
-                    $(Self::$field => &bindings.$field),+
-                }
-            }
-
-            pub(crate) fn replace(self, bindings: &mut ShellBindings, binding: KeyBinding) {
-                match self {
-                    $(Self::$field => bindings.$field = vec![binding]),+
-                }
-            }
-        }
-    };
-}
-
-binding_actions!(
-    (leaders, "leaders", "Leader", "Global"),
-    (palette, "palette", "Action bar", "Global"),
-    (redraw, "redraw", "Redraw", "Global"),
-    (next_screen, "next-screen", "Next screen", "Global"),
-    (
-        previous_screen,
-        "previous-screen",
-        "Previous screen",
-        "Global"
-    ),
-    (shell_detach, "shell-detach", "Detach", "Shell"),
-    (
-        shell_next_screen,
-        "shell-next-screen",
-        "Next screen",
-        "Shell"
-    ),
-    (
-        shell_previous_screen,
-        "shell-previous-screen",
-        "Previous screen",
-        "Shell"
-    ),
-    (shell_help, "shell-help", "Help", "Shell"),
-    (leader_palette, "leader-palette", "Action bar", "Leader"),
-    (
-        leader_next_screen,
-        "leader-next-screen",
-        "Next screen",
-        "Leader"
-    ),
-    (
-        leader_previous_screen,
-        "leader-previous-screen",
-        "Previous screen",
-        "Leader"
-    ),
-    (leader_scroll_up, "leader-scroll-up", "Scroll up", "Leader"),
-    (
-        leader_scroll_down,
-        "leader-scroll-down",
-        "Scroll down",
-        "Leader"
-    ),
-    (leader_close, "leader-close", "Close", "Leader"),
-    (leader_detach, "leader-detach", "Detach", "Leader"),
-    (leader_help, "leader-help", "Help", "Leader"),
-    (
-        action_next_screen,
-        "action-next-screen",
-        "Next screen",
-        "Action bar"
-    ),
-    (
-        action_previous_screen,
-        "action-previous-screen",
-        "Previous screen",
-        "Action bar"
-    ),
-    (
-        action_scroll_up,
-        "action-scroll-up",
-        "Scroll up",
-        "Action bar"
-    ),
-    (
-        action_scroll_down,
-        "action-scroll-down",
-        "Scroll down",
-        "Action bar"
-    ),
-    (action_close, "action-close", "Close", "Action bar"),
-    (action_detach, "action-detach", "Detach", "Action bar"),
-    (action_help, "action-help", "Help", "Action bar"),
-    (
-        action_clear_query,
-        "action-clear-query",
-        "Clear query",
-        "Action bar"
-    ),
-    (
-        session_release_driver,
-        "session-release-driver",
-        "Release driver",
-        "Session"
-    ),
-    (
-        session_take_driver,
-        "session-take-driver",
-        "Take driver",
-        "Session"
-    ),
-    (session_clear, "session-clear", "Clear", "Session"),
-    (
-        session_interrupt,
-        "session-interrupt",
-        "Interrupt",
-        "Session"
-    ),
-    (session_detach, "session-detach", "Detach", "Session"),
-    (
-        session_delete_to_start,
-        "session-delete-to-start",
-        "Delete to start",
-        "Session"
-    ),
-    (
-        session_word_left,
-        "session-word-left",
-        "Word left",
-        "Session"
-    ),
-    (
-        session_word_right,
-        "session-word-right",
-        "Word right",
-        "Session"
-    ),
-    (
-        session_line_start,
-        "session-line-start",
-        "Line start",
-        "Session"
-    ),
-    (session_line_end, "session-line-end", "Line end", "Session"),
-    (
-        session_delete_word,
-        "session-delete-word",
-        "Delete word",
-        "Session"
-    ),
-    (session_complete, "session-complete", "Complete", "Session"),
-    (
-        session_scroll_up,
-        "session-scroll-up",
-        "Scroll up",
-        "Session"
-    ),
-    (
-        session_scroll_down,
-        "session-scroll-down",
-        "Scroll down",
-        "Session"
-    ),
-    (
-        session_scroll_top,
-        "session-scroll-top",
-        "Scroll to top",
-        "Session"
-    ),
-    (
-        session_scroll_bottom,
-        "session-scroll-bottom",
-        "Scroll to bottom",
-        "Session"
-    ),
-    (dashboard_up, "dashboard-up", "Move up", "Dashboard"),
-    (dashboard_down, "dashboard-down", "Move down", "Dashboard"),
-    (
-        dashboard_view,
-        "dashboard-view",
-        "View session",
-        "Dashboard"
-    ),
-    (
-        dashboard_take,
-        "dashboard-take",
-        "Take session",
-        "Dashboard"
-    ),
-    (dashboard_search, "dashboard-search", "Search", "Dashboard"),
-    (dashboard_new, "dashboard-new", "New session", "Dashboard"),
-    (
-        dashboard_rename,
-        "dashboard-rename",
-        "Rename session",
-        "Dashboard"
-    ),
-    (
-        dashboard_delete,
-        "dashboard-delete",
-        "Delete session",
-        "Dashboard"
-    ),
-    (
-        dashboard_stop,
-        "dashboard-stop",
-        "Stop resident",
-        "Dashboard"
-    ),
-    (
-        dashboard_keybindings,
-        "dashboard-keybindings",
-        "Edit keybindings",
-        "Dashboard"
-    ),
-    (dashboard_close, "dashboard-close", "Close", "Dashboard"),
-);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EditorMode {
@@ -301,12 +62,12 @@ impl KeybindingEditor {
         }
     }
 
-    fn action(&self) -> BindingAction {
-        BindingAction::ALL[self.selected]
+    fn action(&self) -> BindingId {
+        BindingId::KEY_BINDINGS[self.selected]
     }
 
     fn move_selection(&mut self, delta: isize) {
-        let last = BindingAction::ALL.len().saturating_sub(1);
+        let last = BindingId::KEY_BINDINGS.len().saturating_sub(1);
         self.selected = if delta.is_negative() {
             self.selected.saturating_sub(delta.unsigned_abs())
         } else {
@@ -319,16 +80,22 @@ impl KeybindingEditor {
         if key.kind != KeyEventKind::Press {
             return SurfaceAction::Ignored;
         }
-        let binding = match settings::canonical_binding(KeyBinding::new(key.code, key.modifiers)) {
+        let binding = match KeyBinding::from_event(key) {
             Ok(binding) => binding,
             Err(error) => {
-                self.notice = Some((true, error.to_string()));
+                self.notice = Some((
+                    true,
+                    format!("This terminal key cannot be stored as a TurtleTap binding: {error}"),
+                ));
                 return SurfaceAction::Consumed;
             }
         };
         let mut proposed = self.config.bindings.clone();
-        self.action().replace(&mut proposed, binding);
-        match settings::validate_binding_set(&proposed) {
+        if let Err(error) = proposed.set_keys(self.action(), vec![binding]) {
+            self.notice = Some((true, error.to_string()));
+            return SurfaceAction::Consumed;
+        }
+        match proposed.validate() {
             Ok(()) => {
                 self.mode = EditorMode::Review(binding);
                 self.notice = None;
@@ -398,6 +165,41 @@ impl Surface for KeybindingEditor {
         }
     }
 
+    fn commands(&self) -> Vec<SurfaceCommand> {
+        match self.mode {
+            EditorMode::Browse => vec![
+                SurfaceCommand::new(REMAP_BINDING, "Remap selected binding")
+                    .with_description("Keybinding editor")
+                    .with_shortcut("Enter"),
+            ],
+            EditorMode::Capture => Vec::new(),
+            EditorMode::Review(_) => vec![
+                SurfaceCommand::new(SAVE_BINDING, "Save binding")
+                    .with_description("Keybinding editor")
+                    .with_shortcut("Enter"),
+                SurfaceCommand::new(CANCEL_REVIEW, "Cancel change")
+                    .with_description("Keybinding editor"),
+            ],
+        }
+    }
+
+    fn execute_command(&mut self, id: &str) -> SurfaceAction {
+        match (id, self.mode) {
+            (REMAP_BINDING, EditorMode::Browse) => {
+                self.mode = EditorMode::Capture;
+                self.notice = None;
+                SurfaceAction::Consumed
+            }
+            (SAVE_BINDING, EditorMode::Review(binding)) => self.save(binding),
+            (CANCEL_REVIEW, EditorMode::Review(_)) => {
+                self.mode = EditorMode::Browse;
+                self.notice = None;
+                SurfaceAction::Consumed
+            }
+            _ => SurfaceAction::Ignored,
+        }
+    }
+
     fn reconfigure(&mut self, config: &ShellConfig) {
         self.config = config.clone();
         self.theme = config.theme.clone();
@@ -436,21 +238,24 @@ impl Surface for KeybindingEditor {
         }
         let mut lines = Vec::new();
         let mut last_group = "";
-        for (index, action) in BindingAction::ALL
+        for (index, action) in BindingId::KEY_BINDINGS
             .iter()
             .copied()
             .enumerate()
             .skip(self.offset)
             .take(height)
         {
-            let group = if action.group() != last_group {
-                last_group = action.group();
-                action.group()
+            let group = if action.context().label() != last_group {
+                last_group = action.context().label();
+                action.context().label()
             } else {
                 ""
             };
-            let keys = action
-                .bindings(&self.config.bindings)
+            let keys = self
+                .config
+                .bindings
+                .keys(action)
+                .unwrap_or_default()
                 .iter()
                 .map(|binding| binding.label())
                 .collect::<Vec<_>>()
@@ -532,8 +337,11 @@ impl Surface for KeybindingEditor {
 impl KeybindingEditor {
     fn render_review(&self, frame: &mut Frame<'_>, area: Rect, binding: KeyBinding) {
         let action = self.action();
-        let current = action
-            .bindings(&self.config.bindings)
+        let current = self
+            .config
+            .bindings
+            .keys(action)
+            .unwrap_or_default()
             .iter()
             .map(|binding| binding.label())
             .collect::<Vec<_>>()
@@ -544,7 +352,11 @@ impl KeybindingEditor {
                 Style::default().add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
-            Line::from(format!("Action:  {} / {}", action.group(), action.label())),
+            Line::from(format!(
+                "Action:  {} / {}",
+                action.context().label(),
+                action.label()
+            )),
             Line::from(format!("Current: {current}")),
             Line::from(format!("New:     {}", binding.label())),
             Line::from(""),
@@ -602,11 +414,24 @@ mod tests {
     }
 
     #[test]
+    fn action_bar_commands_follow_keybinding_editor_mode() {
+        let mut editor = KeybindingEditor::new(ShellConfig::new("test"), false);
+        assert_eq!(editor.commands()[0].id, REMAP_BINDING);
+
+        assert!(matches!(
+            editor.execute_command(REMAP_BINDING),
+            SurfaceAction::Consumed
+        ));
+        assert_eq!(editor.mode, EditorMode::Capture);
+        assert!(editor.commands().is_empty());
+    }
+
+    #[test]
     fn conflicts_remain_in_capture_with_an_explanation() {
         let mut editor = KeybindingEditor::new(ShellConfig::new("test"), false);
         editor.mode = EditorMode::Capture;
 
-        let action = editor.handle(key(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        let action = editor.handle(key(KeyCode::Char('`'), KeyModifiers::CONTROL));
 
         assert!(matches!(action, SurfaceAction::Consumed));
         assert_eq!(editor.mode, EditorMode::Capture);
@@ -630,5 +455,43 @@ mod tests {
         );
         let _ = editor.handle(key(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(editor.mode, EditorMode::Browse);
+    }
+
+    #[test]
+    fn typing_context_rejects_unmodified_characters_and_arrows() {
+        let mut editor = KeybindingEditor::new(ShellConfig::new("test"), false);
+        editor.selected = BindingId::KEY_BINDINGS
+            .iter()
+            .position(|action| *action == BindingId::SessionInterrupt)
+            .expect("session interrupt should be editable");
+        editor.mode = EditorMode::Capture;
+
+        let _ = editor.handle(key(KeyCode::Char('z'), KeyModifiers::NONE));
+        assert_eq!(editor.mode, EditorMode::Capture);
+        assert!(
+            editor.notice.as_ref().is_some_and(
+                |(failed, message)| *failed && message.contains("context accepts text")
+            )
+        );
+
+        let _ = editor.handle(key(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(editor.mode, EditorMode::Capture);
+    }
+
+    #[test]
+    fn dashboard_context_still_accepts_single_key_shortcuts() {
+        let mut editor = KeybindingEditor::new(ShellConfig::new("test"), false);
+        editor.selected = BindingId::KEY_BINDINGS
+            .iter()
+            .position(|action| *action == BindingId::DashboardView)
+            .expect("dashboard view should be editable");
+        editor.mode = EditorMode::Capture;
+
+        let _ = editor.handle(key(KeyCode::Char('z'), KeyModifiers::NONE));
+
+        assert_eq!(
+            editor.mode,
+            EditorMode::Review(KeyBinding::new(KeyCode::Char('z'), KeyModifiers::NONE))
+        );
     }
 }

@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File, OpenOptions},
-    io::{self, BufRead, BufReader, Write},
+    io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     marker::PhantomData,
     path::{Path, PathBuf},
 };
@@ -88,6 +88,26 @@ pub struct FileJournal<E> {
     marker: PhantomData<fn() -> E>,
 }
 
+pub(crate) struct JournalWriter<E> {
+    file: File,
+    durability: Durability,
+    marker: PhantomData<fn() -> E>,
+}
+
+impl<E> JournalWriter<E>
+where
+    E: Serialize,
+{
+    pub(crate) fn append(&mut self, record: &JournalRecord<E>) -> Result<(), JournalError> {
+        write_record(&mut self.file, record)?;
+        self.file.flush()?;
+        if self.durability == Durability::Fsync {
+            self.file.sync_data()?;
+        }
+        Ok(())
+    }
+}
+
 impl<E> FileJournal<E>
 where
     E: DeserializeOwned + Serialize,
@@ -104,26 +124,25 @@ where
 
     /// Appends one complete record.
     pub fn append(&self, record: &JournalRecord<E>) -> Result<(), JournalError> {
+        self.writer()?.append(record)
+    }
+
+    pub(crate) fn writer(&self) -> Result<JournalWriter<E>, JournalError> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
         reject_symlink(&self.path)?;
-        let payload = serde_json::to_vec(record)?;
-        let stored = StoredRecordRef {
-            record,
-            checksum: crc32fast::hash(&payload),
-        };
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
+            .read(true)
             .open(&self.path)?;
-        serde_json::to_writer(&mut file, &stored)?;
-        file.write_all(b"\n")?;
-        file.flush()?;
-        if self.durability == Durability::Fsync {
-            file.sync_data()?;
-        }
-        Ok(())
+        truncate_torn_tail(&mut file)?;
+        Ok(JournalWriter {
+            file,
+            durability: self.durability,
+            marker: PhantomData,
+        })
     }
 
     /// Loads all complete records. A final torn line is ignored.
@@ -220,6 +239,52 @@ where
     }
 }
 
+fn write_record<E: Serialize>(
+    file: &mut File,
+    record: &JournalRecord<E>,
+) -> Result<(), JournalError> {
+    let payload = serde_json::to_vec(record)?;
+    serde_json::to_writer(
+        &mut *file,
+        &StoredRecordRef {
+            record,
+            checksum: crc32fast::hash(&payload),
+        },
+    )?;
+    file.write_all(b"\n")?;
+    Ok(())
+}
+
+fn truncate_torn_tail(file: &mut File) -> io::Result<()> {
+    const SCAN_BYTES: u64 = 8 * 1024;
+
+    let length = file.metadata()?.len();
+    if length == 0 {
+        return Ok(());
+    }
+    file.seek(SeekFrom::End(-1))?;
+    let mut last = [0_u8; 1];
+    file.read_exact(&mut last)?;
+    if last[0] == b'\n' {
+        return Ok(());
+    }
+
+    let mut end = length;
+    let mut buffer = vec![0_u8; SCAN_BYTES as usize];
+    while end > 0 {
+        let start = end.saturating_sub(SCAN_BYTES);
+        let read = (end - start) as usize;
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut buffer[..read])?;
+        if let Some(index) = buffer[..read].iter().rposition(|byte| *byte == b'\n') {
+            file.set_len(start + index as u64 + 1)?;
+            return Ok(());
+        }
+        end = start;
+    }
+    file.set_len(0)
+}
+
 fn reject_symlink(path: &Path) -> io::Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => Err(io::Error::new(
@@ -278,6 +343,34 @@ mod tests {
             .write_all(b"{\"record\":")
             .expect("tear");
         assert_eq!(journal.load().expect("load"), vec![record]);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn append_truncates_a_torn_final_record() {
+        let path = path("append-after-torn-journal");
+        let journal = FileJournal::new(&path, Durability::Flush);
+        let first = JournalRecord {
+            sequence: EventSequence(1),
+            request: None,
+            event: "first".to_owned(),
+        };
+        let second = JournalRecord {
+            sequence: EventSequence(2),
+            request: None,
+            event: "second".to_owned(),
+        };
+        journal.append(&first).expect("append first");
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open")
+            .write_all(b"{\"record\":")
+            .expect("tear");
+
+        journal.append(&second).expect("append after torn tail");
+
+        assert_eq!(journal.load().expect("load"), vec![first, second]);
         let _ = fs::remove_file(path);
     }
 

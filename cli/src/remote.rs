@@ -10,7 +10,7 @@ use std::{
 
 use turtletap::{
     Frame, InputPolicy, KeyCode, KeyModifiers, MouseEventKind, Rect, ShellBindings, Shortcut,
-    Surface, SurfaceAction, SurfaceEvent, SurfaceStatus,
+    Surface, SurfaceAction, SurfaceCommand, SurfaceEvent, SurfaceStatus,
     resident::{
         AttachmentMode, ClientInstanceId, ClientRequest, ControlResult, DriverLease, LeaseEpoch,
         ServerMessage, SessionId, ShutdownReason,
@@ -27,11 +27,17 @@ use crate::app::{SessionSnapshot, ShellCommand, ShellEvent, transcript_append_co
 use crate::async_client::{ClientEvent, ConnectionState, SessionHandle};
 use crate::command::{
     Scrollback, TranscriptEntry, TranscriptKind, binding_labels, char_slice_width,
-    leader_binding_label, matches_binding, session_cursor_target, session_delete_start,
+    command_shortcut, leader_binding_label, matches_binding, session_cursor_target,
+    session_delete_start,
 };
 use crate::commands::is_detach_command;
 
 pub(crate) type OpenSessions = Arc<Mutex<HashSet<SessionId>>>;
+
+const CLEAR_SESSION: &str = "session.clear";
+const INTERRUPT_SESSION: &str = "session.interrupt";
+const RELEASE_DRIVER: &str = "session.release-driver";
+const TAKE_DRIVER: &str = "session.take-driver";
 
 pub(crate) fn open_sessions() -> OpenSessions {
     Arc::new(Mutex::new(HashSet::new()))
@@ -115,7 +121,7 @@ impl RemoteSurface {
         client_instance: ClientInstanceId,
         lease: Option<LeaseEpoch>,
         snapshot: SessionSnapshot,
-        handle: SessionHandle,
+        mut handle: SessionHandle,
         mode: AttachmentMode,
         ui: RemoteUi,
     ) -> io::Result<Self> {
@@ -129,6 +135,23 @@ impl RemoteSurface {
                 io::ErrorKind::AlreadyExists,
                 format!("session '{}' is already open", session.name),
             ));
+        }
+        if mode == AttachmentMode::Drive
+            && !snapshot.running
+            && let Some(lease) = lease
+        {
+            let command = serde_json::to_value(ShellCommand::Prepare).map_err(io::Error::other)?;
+            if let Err(error) = handle.try_request(ClientRequest::Command {
+                session: session.id,
+                lease,
+                command,
+            }) {
+                ui.open_sessions
+                    .lock()
+                    .map_err(|_| io::Error::other("open-session registry is poisoned"))?
+                    .remove(&session.id);
+                return Err(error);
+            }
         }
         Ok(Self {
             client: handle,
@@ -965,6 +988,53 @@ impl Surface for RemoteSurface {
         ]
     }
 
+    fn commands(&self) -> Vec<SurfaceCommand> {
+        let mut commands = Vec::new();
+        if self.mode == AttachmentMode::Drive {
+            commands.push(command_shortcut(
+                SurfaceCommand::new(RELEASE_DRIVER, "Release control")
+                    .with_description("Resident session"),
+                &self.bindings.session_release_driver,
+            ));
+            commands.push(command_shortcut(
+                SurfaceCommand::new(CLEAR_SESSION, "Clear transcript")
+                    .with_description("Resident session"),
+                &self.bindings.session_clear,
+            ));
+            if self.snapshot.running {
+                commands.insert(
+                    0,
+                    command_shortcut(
+                        SurfaceCommand::new(INTERRUPT_SESSION, "Interrupt running command")
+                            .with_description("Resident session"),
+                        &self.bindings.session_interrupt,
+                    ),
+                );
+            }
+        } else {
+            commands.push(command_shortcut(
+                SurfaceCommand::new(TAKE_DRIVER, "Take control")
+                    .with_description("Resident session · confirmation required"),
+                &self.bindings.session_take_driver,
+            ));
+        }
+        commands
+    }
+
+    fn execute_command(&mut self, id: &str) -> SurfaceAction {
+        match id {
+            CLEAR_SESSION if self.mode == AttachmentMode::Drive => {
+                self.command(ShellCommand::Clear)
+            }
+            INTERRUPT_SESSION if self.mode == AttachmentMode::Drive && self.snapshot.running => {
+                self.command(ShellCommand::Interrupt)
+            }
+            RELEASE_DRIVER if self.mode == AttachmentMode::Drive => self.release_driver(),
+            TAKE_DRIVER if self.mode == AttachmentMode::View => self.take_driver(),
+            _ => SurfaceAction::Ignored,
+        }
+    }
+
     fn focus(&mut self) {
         self.activity.focus();
     }
@@ -998,6 +1068,69 @@ fn compact_elapsed(last_event_at: Option<u64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn remote_surface(mode: AttachmentMode, running: bool) -> RemoteSurface {
+        let session = turtletap::resident::SessionSummary {
+            id: SessionId::new(),
+            name: "build".to_owned(),
+            driver: None,
+            attached_clients: 1,
+            sequence: turtletap::resident::EventSequence(0),
+            last_event_at: None,
+            digest: None,
+        };
+        let snapshot = SessionSnapshot {
+            revision: 0,
+            transcript: Vec::new(),
+            history: Vec::new(),
+            commands: Vec::new(),
+            cwd_label: "~".to_owned(),
+            running,
+            last_failed: false,
+            queued: 0,
+        };
+        let (client, _operations, _events, _shutdown) = crate::async_client::test_handle();
+        RemoteSurface::attach_async(
+            session,
+            ClientInstanceId::new(),
+            None,
+            snapshot,
+            client,
+            mode,
+            RemoteUi {
+                bindings: ShellBindings::default(),
+                open_sessions: open_sessions(),
+            },
+        )
+        .expect("remote surface should attach")
+    }
+
+    #[test]
+    fn action_bar_commands_follow_driver_role_and_running_state() {
+        let mut viewer = remote_surface(AttachmentMode::View, true);
+        let viewer_commands = viewer.commands();
+        assert_eq!(viewer_commands.len(), 1);
+        assert_eq!(viewer_commands[0].id, TAKE_DRIVER);
+        assert!(matches!(
+            viewer.execute_command(TAKE_DRIVER),
+            SurfaceAction::Consumed
+        ));
+        assert!(viewer.take_confirmation);
+
+        let driver = remote_surface(AttachmentMode::Drive, true);
+        let driver_commands = driver.commands();
+        for id in [INTERRUPT_SESSION, RELEASE_DRIVER, CLEAR_SESSION] {
+            assert!(
+                driver_commands.iter().any(|command| command.id == id),
+                "driver command {id} should be discoverable"
+            );
+        }
+        assert!(
+            !driver_commands
+                .iter()
+                .any(|command| command.id == TAKE_DRIVER)
+        );
+    }
 
     #[test]
     fn screen_activity_counts_only_while_unfocused() {

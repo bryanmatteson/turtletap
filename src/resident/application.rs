@@ -12,7 +12,7 @@ use std::{
 
 use serde::{Serialize, de::DeserializeOwned};
 
-use super::{EffectId, SessionId};
+use super::{EffectId, SessionId, ShutdownReason};
 
 /// Application-domain failure returned to a resident client.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -305,6 +305,39 @@ pub trait ResidentApplication: Clone + Send + Sync + 'static {
 
     /// Restores a session from the current checkpoint representation.
     fn restore(&self, state: Self::State) -> Result<Self::Session, ApplicationError>;
+
+    /// Notifies the application that a durable session is available.
+    ///
+    /// The host calls this after the session checkpoint and manifest are
+    /// recoverable. Implementations may use it to reconcile session-scoped
+    /// resources without eagerly starting them.
+    fn session_available(&self, _session: SessionId) -> Result<(), ApplicationError> {
+        Ok(())
+    }
+
+    /// Notifies the application that a client attached to a session.
+    ///
+    /// This is a best-effort prewarming hint. Failure does not make an
+    /// otherwise valid resident attachment fail.
+    fn session_attached(&self, _session: SessionId) -> Result<(), ApplicationError> {
+        Ok(())
+    }
+
+    /// Stops application-owned resources before a session is removed.
+    ///
+    /// Returning an error aborts deletion, preserving the session state so the
+    /// cleanup can be retried safely.
+    fn session_stopping(&self, _session: SessionId) -> Result<(), ApplicationError> {
+        Ok(())
+    }
+
+    /// Reconciles application-owned resources before the resident leader exits.
+    ///
+    /// Manual shutdowns release owned resources. Upgrade shutdowns retain
+    /// independently recoverable resources for the replacement leader.
+    fn host_stopping(&self, _reason: ShutdownReason) -> Result<(), ApplicationError> {
+        Ok(())
+    }
 
     /// Executes external work without borrowing the resident actor or session state.
     fn execute(

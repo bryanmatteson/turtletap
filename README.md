@@ -1,204 +1,182 @@
 # TurtleTap
 
-TurtleTap is a reusable terminal shell for applications that need several long-lived,
-session-like surfaces in one terminal. An agent conversation, embedded terminal,
-questionnaire, approval flow, log stream, or debugger can all implement the same
-small `Surface` trait.
+TurtleTap hosts multiple terminal surfaces in one attachable shell. A surface owns
+its content and input policy. TurtleTap owns terminal setup, focus, chrome,
+navigation, rendering, and detach.
 
-TurtleTap owns the shell chrome and behavior:
+The workspace contains two crates:
 
-- stable surface identity, focus, tabs or a master-detail rail, and a searchable action bar;
-- clean attach/detach terminal lifecycle;
-- configurable action shortcuts for navigation, detach, leader sequences,
-  action-bar accelerators, and host-defined actions;
-- an action bar opened by `Esc` on an empty prompt or `Ctrl-\``, whose Alt
-  accelerators never steal shell input;
-- background tick and resize delivery for inactive agents and PTYs;
-- incremental redraws with only a compact liveness pulse while surfaces are idle;
-- contextual help and status without requiring each host to reinvent navigation;
-- deterministic off-screen rendering for tests.
+- `turtletap`: the reusable shell and resident-session library.
+- `turtletap-cli`: persistent command sessions backed by the library.
 
-It does **not** define what an agent, session, or questionnaire is. Those remain
-host-domain objects behind `Surface` implementations.
-
-Installing a ready-to-use shell built on this library is a separate crate,
-[`turtletap-cli`](https://crates.io/crates/turtletap-cli).
-
-## Add it
+## Library
 
 ```toml
 [dependencies]
 turtletap = "0.2"
 ```
 
-The default build depends only on `crossterm` and `ratatui` — just the
-`Shell`/`Surface` half. Reconnectable, durable sessions live behind features:
+The default feature set provides `Shell`, `Surface`, tabs, the master-detail rail,
+the action bar, configurable bindings, terminal restoration, background events, and
+off-screen rendering. It depends on `crossterm` and `ratatui`.
 
-| Feature | Adds | Pulls in |
-| --- | --- | --- |
-| _(default)_ | `Shell`, `Surface`, chrome, terminal lifecycle | crossterm, ratatui |
-| `resident` | runtime-neutral resident core: protocol, journal, host, election | serde, uuid, semver, … |
-| `tokio` | Tokio transport adapters, the blocking client, and the supervisor | tokio |
+| Feature | Public surface |
+| --- | --- |
+| `resident` | Protocol types, framing, journals, election, host, sessions, effects |
+| `async-shell` | Event-driven terminal and background surface polling |
+| `tokio` | Tokio transport, blocking client, supervisor; includes `resident` and `async-shell` |
 
 ```toml
 turtletap = { version = "0.2", features = ["tokio"] }
 ```
 
-## Host example
+## Surface example
 
 ```rust,no_run
 use std::borrow::Cow;
-
 use turtletap::{
-    InputPolicy, Shell, ShellConfig, Surface, SurfaceAction, SurfaceEvent,
-    SurfaceStatus,
+    Frame, Rect, Shell, ShellConfig, Surface, SurfaceAction, SurfaceCommand, SurfaceEvent,
 };
 
-struct AgentSurface;
+struct LogSurface;
 
-impl Surface for AgentSurface {
+impl Surface for LogSurface {
     fn title(&self) -> Cow<'_, str> {
-        "planner".into()
+        "build".into()
     }
 
-    fn status(&self) -> SurfaceStatus {
-        SurfaceStatus::Working
-    }
-
-    fn input_policy(&self) -> InputPolicy {
-        InputPolicy::Shell
-    }
-
-    fn render(&mut self, frame: &mut turtletap::Frame<'_>, area: turtletap::Rect) {
-        frame.render_widget("Agent output goes here", area);
+    fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        frame.render_widget("build output", area);
     }
 
     fn handle(&mut self, _event: SurfaceEvent) -> SurfaceAction {
         SurfaceAction::Ignored
     }
+
+    fn commands(&self) -> Vec<SurfaceCommand> {
+        vec![SurfaceCommand::new("log.refresh", "Refresh log")]
+    }
+
+    fn execute_command(&mut self, id: &str) -> SurfaceAction {
+        match id {
+            "log.refresh" => SurfaceAction::Consumed,
+            _ => SurfaceAction::Ignored,
+        }
+    }
 }
 
-let mut shell = Shell::new(ShellConfig::new("Koda"));
-shell.add_surface(AgentSurface);
+let mut shell = Shell::new(ShellConfig::new("Workbench"));
+shell.add_surface(LogSurface);
 let reason = shell.attach()?;
-println!("shell detached: {reason:?}");
+println!("{reason:?}");
 # Ok::<(), std::io::Error>(())
 ```
 
-`Shell::attach` borrows the shell. When the user detaches, the alternate screen and
-raw mode are restored and the caller receives control with every surface still in
-memory. A host can attach the same shell again. Keeping it alive after the host
-process exits is deliberately a supervisor concern, not a terminal-rendering trick.
+`Shell::attach` restores raw mode and the alternate screen before returning. The
+shell retains its surfaces and can attach again. Mouse capture is off by default, so
+native terminal selection remains available. `ShellConfig::with_mouse_capture(true)`
+enables surface mouse events.
 
-Native terminal text selection is available by default: drag across text and use
-your terminal's normal copy command. TurtleTap does not capture mouse events unless
-the host explicitly opts in with `ShellConfig::with_mouse_capture(true)`. Mouse-aware
-surfaces can enable capture; most terminals then provide an override modifier such
-as Shift or Option for native selection.
+`Chrome::Tabs` is the default. `Chrome::rail()` keeps a persistent surface list and
+narrows it to status markers when terminal width is constrained. Surface titles,
+status, badges, and shortcuts feed the shell chrome and contextual help.
 
-## Chrome
+## Input contract
 
-`ShellConfig::with_chrome` chooses how the surface list is presented. `Chrome::Tabs`
-(the default) is a horizontal strip above the active surface, suited to a handful of
-long-lived surfaces. `Chrome::rail()` is a persistent vertical list beside the active
-surface — master-detail — that keeps the list scannable as it grows and narrows to a
-marker-only rail on tight terminals rather than reverting to tabs. Surfaces annotate
-their rail row with `Surface::badge`.
+The shell applies configured bindings before delivering unhandled input to the
+active surface. `InputPolicy::Captured` reserves shell navigation and leader chords
+while forwarding ordinary input. `InputPolicy::Exclusive` forwards every key.
 
-## Navigation contract
-
-These are the built-in defaults. The shell interprets configured global actions and
-delivers everything else to the active
-surface. A captured surface (`InputPolicy::Captured`, for an embedded PTY or editor)
-receives ordinary input while the shell still reserves screen navigation and the
-leader chord as the escape hatch back to chrome.
-
-| Key | Shell-managed surface | Captured surface |
+| Default | Shell-managed surface | Captured surface |
 | --- | --- | --- |
-| `Ctrl-D` | Detach | Delivered to the surface |
-| `Tab` / `Shift-Tab` | Next / previous surface | Delivered to the surface |
-| `Esc` on an empty prompt | Open TurtleTap action bar | Surface-controlled |
-| `Ctrl-\`` | Open TurtleTap action bar | Open TurtleTap action bar |
-| `Ctrl-/` | Clear and redraw terminal frame | Clear and redraw terminal frame |
-| `?` | Contextual help | Delivered to the surface |
-| Action bar `Alt-→` / `Alt-←` | Next / previous | Next / previous |
-| Action bar `Alt-↓` / `Alt-↑` | Scroll down / up | Scroll down / up |
-| Action bar `Alt-1` … `Alt-9` | Jump to numbered surface | Jump to numbered surface |
-| Action bar `Alt-X` / `Alt-D` | Close surface / detach | Close surface / detach |
+| `Ctrl-D` | Detach | Forward |
+| `Tab` / `Shift-Tab` | Next / previous surface | Forward |
+| `Esc` on an eligible empty input | Open action bar | Surface-controlled |
+| `Ctrl-\`` | Open action bar | Open action bar |
+| `F5` | Clear and redraw | Clear and redraw |
+| `?` | Contextual help | Forward |
 | `Ctrl-G ?` | Contextual help | Contextual help |
 
-TurtleTap never steals the default `Ctrl-D` from a captured child. Command surfaces
-explicitly opt into the fixed empty-prompt `Esc` action-bar fallback.
+The action bar ranks executable commands from the active surface, open surfaces,
+and shell actions. Up and Down select a result; Enter runs it; `Alt-1` through
+`Alt-9` select numbered surfaces. Other `Alt` accelerators navigate, scroll, close,
+and detach only while the bar is open.
 
-Every action binding in `ShellBindings` is configurable, and an empty list disables
-that action. The footer, action bar, and contextual help show the resolved bindings.
-Text entry, Enter, Backspace, arrow-key editing/navigation, Esc cancellation and
-empty-prompt action-bar entry, and Y/N confirmations remain stable interaction
-grammar rather than remappable actions.
+`ShellBindings` contains every remappable action. An empty list disables an action.
+`BindingId::KEY_BINDINGS` is the stable configuration catalog. Validation rejects
+unsupported modifier flags, duplicate bindings, context-local collisions, and plain
+text keys in contexts that accept text.
 
-Run the included demo with:
+```rust
+use turtletap::{BindingId, KeyBinding, ShellConfig};
+
+# fn configured_shell() -> Result<ShellConfig, Box<dyn std::error::Error>> {
+let mut config = ShellConfig::new("Workbench");
+let interrupt = "ctrl-x".parse::<KeyBinding>()?;
+config
+    .bindings
+    .set_keys(BindingId::SessionInterrupt, vec![interrupt])?;
+config.bindings.validate()?;
+assert_eq!(interrupt.config_label()?, "ctrl-x");
+# Ok(config)
+# }
+```
+
+`KeyBinding` accepts terminal-friendly aliases such as `Cmd` and `Option`.
+`config_label` emits portable `super` and `alt` labels.
+
+## Resident sessions
+
+`resident` is independent of terminal rendering. It provides:
+
+- version-negotiated, length-prefixed framing with bounded frames;
+- stable client, request, session, event, effect, and lease identities;
+- driver fencing and request deduplication;
+- checksummed journals, checkpoints, manifests, replay, and storage migration;
+- leader election, reconnect cursors, bounded client queues, and graceful shutdown;
+- durable at-least-once and at-most-once effects with deadlines and cancellation.
+
+Applications implement `ResidentApplication` and `ResidentSession`. A transition
+returns durable events and effect requests. The host persists the transition before
+dispatching effects. Session reducers remain synchronous. Effects execute outside
+the reducer and return through a completion transition.
+
+At-least-once effects retain their `EffectId` across recovery. At-most-once effects
+report an unknown outcome when execution may have started. Effects are sequential
+within one session, concurrent across sessions, and bounded by
+`max_concurrent_effects`.
+
+`ResidentClient` retains attachment authority and event cursors across reconnects.
+The blocking client adds timeouts, leader relaunch, and retry under the original
+`RequestId`. The supervisor reuses a compatible leader, replaces an older leader,
+or starts one under the endpoint lock.
+
+The complete resident example runs with:
+
+```console
+cargo run --example resident --features tokio
+```
+
+The shell example runs with:
 
 ```console
 cargo run --example demo
 ```
 
-## Resident applications
+## Verification
 
-The `turtletap::resident` module (feature `resident`) is independent of terminal
-rendering. It provides stable client, session, request, event, and lease identities;
-deterministic driver and deduplication state; bounded length-prefixed framing;
-versioned handshake types; checksummed journals; leader locking; a reusable
-`ResidentHost`; and runtime transport contracts.
+The repository verifies the public surface at three levels:
 
-Applications implement `ResidentApplication` and `ResidentSession`. A transition
-returns durable events plus follow-on effects: the host journals events and writes a
-checkpoint before it runs those effects. Session reducers remain synchronous and
-deterministic. External effects execute asynchronously without borrowing the actor,
-then return through its mailbox for a synchronous completion transition.
-
-Every effect has a durable `EffectId`. At-least-once effects are redriven after leader
-recovery with the same identity and an incremented attempt number, allowing downstream
-idempotency. At-most-once effects are never repeated after execution may have begun;
-their completion instead reports `effect_outcome_unknown`. Effects run sequentially
-within a session and concurrently across sessions, bounded by the host's
-`max_concurrent_effects` setting. `EffectContext` carries a cooperative cancellation
-signal that fires when its deadline expires, its session is deleted, or the leader
-shuts down. Effects inherit the host deadline unless an `EffectRequest` overrides it.
-This ordering makes accepted requests and their effect outbox recoverable across
-disconnects and process death.
-
-Storage carries independent host and application versions, replays journal records
-newer than the checkpoint, and can reconstruct a corrupt checkpoint from the session
-manifest plus replayable transitions. The fixture corpus under `tests/fixtures/`
-freezes protocol v1 and host storage v0/v1/v2 for compatibility review.
-
-`ResidentHost` owns election, registration, request routing, bounded client queues,
-driver fencing, deduplication, persistence, reconnect cursors, and graceful shutdown.
-The application owns only its command, event, snapshot, checkpoint state, and effect
-types.
-
-### Transport, blocking client, and supervision (feature `tokio`)
-
-Tokio is the default production adapter under `resident::runtime::tokio`. Tokio
-sockets, channels, timers, and task handles do not appear in the protocol or leader
-core, so another runtime can implement the `Transport`, `Connection`, `Listener`,
-`Clock`, `Spawner`, and `ProcessSpawner` contracts without changing application or
-wire types.
-
-`ResidentClient` is asynchronous. It retains stable identity plus every attachment's
-authority and highest received event cursor, so reconnecting restores all subscribed
-session IDs without replaying already received events. `resident::blocking::Client`
-wraps that behavior in a current-thread runtime for terminal-driven callers and
-adds timeouts, leader relaunch, and retry of an ambiguous request under its original
-`RequestId` for the leader to deduplicate.
-`resident::supervisor` owns the endpoint conventions and the start-up election —
-`ensure_leader` reuses a running leader, replaces one older than the caller, or wins
-the lock and spawns a new one, while the caller keeps only the product-specific detail
-of how its resident process is launched.
-
-A complete, runnable application is in
-[`examples/resident.rs`](examples/resident.rs):
+- `tests/shell.rs` and `tests/bindings.rs`: rendering, navigation, lifecycle,
+  configuration, and input contracts.
+- `tests/resident_api.rs` and `tests/compatibility.rs`: public resident API, effects,
+  recovery, protocol fixtures, and storage fixtures.
+- `cli/tests/cli.rs` and `cli/tests/resident.rs`: installed command behavior, TUI
+  interaction, worker recovery, reconnection, fencing, cleanup, and process groups.
 
 ```console
-cargo run --example resident --features tokio
+cargo fmt --all --check
+cargo clippy --workspace --all-features --all-targets -- -D warnings
+cargo test --workspace --all-features --all-targets
+RUSTDOCFLAGS="-D warnings" cargo doc -p turtletap --all-features --no-deps
 ```

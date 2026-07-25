@@ -32,7 +32,7 @@ pub enum SurfaceStatus {
     /// Ready for interaction.
     #[default]
     Ready,
-    /// Work is currently progressing.
+    /// Work is in progress.
     Working,
     /// The surface needs the user's attention.
     Attention,
@@ -90,6 +90,45 @@ impl Shortcut {
     }
 }
 
+/// An executable command exposed by the active surface in the action bar.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SurfaceCommand {
+    /// Stable surface-local identifier passed to [`Surface::execute_command`].
+    pub id: Cow<'static, str>,
+    /// Short imperative label shown in the action bar.
+    pub label: Cow<'static, str>,
+    /// Concise context shown after the label.
+    pub description: Cow<'static, str>,
+    /// Optional direct shortcut shown before the label.
+    pub shortcut: Option<Cow<'static, str>>,
+}
+
+impl SurfaceCommand {
+    /// Creates an executable surface command.
+    pub fn new(id: impl Into<Cow<'static, str>>, label: impl Into<Cow<'static, str>>) -> Self {
+        Self {
+            id: id.into(),
+            label: label.into(),
+            description: Cow::Borrowed("Current surface"),
+            shortcut: None,
+        }
+    }
+
+    /// Sets the context displayed after the command label.
+    #[must_use]
+    pub fn with_description(mut self, description: impl Into<Cow<'static, str>>) -> Self {
+        self.description = description.into();
+        self
+    }
+
+    /// Sets the direct shortcut displayed before the command label.
+    #[must_use]
+    pub fn with_shortcut(mut self, shortcut: impl Into<Cow<'static, str>>) -> Self {
+        self.shortcut = Some(shortcut.into());
+        self
+    }
+}
+
 /// Input and lifecycle events delivered to a surface.
 #[derive(Clone, Debug)]
 pub enum SurfaceEvent {
@@ -104,7 +143,7 @@ pub enum SurfaceEvent {
     /// A mouse event inside the shell.
     Mouse(MouseEvent),
     /// A periodic opportunity for every open surface to drain channels or
-    /// advance animation, including surfaces that are not currently focused.
+    /// advance animation, including surfaces without focus.
     Tick(Duration),
     /// The terminal changed size. TurtleTap broadcasts this to every open
     /// surface so background PTYs can update their dimensions immediately.
@@ -194,7 +233,7 @@ pub trait Surface: Send {
     /// Applies settings reloaded by the host while the shell remains attached.
     fn reconfigure(&mut self, _config: &ShellConfig) {}
 
-    /// Whether an unmodified Escape should open the action bar right now.
+    /// Whether an unmodified Escape opens the action bar in the current state.
     ///
     /// Input surfaces can use this for an empty-prompt escape hatch while
     /// preserving Escape as ordinary input whenever they have text or an
@@ -236,6 +275,16 @@ pub trait Surface: Send {
     /// Returns surface-specific shortcuts for contextual help.
     fn shortcuts(&self) -> Vec<Shortcut> {
         Vec::new()
+    }
+
+    /// Returns commands the action bar can execute for the current surface state.
+    fn commands(&self) -> Vec<SurfaceCommand> {
+        Vec::new()
+    }
+
+    /// Executes a command previously returned by [`Surface::commands`].
+    fn execute_command(&mut self, _id: &str) -> SurfaceAction {
+        SurfaceAction::Ignored
     }
 
     /// Called after this surface becomes active.

@@ -27,70 +27,70 @@ background = "cyan"
 [bindings]
 # The first entry is shown in the footer and help. Additional entries are fallbacks.
 leaders = ["ctrl-g"]
-palette = ["ctrl-`", "ctrl-space", "ctrl-p"]
-redraw = ["ctrl-/", "ctrl-_"]
+palette = ["ctrl-`", "ctrl-space"]
+redraw = ["f5"]
 next_screen = []
 previous_screen = []
 jump_modifiers = []
 
-# Shortcuts active on shell-managed surfaces.
-shell_detach = ["ctrl-d"]
-shell_next_screen = ["tab"]
-shell_previous_screen = ["backtab"]
-shell_help = ["?"]
+[bindings.shell]
+detach = ["ctrl-d"]
+next_screen = ["tab"]
+previous_screen = ["backtab"]
+help = ["?", "f1", "alt-h"]
 
-# Keys pressed after the leader.
-leader_palette = ["s"]
-leader_next_screen = ["n", "tab", "right"]
-leader_previous_screen = ["p", "backtab", "left"]
-leader_scroll_up = ["k", "up"]
-leader_scroll_down = ["j", "down"]
-leader_close = ["x"]
-leader_detach = ["d"]
-leader_help = ["?", "h"]
-leader_jump_modifiers = ["none"]
+[bindings.leader]
+palette = ["s"]
+next_screen = ["n", "tab", "right"]
+previous_screen = ["p", "backtab", "left"]
+scroll_up = ["k", "up"]
+scroll_down = ["j", "down"]
+close = ["x"]
+detach = ["d"]
+help = ["?", "h"]
+jump_modifiers = ["none"]
 
-# Accelerators active only while the action bar is open.
-action_next_screen = ["alt-right"]
-action_previous_screen = ["alt-left"]
-action_scroll_up = ["alt-up"]
-action_scroll_down = ["alt-down"]
-action_close = ["alt-x"]
-action_detach = ["alt-d"]
-action_help = ["alt-?"]
-action_clear_query = ["ctrl-u"]
-action_jump_modifiers = ["alt"]
+[bindings.action]
+next_screen = ["alt-right"]
+previous_screen = ["alt-left"]
+scroll_up = ["alt-up"]
+scroll_down = ["alt-down"]
+close = ["alt-x"]
+detach = ["alt-d"]
+help = ["alt-?"]
+clear_query = ["ctrl-u"]
+jump_modifiers = ["alt"]
 
-# Resident command-session shortcuts.
-session_release_driver = ["f2"]
-session_take_driver = ["f3"]
-session_clear = ["cmd-k", "ctrl-l"]
-session_interrupt = ["ctrl-c"]
-session_detach = ["ctrl-d"]
-session_delete_to_start = ["ctrl-u", "cmd-backspace"]
-session_word_left = ["alt-left", "alt-b"]
-session_word_right = ["alt-right", "alt-f"]
-session_line_start = ["cmd-left"]
-session_line_end = ["cmd-right"]
-session_delete_word = ["alt-backspace"]
-session_complete = ["tab"]
-session_scroll_up = ["pageup"]
-session_scroll_down = ["pagedown"]
-session_scroll_top = ["ctrl-home"]
-session_scroll_bottom = ["ctrl-end"]
+[bindings.session]
+release_driver = ["f2"]
+take_driver = ["f3"]
+clear = ["ctrl-l", "cmd-k"]
+interrupt = ["ctrl-c"]
+detach = ["ctrl-d"]
+delete_to_start = ["ctrl-u", "cmd-backspace"]
+word_left = ["alt-b", "alt-left"]
+word_right = ["alt-f", "alt-right"]
+line_start = ["ctrl-a", "cmd-left"]
+line_end = ["ctrl-e", "cmd-right"]
+delete_word = ["ctrl-w", "alt-backspace"]
+complete = ["tab"]
+scroll_up = ["pageup"]
+scroll_down = ["pagedown"]
+scroll_top = ["ctrl-home"]
+scroll_bottom = ["ctrl-end"]
 
-# Overview/dashboard action shortcuts.
-dashboard_up = ["k"]
-dashboard_down = ["j"]
-dashboard_view = ["v"]
-dashboard_take = ["t"]
-dashboard_search = ["/"]
-dashboard_new = ["n"]
-dashboard_rename = ["r"]
-dashboard_delete = ["x"]
-dashboard_stop = ["!"]
-dashboard_keybindings = ["b"]
-dashboard_close = ["q"]
+[bindings.dashboard]
+up = ["k"]
+down = ["j"]
+view = ["v"]
+take = ["t"]
+search = ["/"]
+new = ["n"]
+rename = ["r"]
+delete = ["x"]
+stop = ["!"]
+keybindings = ["b"]
+close = ["q"]
 "#;
 
 pub(super) fn print_resolved_toml(config: &ShellConfig) {
@@ -132,82 +132,65 @@ pub(super) fn print_resolved_toml(config: &ShellConfig) {
     print_binding_list("next_screen", &config.bindings.next_screen);
     print_binding_list("previous_screen", &config.bindings.previous_screen);
     print_modifier_list("jump_modifiers", &config.bindings.jump_modifiers);
-    print_binding_list("shell_detach", &config.bindings.shell_detach);
-    print_binding_list("shell_next_screen", &config.bindings.shell_next_screen);
-    print_binding_list(
-        "shell_previous_screen",
-        &config.bindings.shell_previous_screen,
-    );
-    print_binding_list("shell_help", &config.bindings.shell_help);
-    print_binding_list("leader_palette", &config.bindings.leader_palette);
-    print_binding_list("leader_next_screen", &config.bindings.leader_next_screen);
-    print_binding_list(
-        "leader_previous_screen",
-        &config.bindings.leader_previous_screen,
-    );
-    print_binding_list("leader_scroll_up", &config.bindings.leader_scroll_up);
-    print_binding_list("leader_scroll_down", &config.bindings.leader_scroll_down);
-    print_binding_list("leader_close", &config.bindings.leader_close);
-    print_binding_list("leader_detach", &config.bindings.leader_detach);
-    print_binding_list("leader_help", &config.bindings.leader_help);
-    print_modifier_list(
-        "leader_jump_modifiers",
-        &config.bindings.leader_jump_modifiers,
-    );
-    print_binding_list("action_next_screen", &config.bindings.action_next_screen);
-    print_binding_list(
-        "action_previous_screen",
-        &config.bindings.action_previous_screen,
-    );
-    print_binding_list("action_scroll_up", &config.bindings.action_scroll_up);
-    print_binding_list("action_scroll_down", &config.bindings.action_scroll_down);
-    print_binding_list("action_close", &config.bindings.action_close);
-    print_binding_list("action_detach", &config.bindings.action_detach);
-    print_binding_list("action_help", &config.bindings.action_help);
-    print_binding_list("action_clear_query", &config.bindings.action_clear_query);
-    print_modifier_list(
-        "action_jump_modifiers",
-        &config.bindings.action_jump_modifiers,
-    );
-    print_binding_list(
-        "session_release_driver",
-        &config.bindings.session_release_driver,
-    );
-    print_binding_list("session_take_driver", &config.bindings.session_take_driver);
-    print_binding_list("session_clear", &config.bindings.session_clear);
-    print_binding_list("session_interrupt", &config.bindings.session_interrupt);
-    print_binding_list("session_detach", &config.bindings.session_detach);
-    print_binding_list(
-        "session_delete_to_start",
-        &config.bindings.session_delete_to_start,
-    );
-    print_binding_list("session_word_left", &config.bindings.session_word_left);
-    print_binding_list("session_word_right", &config.bindings.session_word_right);
-    print_binding_list("session_line_start", &config.bindings.session_line_start);
-    print_binding_list("session_line_end", &config.bindings.session_line_end);
-    print_binding_list("session_delete_word", &config.bindings.session_delete_word);
-    print_binding_list("session_complete", &config.bindings.session_complete);
-    print_binding_list("session_scroll_up", &config.bindings.session_scroll_up);
-    print_binding_list("session_scroll_down", &config.bindings.session_scroll_down);
-    print_binding_list("session_scroll_top", &config.bindings.session_scroll_top);
-    print_binding_list(
-        "session_scroll_bottom",
-        &config.bindings.session_scroll_bottom,
-    );
-    print_binding_list("dashboard_up", &config.bindings.dashboard_up);
-    print_binding_list("dashboard_down", &config.bindings.dashboard_down);
-    print_binding_list("dashboard_view", &config.bindings.dashboard_view);
-    print_binding_list("dashboard_take", &config.bindings.dashboard_take);
-    print_binding_list("dashboard_search", &config.bindings.dashboard_search);
-    print_binding_list("dashboard_new", &config.bindings.dashboard_new);
-    print_binding_list("dashboard_rename", &config.bindings.dashboard_rename);
-    print_binding_list("dashboard_delete", &config.bindings.dashboard_delete);
-    print_binding_list("dashboard_stop", &config.bindings.dashboard_stop);
-    print_binding_list(
-        "dashboard_keybindings",
-        &config.bindings.dashboard_keybindings,
-    );
-    print_binding_list("dashboard_close", &config.bindings.dashboard_close);
+    println!();
+    println!("[bindings.shell]");
+    print_binding_list("detach", &config.bindings.shell_detach);
+    print_binding_list("next_screen", &config.bindings.shell_next_screen);
+    print_binding_list("previous_screen", &config.bindings.shell_previous_screen);
+    print_binding_list("help", &config.bindings.shell_help);
+    println!();
+    println!("[bindings.leader]");
+    print_binding_list("palette", &config.bindings.leader_palette);
+    print_binding_list("next_screen", &config.bindings.leader_next_screen);
+    print_binding_list("previous_screen", &config.bindings.leader_previous_screen);
+    print_binding_list("scroll_up", &config.bindings.leader_scroll_up);
+    print_binding_list("scroll_down", &config.bindings.leader_scroll_down);
+    print_binding_list("close", &config.bindings.leader_close);
+    print_binding_list("detach", &config.bindings.leader_detach);
+    print_binding_list("help", &config.bindings.leader_help);
+    print_modifier_list("jump_modifiers", &config.bindings.leader_jump_modifiers);
+    println!();
+    println!("[bindings.action]");
+    print_binding_list("next_screen", &config.bindings.action_next_screen);
+    print_binding_list("previous_screen", &config.bindings.action_previous_screen);
+    print_binding_list("scroll_up", &config.bindings.action_scroll_up);
+    print_binding_list("scroll_down", &config.bindings.action_scroll_down);
+    print_binding_list("close", &config.bindings.action_close);
+    print_binding_list("detach", &config.bindings.action_detach);
+    print_binding_list("help", &config.bindings.action_help);
+    print_binding_list("clear_query", &config.bindings.action_clear_query);
+    print_modifier_list("jump_modifiers", &config.bindings.action_jump_modifiers);
+    println!();
+    println!("[bindings.session]");
+    print_binding_list("release_driver", &config.bindings.session_release_driver);
+    print_binding_list("take_driver", &config.bindings.session_take_driver);
+    print_binding_list("clear", &config.bindings.session_clear);
+    print_binding_list("interrupt", &config.bindings.session_interrupt);
+    print_binding_list("detach", &config.bindings.session_detach);
+    print_binding_list("delete_to_start", &config.bindings.session_delete_to_start);
+    print_binding_list("word_left", &config.bindings.session_word_left);
+    print_binding_list("word_right", &config.bindings.session_word_right);
+    print_binding_list("line_start", &config.bindings.session_line_start);
+    print_binding_list("line_end", &config.bindings.session_line_end);
+    print_binding_list("delete_word", &config.bindings.session_delete_word);
+    print_binding_list("complete", &config.bindings.session_complete);
+    print_binding_list("scroll_up", &config.bindings.session_scroll_up);
+    print_binding_list("scroll_down", &config.bindings.session_scroll_down);
+    print_binding_list("scroll_top", &config.bindings.session_scroll_top);
+    print_binding_list("scroll_bottom", &config.bindings.session_scroll_bottom);
+    println!();
+    println!("[bindings.dashboard]");
+    print_binding_list("up", &config.bindings.dashboard_up);
+    print_binding_list("down", &config.bindings.dashboard_down);
+    print_binding_list("view", &config.bindings.dashboard_view);
+    print_binding_list("take", &config.bindings.dashboard_take);
+    print_binding_list("search", &config.bindings.dashboard_search);
+    print_binding_list("new", &config.bindings.dashboard_new);
+    print_binding_list("rename", &config.bindings.dashboard_rename);
+    print_binding_list("delete", &config.bindings.dashboard_delete);
+    print_binding_list("stop", &config.bindings.dashboard_stop);
+    print_binding_list("keybindings", &config.bindings.dashboard_keybindings);
+    print_binding_list("close", &config.bindings.dashboard_close);
 }
 
 fn print_modifier_list(name: &str, modifiers: &[KeyModifiers]) {

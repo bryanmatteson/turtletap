@@ -462,20 +462,19 @@ pub enum ServerMessage {
         /// Latest event available at the leader.
         latest: EventSequence,
     },
-    /// Advance notice of a planned shutdown.
+    /// Advance notice of graceful shutdown.
     ShuttingDown {
-        /// Planned shutdown reason.
+        /// Shutdown reason.
         reason: ShutdownReason,
     },
-    /// Final planned-shutdown message.
+    /// Final graceful-shutdown message.
     Shutdown {
         /// Completed shutdown reason.
         reason: ShutdownReason,
     },
 }
 
-/// Whether a `requested` binary version should displace a leader running
-/// `current`.
+/// Returns whether `requested` displaces a leader running `current`.
 ///
 /// Versions that do not parse as semver fall back to string ordering, so a
 /// product using its own versioning scheme still gets a total order rather

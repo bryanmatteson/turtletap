@@ -62,7 +62,7 @@ fn main() -> ExitCode {
     let source_output = matches!(
         &command,
         args::Command::Config(args::ConfigArgs {
-            action: None | Some(args::ConfigAction::Show { .. })
+            action: None | Some(args::ConfigAction::Show { .. }) | Some(args::ConfigAction::Path)
         }) | args::Command::Completions { .. }
             | args::Command::Man
     );
@@ -168,6 +168,11 @@ fn config_command(
     interactive: commands::InteractiveOptions,
 ) -> ExitCode {
     use args::ConfigAction;
+    let format = if matches!(&config.action, Some(ConfigAction::Path)) {
+        commands::OutputFormat::Human
+    } else {
+        format
+    };
     if matches!(config.action, Some(ConfigAction::Keys)) {
         if format == commands::OutputFormat::Json {
             return usage_error(
