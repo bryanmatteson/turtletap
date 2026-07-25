@@ -183,7 +183,7 @@ fn parse_kdl_shell(node: &::kdl::KdlNode, shell: &mut ShellSettings) -> Result<(
             "tick-rate-ms" => {
                 let value = entry
                     .value()
-                    .as_i64()
+                    .as_integer()
                     .ok_or_else(|| "shell tick-rate-ms must be an integer".to_owned())?;
                 shell.tick_rate_ms = Some(
                     u64::try_from(value)
@@ -783,7 +783,7 @@ fn kdl_bool(value: &::kdl::KdlValue, field: &str) -> Result<bool, String> {
 
 fn kdl_u16(value: &::kdl::KdlValue, field: &str) -> Result<u16, String> {
     let integer = value
-        .as_i64()
+        .as_integer()
         .ok_or_else(|| format!("{field} must be an integer"))?;
     u16::try_from(integer).map_err(|_| format!("{field} must be between 0 and 65535"))
 }

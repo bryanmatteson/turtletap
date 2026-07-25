@@ -319,9 +319,9 @@ fn update_kdl_binding(
     let children = if let Some(scope) = scope {
         let legacy_name = format!("{scope}-{name}");
         if let Some(node) = children.get_mut(&legacy_name) {
-            node.clear_entries();
+            node.clear_children();
             node.push(label);
-            node.fmt();
+            node.autoformat();
             return Ok(document.to_string());
         }
         if children.get(scope).is_none() {
@@ -340,9 +340,9 @@ fn update_kdl_binding(
     let node = children
         .get_mut(name)
         .ok_or_else(|| invalid(format!("could not create bindings child '{name}'")))?;
-    node.clear_entries();
+    node.clear_children();
     node.push(label);
-    node.fmt();
+    node.autoformat();
     Ok(document.to_string())
 }
 
