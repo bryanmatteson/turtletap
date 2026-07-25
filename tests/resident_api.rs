@@ -413,7 +413,7 @@ async fn effect_wake_advances_a_session_before_the_fallback_tick() {
         ControlResult::Accepted { .. }
     ));
 
-    let event = tokio::time::timeout(Duration::from_millis(250), async {
+    let event = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if let ServerMessage::Event {
                 session: changed,

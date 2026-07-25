@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- Added `TerminalRuntime` and the non-`Send` `TerminalApplication` contract so
+  thread-affine products can reuse terminal setup, restoration, input, resize,
+  and ticks without adopting TurtleTap's multiplexed shell.
+- Refactored synchronous `Shell::attach` through the terminal runtime; the
+  existing `Surface`, resident-session, and asynchronous shell contracts remain
+  intact.
+- Added `Chrome::None` for hosts that want shell multiplexing and commands
+  without shell-owned header, navigator, or footer rows.
+- Made resident effect wakes wait asynchronously for actor-mailbox capacity
+  instead of falling back to the periodic tick when the mailbox is saturated.
+
 ## 0.2.1 — 2026-07-25
 
 - Updated the optional Termosaic integration to 0.2.2 and its Laidout 0.3

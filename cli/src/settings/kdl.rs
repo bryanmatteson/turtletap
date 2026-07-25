@@ -797,9 +797,16 @@ pub(super) fn print_resolved_kdl(config: &ShellConfig) {
             config.direct_detach,
             config.tick_rate.as_millis(),
         );
-    } else {
+    } else if chrome == "tabs" {
         println!(
             "shell mouse-capture={} direct-detach={} tick-rate-ms={} chrome=\"tabs\"",
+            config.mouse_capture,
+            config.direct_detach,
+            config.tick_rate.as_millis(),
+        );
+    } else {
+        println!(
+            "shell mouse-capture={} direct-detach={} tick-rate-ms={} chrome=\"none\"",
             config.mouse_capture,
             config.direct_detach,
             config.tick_rate.as_millis(),

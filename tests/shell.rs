@@ -163,6 +163,44 @@ fn ctrl_d_detaches_a_shell_managed_surface() {
 }
 
 #[test]
+fn chrome_none_gives_the_active_surface_the_complete_viewport() {
+    let (surface, _) = Probe::new("product", InputPolicy::Shell);
+    let mut shell = Shell::new(ShellConfig::new("host").with_chrome(Chrome::None));
+    shell.add_surface(surface);
+
+    let rendered = shell
+        .render_to_string(40, 6)
+        .expect("chrome-free shell should render");
+
+    assert!(rendered.starts_with("product body"), "{rendered}");
+    assert!(!rendered.contains("screen 1/1"), "{rendered}");
+    assert!(!rendered.contains("host"), "{rendered}");
+}
+
+#[test]
+fn chrome_none_retains_shell_input_and_handles_minimum_viewports() {
+    let (surface, events) = Probe::new("product", InputPolicy::Shell);
+    let mut shell = Shell::new(ShellConfig::new("host").with_chrome(Chrome::None));
+    shell.add_surface(surface);
+
+    let rendered = shell
+        .render_to_string(1, 1)
+        .expect("minimum chrome-free viewport should render");
+    assert!(!rendered.contains("host"), "{rendered}");
+
+    assert_eq!(
+        shell.handle_event(key(KeyCode::Char('d'), KeyModifiers::CONTROL)),
+        ShellSignal::Exit(turtletap::ExitReason::Detached)
+    );
+    assert!(
+        events
+            .lock()
+            .expect("probe lock should be healthy")
+            .is_empty()
+    );
+}
+
+#[test]
 fn opening_a_surface_with_an_existing_key_focuses_without_duplicating_it() {
     let (existing, _) = Probe::new("existing", InputPolicy::Shell);
     let mut shell = Shell::new(ShellConfig::new("Talos"));

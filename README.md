@@ -4,6 +4,11 @@ TurtleTap hosts multiple terminal surfaces in one attachable shell. A surface ow
 its content and input policy. TurtleTap owns terminal setup, focus, chrome,
 navigation, rendering, and detach.
 
+Terminal ownership is available independently of the shell. A same-thread
+`TerminalApplication` receives the complete viewport and raw terminal events
+through `TerminalRuntime`; it does not need to be `Send`. `Shell` is an optional
+`TerminalApplication` that adds multiplexing, chrome, bindings, and the action bar.
+
 The workspace contains two crates:
 
 - `turtletap`: the reusable shell and resident-session library.
@@ -84,12 +89,54 @@ println!("{reason:?}");
 # Ok::<(), std::io::Error>(())
 ```
 
+## Product-owned application
+
+Applications that already own navigation, chrome, commands, and focus can use the
+terminal runtime directly. This path supports thread-affine state such as FFI
+interpreters and `Rc` graphs.
+
+```rust,no_run
+use turtletap::{
+    Event, Frame, Rect, RuntimeAction, RuntimeEvent, TerminalApplication,
+    TerminalConfig, TerminalRuntime,
+};
+
+struct ProductApp;
+
+impl TerminalApplication for ProductApp {
+    type Exit = ();
+
+    fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        frame.render_widget("product-owned interface", area);
+    }
+
+    fn handle(&mut self, event: RuntimeEvent) -> RuntimeAction<Self::Exit> {
+        match event {
+            RuntimeEvent::Terminal(Event::Key(key))
+                if key.code == turtletap::KeyCode::Char('q') =>
+            {
+                RuntimeAction::Exit(())
+            }
+            RuntimeEvent::Terminal(Event::Resize(..)) | RuntimeEvent::Tick(_) => {
+                RuntimeAction::Redraw
+            }
+            _ => RuntimeAction::Ignored,
+        }
+    }
+}
+
+let mut application = ProductApp;
+TerminalRuntime::new(TerminalConfig::new()).run(&mut application)?;
+# Ok::<(), std::io::Error>(())
+```
+
 `Shell::attach` restores raw mode and the alternate screen before returning. The
 shell retains its surfaces and can attach again. Mouse capture is off by default, so
 native terminal selection remains available. `ShellConfig::with_mouse_capture(true)`
 enables surface mouse events.
 
-`Chrome::Tabs` is the default. `Chrome::rail()` keeps a persistent surface list and
+`Chrome::Tabs` is the default. `Chrome::None` gives the active surface the complete
+viewport while retaining shell behavior. `Chrome::rail()` keeps a persistent surface list and
 narrows it to status markers when terminal width is constrained. Surface titles,
 status, badges, and shortcuts feed the shell chrome and contextual help.
 

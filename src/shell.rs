@@ -1,53 +1,30 @@
 use std::{
     io,
-    sync::atomic::{AtomicBool, Ordering},
     task::{Context, Poll},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 #[cfg(feature = "async-shell")]
 use crossterm::event::EventStream;
-use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
-};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
 #[cfg(feature = "async-shell")]
 use futures_util::{StreamExt as _, future::OptionFuture};
 use ratatui::{Terminal, backend::TestBackend, layout::Rect};
+#[cfg(feature = "async-shell")]
+use std::time::Instant;
 
 use crate::{
     InputPolicy, Surface, SurfaceAction, SurfaceEvent, Theme,
     binding::{KeyBinding, ShellBindings},
     render,
-    terminal::TerminalSession,
+    runtime::{RuntimeAction, RuntimeEvent, TerminalApplication, TerminalConfig, TerminalRuntime},
 };
+#[cfg(feature = "async-shell")]
+use crate::{runtime::AttachLease, terminal::TerminalSession};
 
 const PULSE_FRAME_RATE: Duration = Duration::from_millis(250);
 const DEFAULT_FRAME_INTERVAL: Duration = Duration::from_millis(4);
 const PULSE_FRAMES: [&str; 8] = ["·", "·", "•", "●", "•", "·", "·", "·"];
-static ATTACHED: AtomicBool = AtomicBool::new(false);
-
-struct AttachLease;
-
-impl AttachLease {
-    fn acquire() -> io::Result<Self> {
-        ATTACHED
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map(|_| Self)
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "already_attached: another TurtleTap shell owns terminal input",
-                )
-            })
-    }
-}
-
-impl Drop for AttachLease {
-    fn drop(&mut self) {
-        ATTACHED.store(false, Ordering::Release);
-    }
-}
-
 /// Stable identity assigned to a surface by its shell.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct SurfaceId(u64);
@@ -260,6 +237,11 @@ fn digit_range_label(modifiers: KeyModifiers) -> String {
 /// How the shell presents its list of surfaces.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Chrome {
+    /// No shell-owned header, navigator, or footer.
+    ///
+    /// The active surface receives the complete terminal viewport. Shell
+    /// bindings and overlays remain available.
+    None,
     /// A horizontal tab strip above the active surface.
     ///
     /// Suited to a handful of long-lived surfaces; a growing list outgrows the
@@ -295,7 +277,7 @@ impl Chrome {
     /// Columns this chrome claims at `total` width, or `None` for tabs.
     pub(crate) const fn rail_width(self, total: u16) -> Option<u16> {
         match self {
-            Self::Tabs => None,
+            Self::None | Self::Tabs => None,
             Self::Rail {
                 width,
                 narrow,
@@ -558,56 +540,11 @@ impl Shell {
         if self.entries.is_empty() {
             return Ok(ExitReason::NoSurfaces);
         }
-
-        let _lease = AttachLease::acquire()?;
-        let mut session = TerminalSession::enter(self.config.mouse_capture)?;
-        let mut previous_tick = Instant::now();
         self.dirty = true;
-
-        loop {
-            let tick_rate = self.tick_rate();
-            if self.clear_requested {
-                session.clear_frame()?;
-                self.clear_requested = false;
-                self.dirty = true;
-            }
-            if self.dirty {
-                session.terminal().draw(|frame| render::draw(frame, self))?;
-                self.dirty = false;
-            }
-
-            let elapsed = previous_tick.elapsed();
-            if elapsed >= tick_rate {
-                previous_tick = Instant::now();
-                if let ShellSignal::Exit(reason) = self.dispatch_to_all(SurfaceEvent::Tick(elapsed))
-                {
-                    return Ok(reason);
-                }
-                if let ShellSignal::Exit(reason) = self.poll_background_sync() {
-                    return Ok(reason);
-                }
-                // Show lifecycle-driven changes before waiting for more input.
-                continue;
-            }
-
-            let timeout = tick_rate.saturating_sub(elapsed);
-            let signal = if event::poll(timeout)? {
-                self.handle_event(event::read()?)
-            } else {
-                let elapsed = previous_tick.elapsed();
-                previous_tick = Instant::now();
-                let tick = self.dispatch_to_all(SurfaceEvent::Tick(elapsed));
-                if matches!(tick, ShellSignal::Continue) {
-                    self.poll_background_sync()
-                } else {
-                    tick
-                }
-            };
-
-            if let ShellSignal::Exit(reason) = signal {
-                return Ok(reason);
-            }
-        }
+        let config = TerminalConfig::new()
+            .with_tick_rate(self.config.tick_rate)
+            .with_mouse_capture(self.config.mouse_capture);
+        TerminalRuntime::new(config).run(self)
     }
 
     /// Attaches this shell using event-driven terminal, background, redraw, and
@@ -1518,6 +1455,44 @@ fn fuzzy_score(needle: &str, label: &str, haystack: &str) -> Option<usize> {
     Some(100 + last.saturating_sub(first.unwrap_or(0)))
 }
 
+impl TerminalApplication for Shell {
+    type Exit = ExitReason;
+
+    fn render(&mut self, frame: &mut ratatui::Frame<'_>, _area: Rect) {
+        render::draw(frame, self);
+        self.dirty = false;
+    }
+
+    fn handle(&mut self, event: RuntimeEvent) -> RuntimeAction<Self::Exit> {
+        let signal = match event {
+            RuntimeEvent::Terminal(event) => self.handle_event(event),
+            RuntimeEvent::Tick(elapsed) => {
+                let tick = self.dispatch_to_all(SurfaceEvent::Tick(elapsed));
+                if matches!(tick, ShellSignal::Continue) {
+                    self.poll_background_sync()
+                } else {
+                    tick
+                }
+            }
+        };
+
+        if let ShellSignal::Exit(reason) = signal {
+            RuntimeAction::Exit(reason)
+        } else if self.clear_requested {
+            self.clear_requested = false;
+            RuntimeAction::ClearAndRedraw
+        } else if self.dirty {
+            RuntimeAction::Redraw
+        } else {
+            RuntimeAction::Ignored
+        }
+    }
+
+    fn poll_interval(&self) -> Option<Duration> {
+        Some(self.tick_rate())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
@@ -1664,6 +1639,49 @@ mod tests {
         );
         assert!(shell.clear_requested);
         assert!(shell.dirty);
+    }
+
+    #[test]
+    fn runtime_adapter_translates_redraw_clear_and_exit_actions() {
+        let mut shell = Shell::new(ShellConfig::new("test"));
+        shell.add_surface(TickSurface {
+            redraw: true,
+            poll_interval: Some(Duration::from_millis(20)),
+        });
+        shell.dirty = false;
+
+        assert!(matches!(
+            TerminalApplication::handle(&mut shell, RuntimeEvent::Tick(Duration::from_millis(20))),
+            RuntimeAction::Redraw
+        ));
+
+        shell.dirty = false;
+        assert!(matches!(
+            TerminalApplication::handle(
+                &mut shell,
+                RuntimeEvent::Terminal(Event::Key(KeyEvent::new(
+                    KeyCode::F(5),
+                    KeyModifiers::NONE,
+                )))
+            ),
+            RuntimeAction::ClearAndRedraw
+        ));
+        assert!(!shell.clear_requested);
+
+        assert!(matches!(
+            TerminalApplication::handle(
+                &mut shell,
+                RuntimeEvent::Terminal(Event::Key(KeyEvent::new(
+                    KeyCode::Char('d'),
+                    KeyModifiers::CONTROL,
+                )))
+            ),
+            RuntimeAction::Exit(ExitReason::Detached)
+        ));
+        assert_eq!(
+            TerminalApplication::poll_interval(&shell),
+            Some(Duration::from_millis(20))
+        );
     }
 
     #[test]

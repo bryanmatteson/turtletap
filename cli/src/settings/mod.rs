@@ -1123,6 +1123,7 @@ fn resolve(title: &str, settings: SettingsFile) -> io::Result<ShellConfig> {
 /// Tabs mode reports zeroed dimensions, which the printers omit.
 fn chrome_fields(chrome: Chrome) -> (&'static str, u16, u16, u16) {
     match chrome {
+        Chrome::None => ("none", 0, 0, 0),
         Chrome::Tabs => ("tabs", 0, 0, 0),
         Chrome::Rail {
             width,
@@ -1137,6 +1138,7 @@ fn chrome_fields(chrome: Chrome) -> (&'static str, u16, u16, u16) {
 fn resolve_chrome(shell: &ShellSettings) -> io::Result<Chrome> {
     let mode = shell.chrome.as_deref().unwrap_or("rail");
     match mode {
+        "none" => Ok(Chrome::None),
         "tabs" => Ok(Chrome::Tabs),
         "rail" => {
             let Chrome::Rail {
@@ -1154,7 +1156,7 @@ fn resolve_chrome(shell: &ShellSettings) -> io::Result<Chrome> {
             })
         }
         other => Err(invalid(format!(
-            "shell.chrome must be 'rail' or 'tabs', not '{other}'"
+            "shell.chrome must be 'none', 'rail', or 'tabs', not '{other}'"
         ))),
     }
 }
@@ -1458,6 +1460,29 @@ mod tests {
         let config = resolve("test", settings).expect("TOML settings should resolve");
 
         assert_eq!(config.bindings, ShellBindings::default());
+    }
+
+    #[test]
+    fn chrome_none_resolves_equivalently_from_kdl_and_toml() {
+        let kdl = resolve(
+            "test",
+            parse_kdl("shell chrome=\"none\"\n", Path::new("chrome-none.kdl"))
+                .expect("KDL chrome mode should parse"),
+        )
+        .expect("KDL chrome mode should resolve");
+        let toml = resolve(
+            "test",
+            parse_toml(
+                "[shell]\nchrome = \"none\"\n",
+                Path::new("chrome-none.toml"),
+            )
+            .expect("TOML chrome mode should parse"),
+        )
+        .expect("TOML chrome mode should resolve");
+
+        assert_eq!(kdl.chrome, Chrome::None);
+        assert_eq!(toml.chrome, Chrome::None);
+        assert_eq!(chrome_fields(kdl.chrome), ("none", 0, 0, 0));
     }
 
     #[test]

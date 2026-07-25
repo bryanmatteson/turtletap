@@ -13,6 +13,19 @@ use crate::{
 
 pub(crate) fn draw(frame: &mut Frame<'_>, shell: &mut Shell) {
     let area = frame.area();
+    if shell.config.chrome == crate::Chrome::None {
+        shell.chrome_hits.clear();
+        draw_active_unframed(frame, area, shell);
+        match shell.overlay.clone() {
+            Some(Overlay::Palette { query, selected }) => {
+                draw_palette(frame, area, shell, &query, selected);
+            }
+            Some(Overlay::Help) => draw_help(frame, area, shell),
+            None => {}
+        }
+        return;
+    }
+
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -45,6 +58,19 @@ pub(crate) fn draw(frame: &mut Frame<'_>, shell: &mut Shell) {
         }
         Some(Overlay::Help) => draw_help(frame, area, shell),
         None => {}
+    }
+}
+
+fn draw_active_unframed(frame: &mut Frame<'_>, area: Rect, shell: &mut Shell) {
+    if let Some(surface) = shell.active_surface_mut() {
+        surface.render(frame, area);
+    } else {
+        frame.render_widget(
+            Paragraph::new("No surfaces are open.")
+                .style(shell.config.theme.muted)
+                .alignment(Alignment::Center),
+            area,
+        );
     }
 }
 

@@ -4,6 +4,7 @@ mod binding;
 mod render;
 #[cfg(feature = "resident")]
 pub mod resident;
+mod runtime;
 mod shell;
 mod surface;
 mod terminal;
@@ -15,6 +16,9 @@ pub use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 pub use ratatui::{Frame, layout::Rect};
+pub use runtime::{
+    RuntimeAction, RuntimeEvent, TerminalApplication, TerminalConfig, TerminalRuntime,
+};
 pub use shell::{Chrome, ExitReason, Shell, ShellConfig, ShellSignal, SurfaceId};
 pub use surface::{
     InputPolicy, Shortcut, Surface, SurfaceAction, SurfaceCommand, SurfaceEvent, SurfaceStatus,

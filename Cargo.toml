@@ -73,7 +73,9 @@
     uuid          = { version = "1", features = ["serde", "v4"], optional = true }
 
 [dev-dependencies]
-    tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+portable-pty = "0.9"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+vt100 = "=0.15.2"
 
 [[test]]
     name              = "compatibility"

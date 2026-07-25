@@ -1072,21 +1072,7 @@ where
         });
         let application = self.application.clone();
         let sender = self.incoming_tx.clone();
-        let wake_sender = self.incoming_tx.clone();
-        let wake = EffectWake::new(move |wake| {
-            if wake_sender
-                .try_send(Incoming::SessionReady {
-                    session,
-                    wake: wake.clone(),
-                })
-                .is_err()
-            {
-                // A saturated or closing mailbox must not leave the handle
-                // permanently coalesced. A later notification can retry, and
-                // the periodic poll remains the overload fallback.
-                wake.acknowledge();
-            }
-        });
+        let wake = session_wake(self.runtime.clone(), self.incoming_tx.clone(), session);
         let effect_id = pending.id;
         let effect_cancellation = cancellation.clone();
         self.runtime.spawn(async move {
@@ -1396,6 +1382,38 @@ where
     }
 }
 
+fn session_wake<R, O>(runtime: R, sender: IncomingSender<O>, session: SessionId) -> EffectWake
+where
+    R: Spawner,
+    O: Send + 'static,
+{
+    let (wake_tx, wake_rx) = async_channel::bounded::<EffectWake>(1);
+    runtime.spawn(async move {
+        while let Ok(wake) = wake_rx.recv().await {
+            if sender
+                .send(Incoming::SessionReady {
+                    session,
+                    wake: wake.clone(),
+                })
+                .await
+                .is_err()
+            {
+                wake.acknowledge();
+                return;
+            }
+        }
+    });
+
+    EffectWake::new(move |wake| {
+        if wake_tx.try_send(wake.clone()).is_err() {
+            // A closed forwarder must not leave a retained wake handle
+            // permanently coalesced. Full is unreachable while EffectWake's
+            // own queued bit is set, but recovering here is harmless.
+            wake.acknowledge();
+        }
+    })
+}
+
 fn close_client_queues(
     clients: &mut HashMap<ConnectionId, async_channel::Sender<ServerMessage>>,
     reason: ShutdownReason,
@@ -1678,6 +1696,38 @@ mod tests {
             receiver.try_recv(),
             Err(async_channel::TryRecvError::Closed)
         ));
+    }
+
+    #[tokio::test]
+    async fn effect_wake_waits_for_saturated_actor_mailbox_capacity() {
+        let (sender, receiver): (IncomingSender<()>, IncomingReceiver<()>) =
+            async_channel::bounded(1);
+        sender
+            .send(Incoming::Tick(Duration::ZERO))
+            .await
+            .expect("fixture should saturate the mailbox");
+        let session = SessionId::new();
+        let wake = session_wake(TokioRuntime, sender, session);
+
+        wake.notify();
+        assert!(matches!(
+            receiver.recv().await,
+            Ok(Incoming::Tick(Duration::ZERO))
+        ));
+
+        let incoming = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("wake should enqueue after capacity becomes available")
+            .expect("actor mailbox should remain open");
+        let Incoming::SessionReady {
+            session: changed,
+            wake,
+        } = incoming
+        else {
+            panic!("expected the retained session wake");
+        };
+        assert_eq!(changed, session);
+        wake.acknowledge();
     }
 
     #[derive(Clone)]
