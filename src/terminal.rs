@@ -1,4 +1,4 @@
-use std::io::{self, Stdout, Write};
+use std::io::{self, BufWriter, Stdout, Write};
 
 use crossterm::{
     cursor::{Hide, Show},
@@ -14,7 +14,9 @@ use ratatui::{
     backend::{Backend, CrosstermBackend},
 };
 
-pub(crate) type TuiTerminal = Terminal<CrosstermBackend<Stdout>>;
+const FRAME_BUFFER_CAPACITY: usize = 64 * 1024;
+
+pub(crate) type TuiTerminal = Terminal<CrosstermBackend<BufWriter<Stdout>>>;
 
 pub(crate) struct TerminalSession {
     terminal: TuiTerminal,
@@ -49,7 +51,8 @@ impl TerminalSession {
         )
         .is_ok();
 
-        let backend = CrosstermBackend::new(stdout);
+        let backend =
+            CrosstermBackend::new(BufWriter::with_capacity(FRAME_BUFFER_CAPACITY, stdout));
         let terminal = match Terminal::new(backend) {
             Ok(terminal) => terminal,
             Err(error) => {
