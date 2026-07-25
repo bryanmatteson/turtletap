@@ -354,6 +354,7 @@ struct RuntimeState {
     events: VecDeque<WorkerEvent>,
     output_bytes: usize,
     subscribers: Vec<mpsc::SyncSender<WorkerEvent>>,
+    completion_override: Option<i32>,
     directory: PathBuf,
     durability: Durability,
 }
@@ -372,6 +373,7 @@ impl RuntimeState {
             events,
             output_bytes,
             subscribers: Vec::new(),
+            completion_override: None,
             directory,
             durability,
         })
@@ -444,6 +446,7 @@ impl RuntimeState {
     }
 
     fn finish(&mut self, code: i32) -> io::Result<()> {
+        self.completion_override = None;
         let sequence = self.next_sequence();
         if let Some(command) = self.stored.command.as_mut() {
             command.status = StoredStatus::Completed { code };
@@ -755,7 +758,7 @@ fn spawn_active_command(
     };
     let _ = fs::remove_file(&gate);
     let process_token = random_token(16)?;
-    const GATED_EXEC: &str = "i=0; while [ ! -f \"$1\" ]; do i=$((i+1)); [ \"$i\" -ge 5000 ] && exit 125; sleep 0.001; done; exec \"$2\" -c \"$3\" \"$4\"";
+    const GATED_EXEC: &str = "i=0; while [ ! -f \"$1\" ]; do i=$((i+1)); [ \"$i\" -ge 5000 ] && exit 125; sleep 0.001; done; \"$2\" -c \"$3\" \"$4\"; status=$?; exit \"$status\"";
     let mut child = match Command::new("/bin/sh")
         .arg("-c")
         .arg(GATED_EXEC)
@@ -921,6 +924,7 @@ fn monitor_command(
             .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
     });
     if let Ok(mut runtime) = shared.lock() {
+        let code = runtime.completion_override.take().unwrap_or(code);
         let _ = runtime.finish(code);
     }
     let _ = fs::remove_file(gate);
@@ -970,9 +974,32 @@ fn recover_incomplete_command(runtime: &mut RuntimeState) -> io::Result<()> {
 }
 
 fn interrupt_active(shared: &Arc<Mutex<RuntimeState>>) -> io::Result<()> {
-    let identity = active_identity(shared)?;
+    let identity = {
+        let mut runtime = shared
+            .lock()
+            .map_err(|_| io::Error::other("worker state lock poisoned"))?;
+        let identity = runtime.stored.command.as_ref().and_then(|command| {
+            if matches!(
+                command.status,
+                StoredStatus::Dispatching | StoredStatus::Running
+            ) {
+                command.process_group.zip(command.process_started.clone())
+            } else {
+                None
+            }
+        });
+        if identity.is_some() {
+            runtime.completion_override = Some(130);
+        }
+        identity
+    };
     if let Some((group, started)) = identity {
-        signal_verified_group(group, &started, "-INT")?;
+        if let Err(error) = interrupt_verified_group(group, &started) {
+            if let Ok(mut runtime) = shared.lock() {
+                runtime.completion_override = None;
+            }
+            return Err(error);
+        }
     }
     Ok(())
 }
@@ -1005,10 +1032,11 @@ fn terminate_verified_group(group: u32, started: &str) -> io::Result<()> {
     if !identity_matches(group, started) {
         return Ok(());
     }
-    signal_verified_group(group, started, "-TERM")?;
-    if !wait_until(Duration::from_secs(1), || !identity_matches(group, started)) {
-        signal_verified_group(group, started, "-KILL")?;
-        if !wait_until(Duration::from_secs(1), || !identity_matches(group, started)) {
+    verify_group_leader(group)?;
+    signal_group(group, "-TERM")?;
+    if !wait_until(Duration::from_secs(1), || !group_has_live_processes(group)) {
+        signal_group(group, "-KILL")?;
+        if !wait_until(Duration::from_secs(1), || !group_has_live_processes(group)) {
             return Err(io::Error::other(
                 "process group remained alive after SIGKILL",
             ));
@@ -1017,24 +1045,42 @@ fn terminate_verified_group(group: u32, started: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn signal_verified_group(group: u32, started: &str, signal: &str) -> io::Result<()> {
+fn interrupt_verified_group(group: u32, started: &str) -> io::Result<()> {
     if !identity_matches(group, started) {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "process identity changed before group signaling",
-        ));
+        return Ok(());
     }
+    verify_group_leader(group)?;
+    signal_group(group, "-INT")?;
+    if group_has_live_processes(group) {
+        signal_group(group, "-TERM")?;
+    }
+    if !wait_until(Duration::from_secs(1), || !group_has_live_processes(group)) {
+        signal_group(group, "-KILL")?;
+        if !wait_until(Duration::from_secs(1), || !group_has_live_processes(group)) {
+            return Err(io::Error::other(
+                "process group remained alive after interrupt escalation",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_group_leader(group: u32) -> io::Result<()> {
     let observed_group = process_group(group)?;
     if observed_group != group {
         return Err(io::Error::other(
             "process is no longer the recorded process-group leader",
         ));
     }
+    Ok(())
+}
+
+fn signal_group(group: u32, signal: &str) -> io::Result<()> {
     let status = Command::new("kill")
         .arg(signal)
         .arg(format!("-{group}"))
         .status()?;
-    if status.success() || !identity_matches(group, started) {
+    if status.success() || !group_has_live_processes(group) {
         Ok(())
     } else {
         Err(io::Error::other(format!(
@@ -1067,10 +1113,19 @@ fn terminate_child_group(child: &mut Child) -> io::Result<()> {
         .arg(format!("-{group}"))
         .status()?;
     let _ = child.wait();
-    status
-        .success()
-        .then_some(())
-        .ok_or_else(|| io::Error::other("could not terminate command process group"))
+    if status.success() || !group_has_live_processes(group) {
+        if wait_until(Duration::from_secs(1), || !group_has_live_processes(group)) {
+            Ok(())
+        } else {
+            Err(io::Error::other(
+                "command process group remained alive after SIGKILL",
+            ))
+        }
+    } else {
+        Err(io::Error::other(
+            "could not terminate command process group",
+        ))
+    }
 }
 
 fn process_identity(pid: u32) -> io::Result<String> {
@@ -1096,6 +1151,23 @@ fn process_group(pid: u32) -> io::Result<u32> {
         .trim()
         .parse()
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn group_has_live_processes(group: u32) -> bool {
+    let Ok(output) = Command::new("ps").args(["-axo", "pgid=,stat="]).output() else {
+        return true;
+    };
+    if !output.status.success() {
+        return true;
+    }
+    String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        fields
+            .next()
+            .and_then(|value| value.parse::<u32>().ok())
+            .zip(fields.next())
+            .is_some_and(|(observed, status)| observed == group && !status.starts_with('Z'))
+    })
 }
 
 fn identity_matches(pid: u32, expected: &str) -> bool {
@@ -1531,6 +1603,7 @@ mod tests {
             output_bytes: events.iter().map(event_spool_bytes).sum(),
             events,
             subscribers: Vec::new(),
+            completion_override: None,
             directory: PathBuf::new(),
             durability: Durability::Flush,
         };

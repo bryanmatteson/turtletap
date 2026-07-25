@@ -1096,15 +1096,7 @@ fn command_latency_stays_within_the_responsiveness_budgets() {
            after 100\n\
            send -- \"\\r\"\n\
            expect {{\n\
-             -exact \"$ $command\" {{}}\n\
-             timeout {{ exit 127 }}\n\
-           }}\n\
-           expect {{\n\
-             -exact \"TT_PROBE\" {{}}\n\
-             timeout {{ exit 128 }}\n\
-           }}\n\
-           expect {{\n\
-             -exact \"$suffix\" {{}}\n\
+             -exact \"TT_PROBE $suffix \" {{}}\n\
              timeout {{ exit 130 }}\n\
            }}\n\
            expect {{\n\

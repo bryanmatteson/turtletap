@@ -40,8 +40,8 @@ jobs:
         run: cargo clippy --workspace --all-features --all-targets -- -D warnings
       - name: Test library
         run: cargo test -p turtletap --all-features --all-targets
-      - name: Test workspace
-        run: cargo test --workspace --all-features --all-targets
+      - name: Test CLI
+        run: cargo test -p turtletap-cli --all-features --bins --test cli
       - name: Test resident lifecycle serially
         run: cargo test -p turtletap-cli --test resident -- --test-threads=1
       - name: Test crate documentation
