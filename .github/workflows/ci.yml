@@ -29,6 +29,7 @@ jobs:
           cargo check -p turtletap --no-default-features
           cargo check -p turtletap --features resident
           cargo check -p turtletap --features async-shell
+          cargo check -p turtletap --features termosaic
           cargo check -p turtletap --features tokio
       - name: Verify dependency boundaries
         run: |

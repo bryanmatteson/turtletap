@@ -22,6 +22,7 @@ off-screen rendering. It depends on `crossterm` and `ratatui`.
 
 | Feature | Public surface |
 | --- | --- |
+| `termosaic` | Semantic documents, themes, and retained Ratatui surface rendering |
 | `resident` | Protocol types, framing, journals, election, host, sessions, effects |
 | `async-shell` | Event-driven terminal and background surface polling |
 | `tokio` | Tokio transport, blocking client, supervisor; includes `resident` and `async-shell` |
@@ -29,6 +30,17 @@ off-screen rendering. It depends on `crossterm` and `ratatui`.
 ```toml
 turtletap = { version = "0.2", features = ["tokio"] }
 ```
+
+Termosaic 0.2.1 integrates at the surface boundary:
+
+```toml
+turtletap = { version = "0.2", features = ["termosaic"] }
+```
+
+`turtletap::termosaic::SurfaceRenderer` retains layout storage between frames,
+reflows prepared semantic documents at the current content width, and paints
+directly into the shell's Ratatui buffer. The complete runnable example is
+`cargo run --example termosaic --features termosaic`.
 
 ## Surface example
 

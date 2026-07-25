@@ -357,6 +357,7 @@ struct RuntimeState {
     completion_override: Option<i32>,
     directory: PathBuf,
     durability: Durability,
+    spool: Option<File>,
 }
 
 impl RuntimeState {
@@ -376,6 +377,7 @@ impl RuntimeState {
             completion_override: None,
             directory,
             durability,
+            spool: None,
         })
     }
 
@@ -390,32 +392,40 @@ impl RuntimeState {
     fn clear_spool(&mut self) -> io::Result<()> {
         self.events.clear();
         self.output_bytes = 0;
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(self.directory.join(SPOOL_FILE))?;
+        let durability = self.durability;
+        let file = self.spool()?;
+        file.set_len(0)?;
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
-        durable_file(&file, self.durability)
+        durable_file(file, durability)
     }
 
     fn append(&mut self, event: WorkerEvent) -> io::Result<()> {
-        append_spool(&self.directory.join(SPOOL_FILE), &event, self.durability)?;
+        let durability = self.durability;
+        let spool = self.spool()?;
+        write_frame(spool, &event)?;
+        durable_file(spool, durability)?;
         self.output_bytes = self.output_bytes.saturating_add(event_spool_bytes(&event));
         self.events.push_back(event.clone());
         self.enforce_output_limit(MAX_OUTPUT_BYTES);
-        if fs::metadata(self.directory.join(SPOOL_FILE))
-            .is_ok_and(|metadata| metadata.len() > MAX_OUTPUT_BYTES as u64)
+        let spool_path = self.directory.join(SPOOL_FILE);
+        if fs::metadata(&spool_path).is_ok_and(|metadata| metadata.len() > MAX_OUTPUT_BYTES as u64)
         {
-            rewrite_spool(
-                &self.directory.join(SPOOL_FILE),
-                &self.events,
-                self.durability,
-            )?;
+            self.spool = None;
+            rewrite_spool(&spool_path, &self.events, self.durability)?;
+            self.spool = Some(open_spool(&spool_path)?);
         }
         self.subscribers
             .retain(|subscriber| subscriber.try_send(event.clone()).is_ok());
         Ok(())
+    }
+
+    fn spool(&mut self) -> io::Result<&mut File> {
+        if self.spool.is_none() {
+            self.spool = Some(open_spool(&self.directory.join(SPOOL_FILE))?);
+        }
+        self.spool
+            .as_mut()
+            .ok_or_else(|| io::Error::other("worker spool did not open"))
     }
 
     fn enforce_output_limit(&mut self, maximum: usize) {
@@ -993,13 +1003,13 @@ fn interrupt_active(shared: &Arc<Mutex<RuntimeState>>) -> io::Result<()> {
         }
         identity
     };
-    if let Some((group, started)) = identity {
-        if let Err(error) = interrupt_verified_group(group, &started) {
-            if let Ok(mut runtime) = shared.lock() {
-                runtime.completion_override = None;
-            }
-            return Err(error);
+    if let Some((group, started)) = identity
+        && let Err(error) = interrupt_verified_group(group, &started)
+    {
+        if let Ok(mut runtime) = shared.lock() {
+            runtime.completion_override = None;
         }
+        return Err(error);
     }
     Ok(())
 }
@@ -1467,14 +1477,12 @@ pub(crate) fn read_frame<T: DeserializeOwned>(reader: &mut impl Read) -> io::Res
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
-fn append_spool(path: &Path, event: &WorkerEvent, durability: Durability) -> io::Result<()> {
-    let mut file = OpenOptions::new()
+fn open_spool(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
-        .open(path)?;
-    write_frame(&mut file, event)?;
-    durable_file(&file, durability)
+        .open(path)
 }
 
 fn load_spool(path: &Path) -> io::Result<VecDeque<WorkerEvent>> {
@@ -1547,7 +1555,31 @@ fn read_json<T: DeserializeOwned>(path: &Path) -> io::Result<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::fd::AsRawFd as _;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::*;
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time should follow the Unix epoch")
+                .as_nanos();
+            let path =
+                env::temp_dir().join(format!("turtletap-worker-{}-{nonce}", std::process::id()));
+            fs::create_dir(&path).expect("worker test directory should be created");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn framing_rejects_oversized_payload_before_allocation() {
@@ -1592,6 +1624,53 @@ mod tests {
     }
 
     #[test]
+    fn spool_writer_is_reused_and_recovery_reads_every_complete_frame() {
+        let directory = TestDirectory::new();
+        let mut runtime =
+            RuntimeState::load(directory.0.clone(), Durability::Flush).expect("spool should open");
+        runtime
+            .append(WorkerEvent::Output {
+                sequence: 1,
+                stderr: false,
+                text: "first".to_owned(),
+            })
+            .expect("first frame should append");
+        let first_descriptor = runtime
+            .spool
+            .as_ref()
+            .expect("append should retain the spool")
+            .as_raw_fd();
+        runtime
+            .append(WorkerEvent::Output {
+                sequence: 2,
+                stderr: true,
+                text: "second".to_owned(),
+            })
+            .expect("second frame should append");
+        assert_eq!(
+            runtime
+                .spool
+                .as_ref()
+                .expect("spool should remain open")
+                .as_raw_fd(),
+            first_descriptor
+        );
+        drop(runtime);
+
+        let recovered = load_spool(&directory.0.join(SPOOL_FILE))
+            .expect("complete spool frames should recover");
+        assert_eq!(recovered.len(), 2);
+        assert!(matches!(
+            recovered.back(),
+            Some(WorkerEvent::Output {
+                sequence: 2,
+                stderr: true,
+                text,
+            }) if text == "second"
+        ));
+    }
+
+    #[test]
     fn spool_retention_drops_oldest_output_to_stay_bounded() {
         let output = |sequence, text: &str| WorkerEvent::Output {
             sequence,
@@ -1608,6 +1687,7 @@ mod tests {
             completion_override: None,
             directory: PathBuf::new(),
             durability: Durability::Flush,
+            spool: None,
         };
 
         runtime.enforce_output_limit(retained_limit);

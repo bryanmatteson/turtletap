@@ -7,6 +7,8 @@ pub mod resident;
 mod shell;
 mod surface;
 mod terminal;
+#[cfg(feature = "termosaic")]
+pub mod termosaic;
 mod theme;
 
 pub use crossterm::event::{

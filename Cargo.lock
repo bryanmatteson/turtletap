@@ -213,6 +213,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "console"
+version = "0.16.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4fe5f465a4f6fee88fad41b85d990f84c835335e85b5d9e6e63e0d06d28cba7c"
+dependencies = [
+ "encode_unicode",
+ "libc",
+ "unicode-width 0.2.2",
+ "windows-sys",
+]
+
+[[package]]
 name = "convert_case"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -340,6 +352,12 @@ name = "either"
 version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
+
+[[package]]
+name = "encode_unicode"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34aa73646ffb006b8f5147f3dc182bd4bcb190227ce861fc4a4844bf8e3cb2c0"
 
 [[package]]
 name = "equivalent"
@@ -553,6 +571,16 @@ dependencies = [
  "miette",
  "nom",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "laidout"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3390c84581479b42f6070714281452861266b06fe92f6218cf41b3efae1adecb"
+dependencies = [
+ "thiserror 2.0.19",
+ "unicode-width 0.2.2",
 ]
 
 [[package]]
@@ -1094,6 +1122,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "termosaic"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6da991189dd14543fdd97904daeb6c2cfb2cd6720e3831e32ce110a16931deba"
+dependencies = [
+ "console",
+ "laidout",
+ "thiserror 2.0.19",
+ "unicode-segmentation",
+ "unicode-width 0.2.2",
+]
+
+[[package]]
+name = "termosaic-ratatui"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "541b41c85b0eb17add96d9db67d4b3421c9b1dbaf556d4b8f6b221020b3a49e9"
+dependencies = [
+ "ratatui-core",
+ "termosaic",
+]
+
+[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1255,6 +1306,8 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "termosaic",
+ "termosaic-ratatui",
  "tokio",
  "uuid",
 ]

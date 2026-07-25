@@ -10,6 +10,8 @@
 - Added active command recovery without redispatch after leader replacement.
 - Added human and JSON command output, shell completions, manual generation, and
   raw `config path` output for shell composition.
+- Added Termosaic 0.2.1 semantic documents and retained Ratatui rendering at the
+  surface boundary.
 
 ## 0.1.0 — 2026-07-22
 
