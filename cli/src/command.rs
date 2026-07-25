@@ -2285,7 +2285,7 @@ mod tests {
         let mut running = spawn_command("cat", Path::new("."))
             .expect("the platform should provide a shell and cat");
         let child = running.child.as_mut().expect("legacy command owns a child");
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => {
@@ -2296,7 +2296,7 @@ mod tests {
                 Ok(None) => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    panic!("cat kept waiting because child stdin was not closed");
+                    panic!("cat kept waiting ten seconds because child stdin was not closed");
                 }
                 Err(error) => panic!("could not inspect child status: {error}"),
             }

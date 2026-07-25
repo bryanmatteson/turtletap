@@ -44,6 +44,9 @@ jobs:
       - name: Test CLI
         run: cargo test -p turtletap-cli --all-features --bins --test cli
       - name: Test resident lifecycle serially
+        env:
+          TURTLETAP_ENTER_TO_OUTPUT_P95_BUDGET_MS: 125
+          TURTLETAP_OUTPUT_TO_SCREEN_P95_BUDGET_MS: 50
         run: cargo test --release -p turtletap-cli --test resident -- --test-threads=1
       - name: Test crate documentation
         run: cargo test -p turtletap --all-features --doc

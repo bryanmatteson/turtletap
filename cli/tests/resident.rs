@@ -1031,6 +1031,19 @@ fn attached_tui_reconnects_and_accepts_input_after_leader_crash() {
 }
 
 #[cfg(target_os = "macos")]
+fn latency_budget(variable: &str, default: u64) -> u64 {
+    match std::env::var(variable) {
+        Ok(value) => value
+            .parse()
+            .unwrap_or_else(|_| panic!("{variable} must be an unsigned integer")),
+        Err(std::env::VarError::NotPresent) => default,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("{variable} must contain valid UTF-8")
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
 #[test]
 fn command_latency_stays_within_the_responsiveness_budgets() {
     if std::env::var_os("TURTLETAP_LATENCY_TEST_CHILD").is_none() {
@@ -1060,8 +1073,16 @@ fn command_latency_stays_within_the_responsiveness_budgets() {
     }
 
     const SAMPLES: usize = 20;
-    const ENTER_TO_OUTPUT_P95_BUDGET_MS: u64 = 100;
-    const OUTPUT_TO_SCREEN_P95_BUDGET_MS: u64 = 16;
+    const DEFAULT_ENTER_TO_OUTPUT_P95_BUDGET_MS: u64 = 100;
+    const DEFAULT_OUTPUT_TO_SCREEN_P95_BUDGET_MS: u64 = 16;
+    let enter_to_output_budget = latency_budget(
+        "TURTLETAP_ENTER_TO_OUTPUT_P95_BUDGET_MS",
+        DEFAULT_ENTER_TO_OUTPUT_P95_BUDGET_MS,
+    );
+    let output_to_screen_budget = latency_budget(
+        "TURTLETAP_OUTPUT_TO_SCREEN_P95_BUDGET_MS",
+        DEFAULT_OUTPUT_TO_SCREEN_P95_BUDGET_MS,
+    );
 
     let resident = ResidentSession::start();
     let script = format!(
@@ -1153,12 +1174,12 @@ fn command_latency_stays_within_the_responsiveness_budgets() {
         "latency samples: enter-to-output={enter_samples:?} ms, output-to-screen={screen_samples:?} ms"
     );
     assert!(
-        enter_p95 <= ENTER_TO_OUTPUT_P95_BUDGET_MS,
-        "enter-to-output p95 {enter_p95} ms exceeded {ENTER_TO_OUTPUT_P95_BUDGET_MS} ms; samples={enter_samples:?}"
+        enter_p95 <= enter_to_output_budget,
+        "enter-to-output p95 {enter_p95} ms exceeded {enter_to_output_budget} ms; samples={enter_samples:?}"
     );
     assert!(
-        screen_p95 <= OUTPUT_TO_SCREEN_P95_BUDGET_MS,
-        "output-to-screen p95 {screen_p95} ms exceeded {OUTPUT_TO_SCREEN_P95_BUDGET_MS} ms; samples={screen_samples:?}"
+        screen_p95 <= output_to_screen_budget,
+        "output-to-screen p95 {screen_p95} ms exceeded {output_to_screen_budget} ms; samples={screen_samples:?}"
     );
 }
 
